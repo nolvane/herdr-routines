@@ -1374,6 +1374,18 @@ mod tests {
     }
 
     #[test]
+    fn the_selected_field_explains_itself() {
+        let mut a = app("explain");
+        press(&mut a, KeyCode::Char('n'));
+        a.form.as_mut().unwrap().select(Field::Mode);
+        for (w, h) in [(90, 34), (80, 24)] {
+            let lines = screen(&mut a, w, h);
+            assert!(lines.iter().any(|l| l.contains("▎ Permission mode")));
+            assert!(lines.iter().any(|l| l.contains("▎ What the agent may do")));
+        }
+    }
+
+    #[test]
     fn the_form_saves_mode_and_model() {
         let mut a = app("form");
         press(&mut a, KeyCode::Char('n'));

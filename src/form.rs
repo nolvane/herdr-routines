@@ -93,7 +93,7 @@ impl Field {
             Field::Cron => "Cron schedule",
             Field::Missed => "If missed",
             Field::Limit => "Time limit",
-            Field::Args => "Extra arguments",
+            Field::Args => "Extra options",
             Field::Enabled => "On",
             Field::Save => "Save",
         }
@@ -124,29 +124,45 @@ impl Field {
 
     pub fn hint(self) -> &'static str {
         match self {
-            Field::Name => "What the routine does, as shown in the list.",
-            Field::Prompt => "What the agent is asked to do. ⏎ opens the editor.",
+            Field::Name => {
+                "The name shown in the list, such as \"Weekly dependency check\"."
+            }
+            Field::Prompt => {
+                "What the agent should do, written as you would type it to the agent yourself. ⏎ opens the editor."
+            }
             Field::Agent => "The coding agent Herdr starts for each run.",
             Field::Mode => {
-                "What the agent may do without asking. A run waits in its tab when the agent asks something."
+                "What the agent may do without asking you. Auto: it works on its own and a safety check stops risky steps. When it still asks something, the run waits in its tab for your answer."
             }
-            Field::Model => "The model the agent uses. Other… takes any model name.",
-            Field::Effort => "How hard the agent thinks before it answers.",
-            Field::Folder => "The folder the agent starts in, such as ~/projects/site.",
-            Field::Repeat => "How often it runs.",
+            Field::Model => {
+                "The AI model that does the work. Bigger models are smarter but slower and use more of your plan. Agent default: what the agent itself is set to. Other…: type any model name."
+            }
+            Field::Effort => {
+                "How long the agent thinks before it acts. More effort gives better results on hard tasks, but takes longer and uses more of your plan."
+            }
+            Field::Folder => {
+                "The folder the run works in, such as ~/projects/site. The agent reads and changes the files there."
+            }
+            Field::Repeat => {
+                "How often it runs: every hour, every day, on weekdays, once a week, or Custom for any other schedule."
+            }
             Field::Time => "24-hour time, such as 08:15. For every hour: the minute, such as 15.",
             Field::Weekday => "The day of the week it runs.",
-            Field::Cron => "minute hour day month weekday, such as 15 8-18 * * 1-5.",
+            Field::Cron => {
+                "Any schedule as five values: minute hour day month weekday. 15 8-18 * * 1-5 means at a quarter past every hour from 8 to 18, Monday to Friday."
+            }
             Field::Missed => {
-                "When Herdr or the computer was off at the time: run once afterwards, or skip it."
+                "When Herdr or the computer was off or asleep at the time. Run once: it runs as soon as Herdr runs again. Skip: it waits for the next time."
             }
             Field::Limit => {
-                "Minutes until a run counts as timed out. Its tab stays open; the agent is not stopped."
+                "After this many minutes the run is marked as timed out and you get a notification. The agent keeps going and its tab stays open."
             }
             Field::Args => {
-                "Extra options for the agent's command line, for experts, such as --add-dir ~/other. Usually empty."
+                "For experts, leave empty if unsure: options added to the agent's start command, such as --add-dir ~/other to let it work in a second folder too."
             }
-            Field::Enabled => "Off keeps the routine but never runs it.",
+            Field::Enabled => {
+                "Yes: it runs on its schedule. No: the routine is kept but never runs by itself; r in the list still runs it by hand."
+            }
             Field::Save => "Saves the routine (Ctrl+S anywhere in the form).",
         }
     }
@@ -257,7 +273,9 @@ impl Form {
             Field::Prompt if self.is_shell() => {
                 "The command or script to run in the folder, such as ./backup.sh. Several lines run one after the other. ⏎ opens the editor."
             }
-            Field::Agent => "A coding agent Herdr starts with the prompt, or a shell command without AI.",
+            Field::Agent => {
+                "Which AI does the work: Claude Code, Codex, Gemini or another agent Herdr knows. Shell command runs a command or script instead, without AI."
+            }
             f => f.hint(),
         }
     }

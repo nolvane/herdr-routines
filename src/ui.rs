@@ -529,7 +529,10 @@ fn field_value(form: &Form, f: Field, selected: bool, room: usize) -> Vec<Span<'
                 text(form.shown(f))
             }];
             let detail = form.detail(f);
-            if !detail.is_empty() {
+            // The short detail only when it fits whole; the explanation
+            // below the form says more.
+            let left = room.saturating_sub(form.shown(f).width() + 2);
+            if !detail.is_empty() && detail.width() <= left {
                 v.push(Span::styled(format!("  {detail}"), Style::new().fg(FAINT)));
             }
             v
@@ -592,10 +595,23 @@ fn draw_form(frame: &mut Frame, app: &mut App, area: Rect) {
     );
     let fields = form.fields();
     let current = form.current();
-    let hint = wrap(form.hint(current), inner.width.saturating_sub(2) as usize);
-    // Below the fields: the schedule in words and the current field's hint.
+    // Below the fields: the schedule in words, then what the current field
+    // means, set off by an accent bar like a tooltip. A click on a field
+    // selects it and so shows its explanation.
+    let mut hint = wrap(form.hint(current), inner.width.saturating_sub(4) as usize);
+    // Up to four lines, fewer when the fields would no longer all fit.
+    let spare = (inner.height as usize).saturating_sub(fields.len() + 1 + 5);
+    let hint_rows = spare.clamp(2, 4);
+    if hint.len() > hint_rows {
+        hint.truncate(hint_rows);
+        if let Some(last) = hint.last_mut() {
+            last.push('…');
+        }
+    }
+    let hint_shown = hint.len().min(hint_rows) as u16;
     let below = if inner.height >= 12 {
-        2 + hint.len().min(3) as u16
+        // gap, summary, gap, title, text
+        4 + hint_shown
     } else {
         1
     };
@@ -672,14 +688,19 @@ fn draw_form(frame: &mut Frame, app: &mut App, area: Rect) {
         Rect::new(inner.x + 1, y, inner.width.saturating_sub(2), 1),
     );
     if below > 2 {
-        let lines: Vec<Line> = hint
-            .into_iter()
-            .take(3)
-            .map(|l| Line::from(Span::styled(l, Style::new().fg(MUTED))))
-            .collect();
+        let bar = || Span::styled("▎ ", Style::new().fg(ACCENT));
+        let mut lines = vec![Line::from(vec![
+            bar(),
+            Span::styled(form.label(current), bold(TEXT)),
+        ])];
+        lines.extend(
+            hint.into_iter()
+                .take(hint_rows)
+                .map(|l| Line::from(vec![bar(), Span::styled(l, Style::new().fg(MUTED))])),
+        );
         frame.render_widget(
             Paragraph::new(Text::from(lines)),
-            Rect::new(inner.x + 1, y + 1, inner.width.saturating_sub(2), below - 2),
+            Rect::new(inner.x + 1, y + 2, inner.width.saturating_sub(2), below - 3),
         );
     }
 }
