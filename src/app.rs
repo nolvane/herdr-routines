@@ -1962,6 +1962,22 @@ impl App {
         }
     }
 
+    /// The mouse over a menu or a list to choose from marks the entry
+    /// under it, as Herdr's own menus do.
+    fn hover(&mut self, x: u16, y: u16) {
+        let under = self
+            .hits
+            .iter()
+            .rev()
+            .find(|(r, _)| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height)
+            .map(|(_, h)| *h);
+        match (&mut self.mode, under) {
+            (Mode::Menu(m), Some(Hit::MenuRow(i))) if i < m.items.len() => m.sel = i,
+            (Mode::Pick(p), Some(Hit::PickRow(i))) if i < p.items.len() => p.sel = i,
+            _ => {}
+        }
+    }
+
     fn click(&mut self, x: u16, y: u16) {
         // Outside an open menu, a click only closes it.
         if matches!(self.mode, Mode::Menu(_)) {
@@ -2114,6 +2130,7 @@ impl App {
                 MouseEventKind::Down(MouseButton::Left) => self.click(m.column, m.row),
                 MouseEventKind::Down(MouseButton::Right) => self.right_click(m.column, m.row),
                 MouseEventKind::Drag(MouseButton::Left) => self.drag(m.column, m.row),
+                MouseEventKind::Moved => self.hover(m.column, m.row),
                 MouseEventKind::ScrollDown => self.wheel(1),
                 MouseEventKind::ScrollUp => self.wheel(-1),
                 _ => {}
@@ -3087,13 +3104,60 @@ mod tests {
         assert_eq!(a.runs.len(), count);
         assert!(a.runs.iter().all(|r| r.routine_id == ids[1].0));
         let lines = screen(&mut a, 140, 30);
-        assert!(lines
-            .iter()
-            .any(|l| l.contains(&format!("Runs of {}", ids[1].1))));
+        // The tab stays "Runs" with all of them; the filter is a line in the
+        // view, with a button that removes it.
+        let all = a.all_runs.len();
+        assert!(
+            lines[0].contains(&format!(" Runs ({all}) ")),
+            "{}",
+            lines[0]
+        );
+        assert!(lines.iter().any(|l| l
+            .contains(&format!("Only runs of {}  {count} of {all}", ids[1].1))
+            && l.contains("✕ show all runs")));
         assert!(lines.iter().any(|l| l.contains("Result 1.1")));
-        press(&mut a, KeyCode::Esc);
+        let button = a
+            .hits
+            .iter()
+            .find_map(|(r, h)| (*h == Hit::Key('\u{1b}')).then_some(*r))
+            .unwrap();
+        a.click(button.x + 1, button.y);
         assert_eq!(a.runs.len(), a.all_runs.len());
         assert!(a.run_filter.is_none());
+        let lines = screen(&mut a, 140, 30);
+        assert!(!lines.iter().any(|l| l.contains("show all runs")));
+        // Esc removes it too.
+        a.filter_runs(Some(ids[1].0.clone()));
+        press(&mut a, KeyCode::Esc);
+        assert!(a.run_filter.is_none());
+    }
+
+    #[test]
+    fn the_mouse_marks_the_menu_entry_under_it() {
+        let mut a = app("hover");
+        screen(&mut a, 120, 30);
+        let row = a
+            .hits
+            .iter()
+            .find_map(|(r, h)| matches!(h, Hit::Row(0)).then_some(*r))
+            .unwrap();
+        a.right_click(row.x + 2, row.y);
+        screen(&mut a, 120, 30);
+        let third = a
+            .hits
+            .iter()
+            .find_map(|(r, h)| (*h == Hit::MenuRow(2)).then_some(*r))
+            .unwrap();
+        a.event(Event::Mouse(ratatui::crossterm::event::MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: third.x + 3,
+            row: third.y,
+            modifiers: KeyModifiers::NONE,
+        }));
+        let Mode::Menu(m) = a.mode.clone() else {
+            panic!("no menu");
+        };
+        assert_eq!(m.sel, 2);
     }
 
     #[test]

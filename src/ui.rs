@@ -92,15 +92,10 @@ fn draw_header(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
                 View::Cron => {
                     app.routines.iter().filter(|r| r.is_cron()).count() + app.crontab_jobs.len()
                 }
-                View::Runs => app.runs.len(),
+                // All runs: a filter only narrows the list in the view.
+                View::Runs => app.all_runs.len(),
             };
-            let label = match (view, app.filter_name()) {
-                (View::Runs, Some(name)) => {
-                    let name: String = name.chars().take(24).collect();
-                    format!(" Runs of {name} ({count}) ")
-                }
-                _ => format!(" {} ({count}) ", view.name()),
-            };
+            let label = format!(" {} ({count}) ", view.name());
             let style = if app.view == view {
                 Style::new()
                     .fg(TEXT)
@@ -836,6 +831,38 @@ enum NCol {
 }
 
 fn draw_runs(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
+    // A filter shows as a line on top, with a button that removes it.
+    let mut area = area;
+    if let Some(name) = app.filter_name().map(str::to_string) {
+        let bar = Rect::new(area.x + 1, area.y, area.width.saturating_sub(2), 1);
+        let shown = app.runs.len();
+        let all = app.all_runs.len();
+        let button_text = " ✕ show all runs ";
+        let lead = "Only runs of ";
+        let tail = format!("  {shown} of {all}   ");
+        let room = (bar.width as usize)
+            .saturating_sub(lead.width() + tail.width() + button_text.width() + 1);
+        let name = clip(&name, room.max(4));
+        let spans = vec![
+            Span::raw(" "),
+            Span::styled(lead, Style::new().fg(MUTED)),
+            Span::styled(name.clone(), bold(TEXT)),
+            Span::styled(tail.clone(), Style::new().fg(FAINT)),
+            Span::styled(button_text, Style::new().fg(TEXT).bg(SELECTED_BG)),
+        ];
+        let x = bar.x + (1 + lead.width() + name.width() + tail.width()) as u16;
+        app.hits.push((
+            Rect::new(x, bar.y, button_text.width() as u16, 1),
+            Hit::Key('\u{1b}'),
+        ));
+        frame.render_widget(Paragraph::new(Line::from(spans)), bar);
+        area = Rect::new(
+            area.x,
+            area.y + 2,
+            area.width,
+            area.height.saturating_sub(2),
+        );
+    }
     if app.runs.is_empty() {
         empty_note(
             frame,
@@ -2111,7 +2138,10 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
                 ("⏎", "go to the run's tab, or its output once closed"),
                 ("l", "result and output of the run"),
                 ("f", "open the output file"),
-                ("h", "only this routine's runs; Esc shows all"),
+                (
+                    "h",
+                    "only this routine's runs; Esc or \"✕ show all runs\" shows all",
+                ),
                 ("d", "delete the run (asks first)"),
             ],
         ),
