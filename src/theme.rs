@@ -42,14 +42,14 @@ impl Icons {
         }
     }
 
-    /// On, off, or broken.
+    /// On (green), off (red), or broken (yellow warning).
     pub fn routine(&self, enabled: bool, broken: bool) -> (&'static str, Color) {
         if broken {
-            (self.pick("\u{f421}", "!"), RED)
+            (self.pick("\u{f421}", "!"), YELLOW)
         } else if enabled {
-            (self.pick("\u{f444}", "●"), ACCENT)
+            (self.pick("\u{f444}", "●"), GREEN)
         } else {
-            (self.pick("\u{f4aa}", "○"), FAINT)
+            (self.pick("\u{f444}", "●"), RED)
         }
     }
 

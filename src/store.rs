@@ -165,9 +165,16 @@ impl Run {
     }
 
     pub fn log_path(&self, paths: &Paths) -> std::path::PathBuf {
+        self.file(paths, "log")
+    }
+
+    /// A file of this run next to its record, such as its log or, for a
+    /// shell command, its script (`sh`), wrapper (`run`) and exit code
+    /// (`exit`).
+    pub fn file(&self, paths: &Paths, ext: &str) -> std::path::PathBuf {
         paths
             .runs_dir(&self.routine_id)
-            .join(format!("{}.log", self.id))
+            .join(format!("{}.{ext}", self.id))
     }
 
     pub fn finish(&mut self, status: Status, message: impl Into<String>) {
@@ -212,9 +219,9 @@ pub fn all_runs(paths: &Paths) -> Vec<Run> {
 pub fn prune(paths: &Paths, routine_id: &str, keep: usize) {
     let runs = runs_of(paths, routine_id);
     for run in runs.iter().skip(keep).filter(|r| !r.status.active()) {
-        let dir = paths.runs_dir(routine_id);
-        let _ = std::fs::remove_file(dir.join(format!("{}.json", run.id)));
-        let _ = std::fs::remove_file(dir.join(format!("{}.log", run.id)));
+        for ext in ["json", "log", "sh", "run", "exit"] {
+            let _ = std::fs::remove_file(run.file(paths, ext));
+        }
     }
 }
 

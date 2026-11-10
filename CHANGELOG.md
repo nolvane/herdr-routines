@@ -24,4 +24,7 @@ All notable changes to this plugin. The format follows
   Claude Code, Codex and Gemini; new routines start in Auto.
 - Prompt editor inside the list (arrows, mouse, paste, undo), and `Ctrl+O`
   for your own editor.
+- Shell commands as routines, like cron jobs without AI: exit code 0
+  finishes the run, anything else marks it failed and notifies.
+- On and off at a glance: a green dot for on, a red one for off.
 - `routines` (JSON) and `fire <id>` commands for scripts and other agents.

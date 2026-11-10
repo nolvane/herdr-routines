@@ -78,7 +78,6 @@ everything afterwards with `herdr-routines stop`,
 
 - No headless runs: every run is an interactive agent in a tab.
 - No runs while the Herdr server is down (no launchd or systemd service).
-- No shell commands as routines for now, only agents.
 
 ## Releasing
 

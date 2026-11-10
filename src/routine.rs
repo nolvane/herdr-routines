@@ -5,10 +5,14 @@ use crate::cron::Cron;
 use crate::paths::{self, Paths};
 use serde::{Deserialize, Serialize};
 
-/// The agent kinds Herdr can start (`herdr agent start --kind`), in the order
-/// the edit form cycles through them.
+/// Not an agent: the routine runs a shell command or script, no AI.
+pub const SHELL: &str = "shell";
+
+/// What a routine can run, in the order the edit form lists them: the agent
+/// kinds Herdr can start (`herdr agent start --kind`) and [`SHELL`].
 pub const AGENTS: &[&str] = &[
     "claude",
+    SHELL,
     "codex",
     "gemini",
     "cursor",
@@ -148,12 +152,33 @@ impl Routine {
             return Some(format!("folder {} does not exist", file.folder));
         }
         if prompt.trim().is_empty() {
-            return Some("the prompt is empty".into());
+            return Some(if file.agent == SHELL {
+                "the command is empty".into()
+            } else {
+                "the prompt is empty".into()
+            });
+        }
+        if file.agent == SHELL && !file.args.is_empty() {
+            return Some("a shell command takes no extra arguments".into());
         }
         if file.time_limit_minutes == 0 {
             return Some("the time limit is 0 minutes".into());
         }
         None
+    }
+
+    pub fn is_shell(&self) -> bool {
+        self.file.agent == SHELL
+    }
+
+    /// The file next to `routine.toml` with what the routine runs: the
+    /// prompt, or for a shell command the command.
+    pub fn text_file(agent: &str) -> &'static str {
+        if agent == SHELL {
+            "command.sh"
+        } else {
+            "prompt.md"
+        }
     }
 
     pub fn load(paths: &Paths, id: &str) -> Result<Routine, String> {
@@ -162,7 +187,8 @@ impl Routine {
             .map_err(|e| format!("cannot read routine.toml: {e}"))?;
         let file: RoutineFile =
             toml::from_str(&text).map_err(|e| format!("routine.toml: {}", e.message()))?;
-        let prompt = std::fs::read_to_string(dir.join("prompt.md")).unwrap_or_default();
+        let prompt =
+            std::fs::read_to_string(dir.join(Routine::text_file(&file.agent))).unwrap_or_default();
         let problem = Routine::check(&file, &prompt);
         Ok(Routine {
             id: id.to_string(),
@@ -176,14 +202,27 @@ impl Routine {
     pub fn save(&self, paths: &Paths) -> Result<(), String> {
         let dir = paths.routine_dir(&self.id);
         let text = toml::to_string(&self.file).map_err(|e| e.to_string())?;
-        let header = "# A Herdr routine. The prompt is in prompt.md next to this file.\n";
+        let name = Routine::text_file(&self.file.agent);
+        let what = if self.is_shell() {
+            "The command"
+        } else {
+            "The prompt"
+        };
+        let header = format!("# A Herdr routine. {what} is in {name} next to this file.\n");
         paths::write_atomic(
             &dir.join("routine.toml"),
             format!("{header}{text}").as_bytes(),
         )
         .map_err(|e| format!("cannot save: {e}"))?;
-        paths::write_atomic(&dir.join("prompt.md"), self.prompt.as_bytes())
-            .map_err(|e| format!("cannot save the prompt: {e}"))
+        paths::write_atomic(&dir.join(name), self.prompt.as_bytes())
+            .map_err(|e| format!("cannot save {}: {e}", what.to_lowercase()))?;
+        // A routine switched between agent and shell keeps one text file.
+        for other in ["prompt.md", "command.sh"] {
+            if other != name {
+                let _ = std::fs::remove_file(dir.join(other));
+            }
+        }
+        Ok(())
     }
 
     pub fn delete(paths: &Paths, id: &str) -> Result<(), String> {
@@ -362,6 +401,30 @@ mod tests {
         assert_eq!(load_all(&p).len(), 1);
         Routine::delete(&p, "morning-report").unwrap();
         assert!(load_all(&p).is_empty());
+    }
+
+    #[test]
+    fn shell_routines_keep_their_command_in_command_sh() {
+        let p = temp_paths("shell");
+        let mut r = Routine {
+            id: "backup".into(),
+            file: sample(),
+            prompt: "Write the report.".into(),
+            problem: None,
+            unreadable: false,
+        };
+        r.save(&p).unwrap();
+        r.file.agent = SHELL.into();
+        r.file.permission_mode.clear();
+        r.file.model.clear();
+        r.prompt = "./backup.sh --all".into();
+        r.save(&p).unwrap();
+        let dir = p.routine_dir("backup");
+        assert!(dir.join("command.sh").exists());
+        assert!(!dir.join("prompt.md").exists(), "the prompt file goes");
+        let back = Routine::load(&p, "backup").unwrap();
+        assert_eq!(back.prompt, "./backup.sh --all");
+        assert_eq!(back.problem, None);
     }
 
     #[test]

@@ -143,6 +143,11 @@ pub fn agent_start(name: &str, kind: &str, pane: &str, args: &[String]) -> Resul
     call(&a).map(|_| ())
 }
 
+/// Types a command line into the pane's shell and runs it.
+pub fn pane_run(pane: &str, command: &str) -> Result<(), Error> {
+    call(&["pane", "run", pane, command]).map(|_| ())
+}
+
 pub fn agent_prompt(target: &str, text: &str) -> Result<(), Error> {
     call(&["agent", "prompt", target, text]).map(|_| ())
 }

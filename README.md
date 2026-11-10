@@ -1,30 +1,34 @@
 # herdr-routines
 
-A [Herdr](https://herdr.dev) plugin that runs coding agents on a schedule.
-A routine is a prompt, an agent (Claude, Codex, Gemini, OpenCode or any other
-agent Herdr knows), a folder and a time. When the time comes, the plugin
-opens a tab in the background, starts the agent there and hands it the
-prompt. You can watch any run live, answer when the agent asks something and
-keep talking to it afterwards.
+A [Herdr](https://herdr.dev) plugin that runs coding agents and shell
+commands on a schedule. A routine is a prompt, an agent (Claude, Codex,
+Gemini, OpenCode or any other agent Herdr knows), a folder and a time. When
+the time comes, the plugin opens a tab in the background, starts the agent
+there and hands it the prompt. You can watch any run live, answer when the
+agent asks something and keep talking to it afterwards. A routine can also
+be a plain shell command or script, like a cron job, without any AI.
 
 Routines run as long as the Herdr server runs, also when no Herdr window is
 open.
 
 ```
- ◷ Agent routines    Routines (3)   Runs (41)                          ● scheduler on
+ ◷ Scheduled routines    Routines (3)   Runs (41)                      ● scheduler on
 
     Routine                                     Schedule                  Last run
  ●  Inbox clean up                              Weekdays, hourly at :15   ✓ Finished
     claude · Sonnet · Auto · ~/mail             next in 12 min            48 min ago · took 3 min
 
- ●  Dependency scan                             Mondays at 07:00          ✓ Finished
-    codex · Auto · ~/code/app                   next Mon 07:00            6 d ago · took 9 min
+ ●  Nightly backup                              Daily at 02:00            ✓ Finished
+    shell · ./backup.sh --all · ~/code/app      next 02:00                10 h ago · took 4 min
 
- ○  Release notes                               Monthly on the 1st        –
+ ●  Release notes                               Monthly on the 1st        –
     claude · Opus · Plan only · ~/code/app      off                       no run yet
 
  ⏎ edit  n new  r run now  space on/off  ? all keys  q close
 ```
+
+The dot in front of a routine is green when it is on and red when it is
+off; a yellow warning sign marks a routine with a problem.
 
 ## What it does
 
@@ -38,6 +42,11 @@ open.
   more), the models (Fable, Opus, Sonnet, Haiku or any typed name) and the
   effort; for Codex and Gemini their modes and any model name. New routines
   start in Auto, since nobody watches a scheduled run.
+- **Shell commands:** choose "Shell command" as the agent and write the
+  command or script instead of a prompt. It runs in its own tab in the
+  folder, with your shell and its environment. Exit code 0 counts as
+  finished; any other code marks the run as failed and Herdr shows a
+  notification.
 - **Prompt editor** in the list: type, paste, move with the arrows or the
   mouse, undo with `Ctrl+Z`, keep with `Ctrl+S`. `Ctrl+O` opens the prompt
   in your own editor instead.
@@ -141,7 +150,9 @@ missed = "run-once"
 time_limit_minutes = 120
 ```
 
-`prompt.md` holds the prompt, as you would type it to the agent.
+`prompt.md` holds the prompt, as you would type it to the agent. A shell
+routine has `agent = "shell"` and its command in `command.sh` instead; it
+runs in your `$SHELL`, line by line like a script.
 
 You, the list or another agent can create and change these files; the
 scheduler reads them every few seconds. A routine with a mistake shows up in

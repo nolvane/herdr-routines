@@ -4,13 +4,15 @@
 //! there and the prompt goes in as if typed, so a person can watch the run
 //! and step in. The scheduler then reads the agent's state from Herdr:
 //! `working` means running, `blocked` means it asks something, `idle` or
-//! `done` after having worked means finished.
+//! `done` after having worked means finished. A shell routine runs its
+//! command in the tab instead and is done when the command ends.
 
 use crate::herdr::{self, Place};
 use crate::paths::{self, Paths};
-use crate::routine::{Routine, Settings};
+use crate::routine::{Routine, Settings, SHELL};
 use crate::store::{Run, Status, Trigger};
 use chrono::{DateTime, Duration, Local};
+use std::path::Path;
 use std::thread::sleep;
 
 /// How long a run may stay in `Starting` before it counts as failed (the
@@ -104,6 +106,9 @@ pub fn launch(paths: &Paths, settings: &Settings, routine: &Routine, mut run: Ru
     run.workspace_id = place.workspace_id;
     run.tab_id = place.tab_id;
     run.pane_id = place.pane_id.clone();
+    if routine.is_shell() {
+        return launch_shell(paths, routine, run);
+    }
     run.agent_name = agent_name(&routine.id, &run.id);
     let _ = run.save(paths);
 
@@ -163,6 +168,90 @@ pub fn launch(paths: &Paths, settings: &Settings, routine: &Routine, mut run: Ru
     run
 }
 
+/// Text in single quotes for any shell.
+fn quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// The wrapper a shell routine runs through: the routine's command in the
+/// person's shell, then its exit code into a file the scheduler reads.
+fn wrapper(shell: &str, script: &Path, exit: &Path) -> String {
+    format!(
+        "#!/bin/sh\n# herdr-routines: runs the routine's command and notes its exit code.\n{} {}\nprintf '%s' \"$?\" > {}\n",
+        quote(shell),
+        quote(&script.to_string_lossy()),
+        quote(&exit.to_string_lossy()),
+    )
+}
+
+/// Runs a shell routine in the run's tab: its command goes into a script
+/// next to the run record, and the tab's shell runs it through `/bin/sh`
+/// (so the line works in any shell) with the tab's environment.
+fn launch_shell(paths: &Paths, routine: &Routine, mut run: Run) -> Run {
+    let script = run.file(paths, "sh");
+    let wrap = run.file(paths, "run");
+    let exit = run.file(paths, "exit");
+    let shell = std::env::var("SHELL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "/bin/sh".into());
+    let written = paths::write_atomic(&script, routine.prompt.as_bytes())
+        .and_then(|_| paths::write_atomic(&wrap, wrapper(&shell, &script, &exit).as_bytes()));
+    if let Err(e) = written {
+        run.finish(Status::Failed, format!("Could not write the command: {e}"));
+        let _ = run.save(paths);
+        return run;
+    }
+    let line = format!("/bin/sh {}", quote(&wrap.to_string_lossy()));
+    let mut result = herdr::pane_run(&run.pane_id, &line);
+    for _ in 0..3 {
+        if result.is_ok() {
+            break;
+        }
+        sleep(std::time::Duration::from_secs(2));
+        result = herdr::pane_run(&run.pane_id, &line);
+    }
+    match result {
+        Ok(()) => {
+            run.status = Status::Running;
+            run.prompted = Some(Local::now());
+        }
+        Err(e) => run.finish(Status::Failed, format!("Could not run the command: {e}")),
+    }
+    let _ = run.save(paths);
+    run
+}
+
+/// Follows a shell run: done once its exit code is written.
+fn watch_shell(paths: &Paths, settings: &Settings, run: &mut Run) {
+    if let Ok(code) = std::fs::read_to_string(run.file(paths, "exit")) {
+        let code = code.trim();
+        if code == "0" {
+            run.finish(Status::Finished, "");
+            if settings.notify_finished {
+                herdr::notify(
+                    &format!("{} finished", run.routine_name),
+                    "Open herdr-routines to see the run.",
+                    "done",
+                );
+            }
+        } else {
+            run.finish(Status::Failed, format!("Ended with exit code {code}"));
+            herdr::notify(
+                &format!("{} failed", run.routine_name),
+                &format!("The command ended with exit code {code}. Its tab stays open."),
+                "request",
+            );
+        }
+    } else if !herdr::pane_exists(&run.pane_id).unwrap_or(true) {
+        run.finish(
+            Status::Closed,
+            "The tab was closed before the command ended",
+        );
+        run.tab_closed = true;
+    }
+}
+
 /// Types the prompt into the agent, noting its completed turns first so
 /// that one more turn later means the prompt is done.
 fn hand_over(run: &mut Run, prompt: &str) -> Result<(), herdr::Error> {
@@ -215,80 +304,84 @@ pub fn watch(paths: &Paths, settings: &Settings, run: &mut Run, routine: Option<
         return false;
     }
 
-    let (state, turns) = match herdr::agent_state(&run.pane_id) {
-        Ok(Some((s, t))) => (Some(s), t),
-        Ok(None) => (None, 0),
-        // Herdr unreachable: try again next time.
-        Err(_) => return false,
-    };
-    // A quick agent can finish between two looks, so a new completed turn
-    // counts as having worked.
-    if run.prompted.is_some() && run.turns_before.is_some_and(|b| turns > b) {
-        run.seen_working = true;
-    }
-    match state.as_deref() {
-        None => {
-            let pane_alive = herdr::pane_exists(&run.pane_id).unwrap_or(true);
-            if run.seen_working && pane_alive {
-                run.finish(Status::Finished, "The agent ended");
-            } else if pane_alive {
-                run.finish(Status::Closed, "The agent quit before it finished");
-            } else {
-                run.finish(Status::Closed, "The tab was closed before the run finished");
-                run.tab_closed = true;
-            }
+    if run.agent == SHELL {
+        watch_shell(paths, settings, run);
+    } else {
+        let (state, turns) = match herdr::agent_state(&run.pane_id) {
+            Ok(Some((s, t))) => (Some(s), t),
+            Ok(None) => (None, 0),
+            // Herdr unreachable: try again next time.
+            Err(_) => return false,
+        };
+        // A quick agent can finish between two looks, so a new completed turn
+        // counts as having worked.
+        if run.prompted.is_some() && run.turns_before.is_some_and(|b| turns > b) {
+            run.seen_working = true;
         }
-        Some("working") => {
-            // Working before the prompt (starting up) does not count.
-            if run.prompted.is_some() {
-                run.seen_working = true;
-            }
-            run.status = Status::Running;
-            run.notified = false;
-            if run.message.starts_with("The agent asks")
-                || run.message.starts_with("The agent did not")
-                || run.message.starts_with("The agent was slow")
-            {
-                run.message.clear();
-            }
-        }
-        Some("blocked") => {
-            run.status = Status::NeedsYou;
-            if run.message.is_empty() {
-                run.message = "The agent asks a question or waits for an approval".into();
-            }
-            notify_needs_you(run);
-        }
-        Some("idle") | Some("done") => {
-            if run.prompted.is_none() {
-                // The agent was held up at start; it is ready now.
-                if let Some(text) = prompt {
-                    match hand_over(run, text) {
-                        Ok(()) => run.message.clear(),
-                        Err(e) => run.message = format!("Could not hand over the prompt: {e}"),
-                    }
+        match state.as_deref() {
+            None => {
+                let pane_alive = herdr::pane_exists(&run.pane_id).unwrap_or(true);
+                if run.seen_working && pane_alive {
+                    run.finish(Status::Finished, "The agent ended");
+                } else if pane_alive {
+                    run.finish(Status::Closed, "The agent quit before it finished");
+                } else {
+                    run.finish(Status::Closed, "The tab was closed before the run finished");
+                    run.tab_closed = true;
                 }
-            } else if run.seen_working {
-                run.finish(Status::Finished, "");
-                run.turns_at_end = Some(turns);
-                if settings.notify_finished {
-                    herdr::notify(
-                        &format!("{} finished", run.routine_name),
-                        "Open herdr-routines to see the run.",
-                        "done",
-                    );
+            }
+            Some("working") => {
+                // Working before the prompt (starting up) does not count.
+                if run.prompted.is_some() {
+                    run.seen_working = true;
                 }
-            } else if run
-                .prompted
-                .is_some_and(|p| now - p > Duration::minutes(PROMPT_GRACE_MINUTES))
-            {
+                run.status = Status::Running;
+                run.notified = false;
+                if run.message.starts_with("The agent asks")
+                    || run.message.starts_with("The agent did not")
+                    || run.message.starts_with("The agent was slow")
+                {
+                    run.message.clear();
+                }
+            }
+            Some("blocked") => {
                 run.status = Status::NeedsYou;
-                run.message = "The agent did not start on the prompt".into();
+                if run.message.is_empty() {
+                    run.message = "The agent asks a question or waits for an approval".into();
+                }
                 notify_needs_you(run);
             }
+            Some("idle") | Some("done") => {
+                if run.prompted.is_none() {
+                    // The agent was held up at start; it is ready now.
+                    if let Some(text) = prompt {
+                        match hand_over(run, text) {
+                            Ok(()) => run.message.clear(),
+                            Err(e) => run.message = format!("Could not hand over the prompt: {e}"),
+                        }
+                    }
+                } else if run.seen_working {
+                    run.finish(Status::Finished, "");
+                    run.turns_at_end = Some(turns);
+                    if settings.notify_finished {
+                        herdr::notify(
+                            &format!("{} finished", run.routine_name),
+                            "Open herdr-routines to see the run.",
+                            "done",
+                        );
+                    }
+                } else if run
+                    .prompted
+                    .is_some_and(|p| now - p > Duration::minutes(PROMPT_GRACE_MINUTES))
+                {
+                    run.status = Status::NeedsYou;
+                    run.message = "The agent did not start on the prompt".into();
+                    notify_needs_you(run);
+                }
+            }
+            // `unknown`: an agent is there but Herdr cannot tell its state.
+            _ => {}
         }
-        // `unknown`: an agent is there but Herdr cannot tell its state.
-        _ => {}
     }
 
     let limit = Duration::minutes(i64::from(limit_minutes));
@@ -332,6 +425,11 @@ pub fn occupied(paths: &Paths, run: &Run) -> bool {
     if run.server != paths.server_id() {
         // On another server: assume busy while that server runs.
         return paths::server_alive(&run.server);
+    }
+    if run.agent == SHELL {
+        // Still running until it notes its exit code.
+        return !run.file(paths, "exit").exists()
+            && herdr::pane_exists(&run.pane_id).unwrap_or(true);
     }
     match herdr::agent_status(&run.pane_id) {
         Ok(Some(s)) => s != "idle" && s != "done",
@@ -408,6 +506,21 @@ pub fn show(paths: &Paths, run: &Run) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shell_wrapper_quotes_paths() {
+        assert_eq!(quote("it's"), "'it'\\''s'");
+        let w = wrapper(
+            "/bin/zsh",
+            Path::new("/state/runs/a b/1.sh"),
+            Path::new("/state/runs/a b/1.exit"),
+        );
+        assert!(w.contains("'/bin/zsh' '/state/runs/a b/1.sh'\n"), "{w}");
+        assert!(
+            w.ends_with("printf '%s' \"$?\" > '/state/runs/a b/1.exit'\n"),
+            "{w}"
+        );
+    }
 
     #[test]
     fn agent_names_are_valid() {

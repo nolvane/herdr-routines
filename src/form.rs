@@ -2,7 +2,7 @@
 
 use crate::agent;
 use crate::cron::Cron;
-use crate::routine::{Missed, Routine, RoutineFile, AGENTS};
+use crate::routine::{Missed, Routine, RoutineFile, AGENTS, SHELL};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Repeat {
@@ -240,6 +240,28 @@ impl Form {
         AGENTS[self.agent]
     }
 
+    pub fn is_shell(&self) -> bool {
+        self.agent() == SHELL
+    }
+
+    /// A field's name: the prompt is the command for a shell routine.
+    pub fn label(&self, f: Field) -> &'static str {
+        match f {
+            Field::Prompt if self.is_shell() => "Command",
+            f => f.label(self.repeat),
+        }
+    }
+
+    pub fn hint(&self, f: Field) -> &'static str {
+        match f {
+            Field::Prompt if self.is_shell() => {
+                "The command or script to run in the folder, such as ./backup.sh. Several lines run one after the other. ⏎ opens the editor."
+            }
+            Field::Agent => "A coding agent Herdr starts with the prompt, or a shell command without AI.",
+            f => f.hint(),
+        }
+    }
+
     /// The fields shown for the current agent and repeat choice.
     pub fn fields(&self) -> Vec<Field> {
         let a = self.agent();
@@ -262,13 +284,11 @@ impl Form {
             }
             _ => v.push(Field::Time),
         }
-        v.extend([
-            Field::Missed,
-            Field::Limit,
-            Field::Args,
-            Field::Enabled,
-            Field::Save,
-        ]);
+        v.extend([Field::Missed, Field::Limit]);
+        if !self.is_shell() {
+            v.push(Field::Args);
+        }
+        v.extend([Field::Enabled, Field::Save]);
         v
     }
 
@@ -351,6 +371,7 @@ impl Form {
     pub fn shown(&self, f: Field) -> String {
         let a = self.agent();
         match f {
+            Field::Agent if self.is_shell() => "Shell command".into(),
             Field::Mode => agent::label(agent::modes(a), &self.mode),
             Field::Model => agent::label(agent::models(a), &self.model),
             Field::Effort => agent::label(agent::efforts(a), &self.effort),
@@ -377,7 +398,14 @@ impl Form {
                 .collect()
         };
         match f {
-            Field::Agent => AGENTS.iter().map(|a| item(a, a, "")).collect(),
+            Field::Agent => AGENTS
+                .iter()
+                .map(|a| match *a {
+                    SHELL => item(a, "Shell command", "A command or script, no AI"),
+                    "claude" => item(a, a, "Claude Code"),
+                    _ => item(a, a, ""),
+                })
+                .collect(),
             Field::Mode => from(agent::modes(a)),
             Field::Model => {
                 let mut v = from(agent::models(a));
@@ -425,6 +453,10 @@ impl Form {
                 }
                 // Model names belong to one agent.
                 self.model.clear();
+                if self.is_shell() {
+                    // Agent flags mean nothing to a shell command.
+                    self.args.clear();
+                }
                 if agent::find(agent::efforts(a), &self.effort).is_none() {
                     self.effort.clear();
                 }
@@ -717,6 +749,25 @@ mod tests {
         f.prompt = "go".into();
         let (file, _) = f.build().unwrap();
         assert_eq!(file.model, "some-model");
+    }
+
+    #[test]
+    fn shell_commands_have_their_own_fields() {
+        let mut f = Form::new("~");
+        f.args = "--verbose".into();
+        f.choose(Field::Agent, SHELL);
+        assert!(f.is_shell());
+        assert_eq!(f.label(Field::Prompt), "Command");
+        let fields = f.fields();
+        for gone in [Field::Mode, Field::Model, Field::Effort, Field::Args] {
+            assert!(!fields.contains(&gone), "{gone:?}");
+        }
+        f.name = "Backup".into();
+        f.prompt = "./backup.sh".into();
+        let (file, text) = f.build().unwrap();
+        assert_eq!(file.agent, "shell");
+        assert!(file.args.is_empty() && file.permission_mode.is_empty());
+        assert_eq!(text, "./backup.sh");
     }
 
     #[test]

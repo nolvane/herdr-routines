@@ -133,8 +133,9 @@ pub enum Mode {
 /// What the prompt editor writes to when saved.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EditTarget {
-    /// A routine's `prompt.md`.
-    Prompt(String),
+    /// A routine's prompt or command: its id and the file (`prompt.md` or
+    /// `command.sh`).
+    Prompt(String, &'static str),
     /// A routine's `routine.toml`, when it cannot be read.
     File(String),
     /// The prompt of the open form.
@@ -151,7 +152,7 @@ pub struct Editor {
 
 /// How the list works, shown on first open and under `?`.
 pub const INTRO: [&str; 5] = [
-    "A routine starts a coding agent on a schedule, in its own tab in the workspace Routines, and hands it the prompt. You can watch each run and step in when the agent asks something.",
+    "A routine runs on a schedule, in its own tab in the workspace Routines: a coding agent that gets your prompt, or a shell command without AI, like a cron job. You can watch each run and step in when it asks something.",
     "Routines run while Herdr runs, also with no window open. When Herdr or the computer was off at the time, a routine runs once afterwards or skips that time, as you choose.",
     "The permission mode decides what the agent may do without asking. Auto suits most routines; with Ask every time, a run waits for you.",
     "The tab of a finished run closes after an hour. Runs lists every run, and l shows what it wrote.",
@@ -303,7 +304,8 @@ impl App {
         match r.save(&self.paths) {
             Ok(()) => {
                 let state = if r.file.enabled { "on" } else { "off" };
-                self.flash(format!("{} is {state}", r.file.name), ACCENT);
+                let color = if r.file.enabled { GREEN } else { RED };
+                self.flash(format!("{} is {state}", r.file.name), color);
             }
             Err(e) => self.flash(e, RED),
         }
@@ -444,11 +446,10 @@ impl App {
                 }
                 return;
             }
-            EditTarget::Prompt(id) => paths::write_atomic(
-                &self.paths.routine_dir(id).join("prompt.md"),
-                text.as_bytes(),
-            )
-            .map(|_| "Prompt saved"),
+            EditTarget::Prompt(id, name) => {
+                paths::write_atomic(&self.paths.routine_dir(id).join(name), text.as_bytes())
+                    .map(|_| "Saved")
+            }
             EditTarget::File(id) => paths::write_atomic(
                 &self.paths.routine_dir(id).join("routine.toml"),
                 text.as_bytes(),
@@ -500,11 +501,18 @@ impl App {
         }
         self.mode = Mode::Confirm(Confirm {
             question: format!("Run {} now?", r.file.name),
-            lines: vec![format!(
-                "{} starts in a new tab in the workspace {} and gets the prompt.",
-                r.file.agent,
-                Settings::load(&self.paths).workspace
-            )],
+            lines: vec![if r.is_shell() {
+                format!(
+                    "The command runs in a new tab in the workspace {}.",
+                    Settings::load(&self.paths).workspace
+                )
+            } else {
+                format!(
+                    "{} starts in a new tab in the workspace {} and gets the prompt.",
+                    r.file.agent,
+                    Settings::load(&self.paths).workspace
+                )
+            }],
             purpose: ConfirmFor::Run(r.id),
         });
     }
@@ -579,7 +587,7 @@ impl App {
         let now = form.value(field);
         let sel = items.iter().position(|i| i.value == now).unwrap_or(0);
         self.mode = Mode::Pick(Picker {
-            title: field.label(form.repeat).into(),
+            title: form.label(field).into(),
             items,
             sel,
             field,
@@ -624,7 +632,8 @@ impl App {
         match form.current() {
             Field::Prompt => {
                 let text = form.prompt.clone();
-                self.open_editor(&text, EditTarget::Form, "Prompt");
+                let title = form.label(Field::Prompt);
+                self.open_editor(&text, EditTarget::Form, title);
             }
             Field::Save => self.try_save(),
             f if f.is_choice() => self.open_picker(),
@@ -873,11 +882,12 @@ impl App {
                 KeyCode::Char('e') => self.edit_selected(),
                 KeyCode::Char('p') => {
                     let r = self.selected_routine().cloned().unwrap();
-                    let title = format!("Prompt of {}", r.file.name);
-                    let text =
-                        std::fs::read_to_string(self.paths.routine_dir(&r.id).join("prompt.md"))
-                            .unwrap_or_default();
-                    self.open_editor(&text, EditTarget::Prompt(r.id), &title);
+                    let what = if r.is_shell() { "Command" } else { "Prompt" };
+                    let title = format!("{what} of {}", r.file.name);
+                    let name = Routine::text_file(&r.file.agent);
+                    let text = std::fs::read_to_string(self.paths.routine_dir(&r.id).join(name))
+                        .unwrap_or_default();
+                    self.open_editor(&text, EditTarget::Prompt(r.id, name), &title);
                 }
                 KeyCode::Char('r') => self.ask_run(),
                 KeyCode::Char(' ') => self.toggle(),

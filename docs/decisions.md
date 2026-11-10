@@ -161,6 +161,30 @@ lists and buttons, and the same colours.
 Why: the owner uses these plugins side by side and wants them to work the
 same way.
 
+## 2026-11-10: Shell commands as routines
+
+A routine can run a shell command or script instead of an agent
+(`agent = "shell"`, the command in `command.sh` instead of `prompt.md`).
+The run opens a tab like any other; the command goes into a script next to
+the run record, and the tab's shell runs a small `/bin/sh` wrapper that
+runs it in the person's `$SHELL` and writes its exit code to a file. The
+scheduler reads that file: exit code 0 is Finished, anything else Failed
+with a notification. Time limit, missed times, no overlap and closing
+finished tabs work as for agents.
+
+Why: the owner wants any cron job, not only AI ones. Running in a tab of
+the routines workspace keeps one place to watch and step in, and the shell
+of the tab brings the person's own environment (PATH and so on). The
+wrapper works whatever shell the tab has, and the exit code file does not
+depend on reading the screen.
+
+## 2026-11-10: On is green, off is red
+
+The mark in front of a routine is a green dot when it is on and a red dot
+when it is off; a routine with a problem gets a yellow warning sign.
+
+Why: the owner's choice, so the state reads at a glance.
+
 ## 2026-11-10: Name
 
 The plugin's name, id and repository are all `herdr-routines` (owner's call,

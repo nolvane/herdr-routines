@@ -79,7 +79,7 @@ fn draw_header(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
             bold(ACCENT),
         ));
     } else {
-        let title = format!("{} Agent routines   ", icons.title());
+        let title = format!("{} Scheduled routines   ", icons.title());
         let mut x = line.x + title.width() as u16;
         spans.push(Span::styled(title, bold(ACCENT)));
         for view in View::ORDER {
@@ -254,6 +254,14 @@ fn routine_detail(r: &Routine) -> Line<'static> {
         return Line::from(Span::styled(p.clone(), Style::new().fg(RED)));
     }
     let f = &r.file;
+    if r.is_shell() {
+        let first = r
+            .prompt
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("");
+        return faint(format!("shell · {} · {}", clip(first.trim(), 40), f.folder));
+    }
     let mut parts = vec![f.agent.clone()];
     if !f.model.is_empty() {
         parts.push(agent::label(agent::models(&f.agent), &f.model));
@@ -331,7 +339,7 @@ fn draw_routines(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
                         let second = if r.problem.is_some() {
                             faint("–")
                         } else if !r.file.enabled {
-                            faint("off")
+                            Line::from(Span::styled("off", Style::new().fg(RED)))
                         } else {
                             match r.cron().and_then(|c| c.next_after(&now)) {
                                 Some(t) => faint(format!("next {}", crate::app::until(&t, &now))),
@@ -512,7 +520,14 @@ fn field_value(form: &Form, f: Field, selected: bool, room: usize) -> Vec<Span<'
             ]
         }
         f if f.is_choice() => {
-            let mut v = vec![text(form.shown(f))];
+            let mut v = vec![if f == Field::Enabled {
+                Span::styled(
+                    form.shown(f),
+                    Style::new().fg(if form.enabled { GREEN } else { RED }),
+                )
+            } else {
+                text(form.shown(f))
+            }];
             let detail = form.detail(f);
             if !detail.is_empty() {
                 v.push(Span::styled(format!("  {detail}"), Style::new().fg(FAINT)));
@@ -577,7 +592,7 @@ fn draw_form(frame: &mut Frame, app: &mut App, area: Rect) {
     );
     let fields = form.fields();
     let current = form.current();
-    let hint = wrap(current.hint(), inner.width.saturating_sub(2) as usize);
+    let hint = wrap(form.hint(current), inner.width.saturating_sub(2) as usize);
     // Below the fields: the schedule in words and the current field's hint.
     let below = if inner.height >= 12 {
         2 + hint.len().min(3) as u16
@@ -594,7 +609,7 @@ fn draw_form(frame: &mut Frame, app: &mut App, area: Rect) {
             frame.render_widget(Block::new().style(Style::new().bg(SELECTED_BG)), row);
         }
         app.hits.push((row, Hit::Field(i)));
-        let label = format!(" {:<w$}", f.label(form.repeat), w = LABEL_W);
+        let label = format!(" {:<w$}", form.label(*f), w = LABEL_W);
         let label_style = if selected {
             bold(TEXT)
         } else {
@@ -895,7 +910,10 @@ fn hints(spans: &[(&'static str, &'static str)]) -> Line<'static> {
 }
 
 fn draw_picker(frame: &mut Frame, app: &mut App, p: &crate::app::Picker) {
-    let two = p.items.iter().any(|i| !i.detail.is_empty());
+    // Details on a line of their own, except in long lists (the agents),
+    // where they follow the name.
+    let any = p.items.iter().any(|i| !i.detail.is_empty());
+    let two = any && p.items.len() <= 8;
     let per = if two { 2u16 } else { 1 };
     let want_h = p.items.len() as u16 * per + 4;
     let area = centered(frame.area(), 72, want_h);
@@ -916,10 +934,17 @@ fn draw_picker(frame: &mut Frame, app: &mut App, p: &crate::app::Picker) {
         } else {
             "  ".into()
         };
-        let mut lines = vec![Line::from(vec![
+        let mut first = vec![
             Span::styled(number, Style::new().fg(FAINT)),
             Span::styled(item.label.clone(), bold(TEXT)),
-        ])];
+        ];
+        if !two && !item.detail.is_empty() {
+            first.push(Span::styled(
+                format!("  {}", item.detail),
+                Style::new().fg(MUTED),
+            ));
+        }
+        let mut lines = vec![Line::from(first)];
         if two {
             lines.push(Line::from(Span::styled(
                 format!("  {}", item.detail),
@@ -1147,7 +1172,7 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
             &[
                 ("⏎  e", "edit the routine"),
                 ("n", "new routine"),
-                ("p", "write the prompt"),
+                ("p", "write the prompt or command"),
                 ("r", "run now (asks first)"),
                 ("Space", "on / off"),
                 ("o", "go to the tab of its last run"),
