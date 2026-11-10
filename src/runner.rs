@@ -180,7 +180,7 @@ fn notify_needs_you(run: &mut Run) {
     if !run.notified {
         herdr::notify(
             &format!("{} needs you", run.routine_name),
-            "The routine's agent is waiting for an answer. Open Routines to jump to it.",
+            "The routine's agent is waiting for an answer. Open herdr-routines to jump to it.",
             "request",
         );
         run.notified = true;
@@ -274,7 +274,7 @@ pub fn watch(paths: &Paths, settings: &Settings, run: &mut Run, routine: Option<
                 if settings.notify_finished {
                     herdr::notify(
                         &format!("{} finished", run.routine_name),
-                        "Open Routines to see the run.",
+                        "Open herdr-routines to see the run.",
                         "done",
                     );
                 }

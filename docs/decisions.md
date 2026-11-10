@@ -126,6 +126,9 @@ only to the local Herdr server, and the agents use their own logins.
 
 ## 2026-11-10: Name
 
-"Routines" is a plain English word for what the plugin does. No agent or
-vendor name is in the plugin's name, id or repository name, so no trademark
-is used as a product name.
+The plugin's name, id and repository are all `herdr-routines` (owner's call,
+2026-11-10): one name everywhere, matching the binary. "Routines" is a plain
+English word for what the plugin does, and Herdr is the host it extends. No
+agent or vendor name is in it, so no trademark is used as a product name.
+Inside the list the tab "Routines" and the default workspace for runs keep
+the plain word, since they name the things listed, not the plugin.

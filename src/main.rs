@@ -1,4 +1,4 @@
-//! Herdr Routines: runs coding agents on a schedule while Herdr runs, each
+//! herdr-routines: runs coding agents on a schedule while Herdr runs, each
 //! run in its own tab, with a list to manage routines and their runs.
 //!
 //! Commands:
@@ -114,7 +114,7 @@ fn main() {
         }
         "restart" => match scheduler::spawn(&paths) {
             Ok(pid) => {
-                herdr::notify("Routines", "Scheduler restarted", "none");
+                herdr::notify("herdr-routines", "Scheduler restarted", "none");
                 println!("started pid {pid}");
                 0
             }
@@ -126,7 +126,7 @@ fn main() {
         "stop" => {
             scheduler::stop(&paths);
             herdr::notify(
-                "Routines",
+                "herdr-routines",
                 "Scheduler stopped: no routine runs until it starts again",
                 "none",
             );

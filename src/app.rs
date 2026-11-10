@@ -379,7 +379,7 @@ impl App {
             }
             KeyCode::Char('q') => {
                 self.mode = Mode::Confirm(
-                    "Close Routines? (routines keep running)".into(),
+                    "Close herdr-routines? (routines keep running)".into(),
                     Pending::Quit,
                 )
             }

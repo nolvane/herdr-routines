@@ -1,4 +1,4 @@
-# Herdr Routines
+# herdr-routines
 
 A [Herdr](https://herdr.dev) plugin that runs coding agents on a schedule.
 A routine is a prompt, an agent (Claude, Codex, Gemini, OpenCode or any other
@@ -51,21 +51,21 @@ herdr plugin install nolvane/herdr-routines --yes
 ```
 
 Herdr builds the plugin and starts the scheduler. Open the list with the
-plugin action "Routines: open or close", or bind a key in
+plugin action "herdr-routines: open or close", or bind a key in
 `~/.config/herdr/config.toml`:
 
 ```toml
 [[keys.command]]
 key = "prefix+u"
 type = "plugin_action"
-command = "routines.open"
-description = "Routines"
+command = "herdr-routines.open"
+description = "herdr-routines"
 
 [[keys.command]]
 key = "prefix+shift+u"
 type = "plugin_action"
-command = "routines.open-split"
-description = "Routines (split)"
+command = "herdr-routines.open-split"
+description = "herdr-routines (split)"
 ```
 
 Update with `herdr plugin update`.
@@ -96,7 +96,7 @@ edits a text field, `Ctrl+U` clears it, `⏎` on "Prompt" opens your editor and
 ## Routines are files
 
 Each routine is a folder in the plugin's config directory
-(`herdr plugin config-dir routines`), under `routines/<id>/`:
+(`herdr plugin config-dir herdr-routines`), under `routines/<id>/`:
 
 `routine.toml`
 
@@ -132,7 +132,7 @@ give the agent the permission mode it needs through its own settings or
 `args`, as you would when starting it yourself.
 
 Runs are kept in the plugin's state directory
-(`~/.local/state/herdr/plugins/routines/runs/`), 50 per routine.
+(`~/.local/state/herdr/plugins/herdr-routines/runs/`), 50 per routine.
 
 ## Settings
 
@@ -149,7 +149,7 @@ herdr-routines fire <id>  # run a routine now
 herdr-routines status     # whether the scheduler runs
 ```
 
-The plugin actions "Routines: restart the scheduler", "stop" and "status" do
+The plugin actions "herdr-routines: restart the scheduler", "stop" and "status" do
 the same from Herdr. The scheduler log is `routines.log` in the state
 directory.
 

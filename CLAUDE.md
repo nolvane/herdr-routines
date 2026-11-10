@@ -1,4 +1,4 @@
-# Herdr Routines
+# herdr-routines
 
 A [Herdr](https://herdr.dev) plugin that runs coding agents on a schedule,
 each run in its own tab. What it does and how users install it:
@@ -86,14 +86,14 @@ picks up the new version, then `./scripts/check.sh --stage release`.
 **What ships.** Users install from GitHub, and `herdr plugin update` fetches
 the newest commit of the ref recorded at install and builds it. A merge to
 `main` is therefore what reaches users at their next update. After an update,
-the plugin action "Routines: restart the scheduler" (or a Herdr restart)
+the plugin action "herdr-routines: restart the scheduler" (or a Herdr restart)
 starts the new scheduler; an open list keeps the old binary until it is
 closed and opened again.
 
 **Try a release before it reaches users.** Build a local checkout with
 `sh scripts/build.sh` and `herdr plugin link "$PWD"`, or install a pushed
 branch with `herdr plugin install nolvane/herdr-routines --ref <branch> --yes`.
-Back to the normal install: `herdr plugin unlink routines`, then
+Back to the normal install: `herdr plugin unlink herdr-routines`, then
 `herdr plugin install nolvane/herdr-routines --yes`.
 
 **Changelog and GitHub release.** `CHANGELOG.md` follows

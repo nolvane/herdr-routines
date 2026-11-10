@@ -1,5 +1,5 @@
-# Settings for the Routines plugin. Copy to the plugin's config directory
-# (`herdr plugin config-dir routines`) as config.toml. Every line is optional;
+# Settings for the herdr-routines plugin. Copy to the plugin's config directory
+# (`herdr plugin config-dir herdr-routines`) as config.toml. Every line is optional;
 # these are the defaults.
 
 # The workspace runs open in; created when missing.

@@ -1,7 +1,7 @@
-# Herdr Routines: runs coding agents on a schedule while Herdr runs.
+# herdr-routines: runs coding agents on a schedule while Herdr runs.
 
-id = "routines"
-name = "Routines"
+id = "herdr-routines"
+name = "herdr-routines"
 version = "0.1.0"
 min_herdr_version = "0.9.0"
 description = "Runs Claude, Codex or any other coding agent on a schedule, each run in its own tab, with a list to manage routines and their runs"
@@ -18,41 +18,41 @@ command = ["./herdr-routines", "start"]
 # The list of routines and runs.
 [[panes]]
 id = "list"
-title = "Routines"
+title = "herdr-routines"
 placement = "overlay"
 command = ["./herdr-routines", "list"]
 
 [[actions]]
 id = "open"
-title = "Routines: open or close"
+title = "herdr-routines: open or close"
 description = "Show the routines and their runs"
 contexts = ["global"]
 command = ["./herdr-routines", "open"]
 
 [[actions]]
 id = "open-split"
-title = "Routines: open or close below the pane"
+title = "herdr-routines: open or close below the pane"
 description = "Show the routines in a split below the pane"
 contexts = ["global"]
 command = ["./herdr-routines", "open", "split"]
 
 [[actions]]
 id = "restart"
-title = "Routines: restart the scheduler"
+title = "herdr-routines: restart the scheduler"
 description = "Start a fresh scheduler in place of the running one"
 contexts = ["global"]
 command = ["./herdr-routines", "restart"]
 
 [[actions]]
 id = "stop"
-title = "Routines: stop the scheduler"
+title = "herdr-routines: stop the scheduler"
 description = "Stop running routines until the next start or restart"
 contexts = ["global"]
 command = ["./herdr-routines", "stop"]
 
 [[actions]]
 id = "status"
-title = "Routines: scheduler status"
+title = "herdr-routines: scheduler status"
 description = "Show whether the scheduler runs"
 contexts = ["global"]
 command = ["./herdr-routines", "status"]

@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
-pub const PLUGIN_ID: &str = "routines";
+pub const PLUGIN_ID: &str = "herdr-routines";
 
 fn home() -> PathBuf {
     PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| ".".into()))
