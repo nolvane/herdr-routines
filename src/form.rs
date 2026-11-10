@@ -144,7 +144,7 @@ impl Field {
                 "Minutes until a run counts as timed out. Its tab stays open; the agent is not stopped."
             }
             Field::Args => {
-                "More arguments for the agent's command line, for experts. Usually empty."
+                "Extra options for the agent's command line, for experts, such as --add-dir ~/other. Usually empty."
             }
             Field::Enabled => "Off keeps the routine but never runs it.",
             Field::Save => "Saves the routine (Ctrl+S anywhere in the form).",
@@ -265,7 +265,7 @@ impl Form {
     /// The fields shown for the current agent and repeat choice.
     pub fn fields(&self) -> Vec<Field> {
         let a = self.agent();
-        let mut v = vec![Field::Name, Field::Prompt, Field::Agent];
+        let mut v = vec![Field::Name, Field::Agent];
         if !agent::modes(a).is_empty() {
             v.push(Field::Mode);
         }
@@ -288,7 +288,9 @@ impl Form {
         if !self.is_shell() {
             v.push(Field::Args);
         }
-        v.extend([Field::Enabled, Field::Save]);
+        // The prompt last, right above the save button: it is the longest
+        // field and the one people write after choosing everything else.
+        v.extend([Field::Enabled, Field::Prompt, Field::Save]);
         v
     }
 

@@ -600,9 +600,17 @@ fn draw_form(frame: &mut Frame, app: &mut App, area: Rect) {
         1
     };
     let list_h = inner.height.saturating_sub(below);
-    let first = offset(form.field, fields.len(), list_h as usize);
-    for (i, f) in fields.iter().enumerate().skip(first).take(list_h as usize) {
-        let y = inner.y + (i - first) as u16;
+    // An empty row between the last field and the save button.
+    let gap = usize::from(list_h >= 6);
+    let row_of = |i: usize| i + if fields[i] == Field::Save { gap } else { 0 };
+    let rows = fields.len() + gap;
+    let first = offset(row_of(form.field), rows, list_h as usize);
+    for (i, f) in fields.iter().enumerate() {
+        let r = row_of(i);
+        if r < first || r >= first + list_h as usize {
+            continue;
+        }
+        let y = inner.y + (r - first) as u16;
         let row = Rect::new(inner.x, y, inner.width, 1);
         let selected = i == form.field;
         if selected {
@@ -634,7 +642,7 @@ fn draw_form(frame: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
     // Right under the fields, so it reads as part of the form.
-    let shown = (fields.len() - first).min(list_h as usize) as u16;
+    let shown = (rows - first).min(list_h as usize) as u16;
     let y = inner.y + shown + if below > 1 { 1 } else { 0 };
     let now = Local::now();
     let mut summary = match form.schedule() {

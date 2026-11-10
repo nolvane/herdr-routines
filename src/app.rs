@@ -1297,13 +1297,13 @@ mod tests {
             press(&mut a, KeyCode::Enter);
             assert!(a.form.is_some());
             screen(&mut a, w, h);
-            press(&mut a, KeyCode::Down);
+            a.form.as_mut().unwrap().select(Field::Prompt);
+            screen(&mut a, w, h);
             press(&mut a, KeyCode::Enter);
             assert!(a.editor.is_some(), "⏎ on the prompt opens the editor");
             screen(&mut a, w, h);
             a.editor = None;
-            press(&mut a, KeyCode::Down);
-            press(&mut a, KeyCode::Down);
+            a.form.as_mut().unwrap().select(Field::Agent);
             press(&mut a, KeyCode::Enter);
             assert!(matches!(a.mode, Mode::Pick(_)));
             screen(&mut a, w, h);
@@ -1358,13 +1358,29 @@ mod tests {
     }
 
     #[test]
+    fn the_prompt_sits_above_the_save_button() {
+        let mut a = app("layout");
+        press(&mut a, KeyCode::Char('n'));
+        let lines = screen(&mut a, 90, 30);
+        let at = |s: &str| lines.iter().position(|l| l.contains(s)).unwrap();
+        let prompt = at(" Prompt ");
+        let save = at("⏎ save");
+        assert!(
+            at(" On ") < prompt,
+            "the prompt comes after the other fields"
+        );
+        assert_eq!(save, prompt + 2, "one empty row before the button");
+        assert!(lines[prompt + 1].trim().is_empty());
+    }
+
+    #[test]
     fn the_form_saves_mode_and_model() {
         let mut a = app("form");
         press(&mut a, KeyCode::Char('n'));
         for c in "Check links".chars() {
             press(&mut a, KeyCode::Char(c));
         }
-        press(&mut a, KeyCode::Down);
+        a.form.as_mut().unwrap().select(Field::Prompt);
         press(&mut a, KeyCode::Enter);
         for c in "Find broken links.".chars() {
             press(&mut a, KeyCode::Char(c));
