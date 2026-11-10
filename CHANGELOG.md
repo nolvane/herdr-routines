@@ -16,6 +16,12 @@ All notable changes to this plugin. The format follows
   agent is ready; the prompt follows once answered.
 - Missed times caught up once or skipped, per routine; no overlapping runs;
   time limit per routine; finished tabs closed after an hour.
-- List of routines and runs with a form to create and edit routines, prompt
-  editing in your editor, run now, on and off, delete, and saved output.
+- List of routines and runs with a form to create and edit routines, run
+  now, on and off, delete, and saved output; the same look and the same
+  keys and mouse use as the other Herdr plugins of this author, with all
+  keys under `?`.
+- Permission mode, model and effort per routine, picked from a list, for
+  Claude Code, Codex and Gemini; new routines start in Auto.
+- Prompt editor inside the list (arrows, mouse, paste, undo), and `Ctrl+O`
+  for your own editor.
 - `routines` (JSON) and `fire <id>` commands for scripts and other agents.

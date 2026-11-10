@@ -56,4 +56,33 @@ impl Icons {
     pub fn tab_open(&self) -> &'static str {
         self.pick("\u{f524}", "▸")
     }
+
+    /// In front of the title.
+    pub fn title(&self) -> &'static str {
+        self.pick("\u{f455}", "◷")
+    }
+
+    pub fn warning(&self) -> &'static str {
+        self.pick("\u{f421}", "!")
+    }
+
+    /// The scheduler runs.
+    pub fn running(&self) -> &'static str {
+        self.pick("\u{f444}", "●")
+    }
+}
+
+/// Text colour that reads on a coloured background.
+pub fn on(bg: Color) -> Color {
+    match bg {
+        Color::Rgb(r, g, b) => {
+            let l = 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32;
+            if l > 150.0 {
+                Color::Rgb(0x16, 0x17, 0x22)
+            } else {
+                Color::Rgb(0xF5, 0xF5, 0xFA)
+            }
+        }
+        _ => TEXT,
+    }
 }

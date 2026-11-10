@@ -21,9 +21,13 @@ each run in its own tab. What it does and how users install it:
 - `runner.rs`: starting a run and following it (states, notifications,
   closing finished tabs).
 - `herdr.rs`: the Herdr calls. `routine.rs`: routines and settings.
-  `store.rs`: run records. `cron.rs`: schedules. `paths.rs`: where files go.
-- `app.rs` and `form.rs`: the list and the edit form. `pane.rs`: the `open`
-  action.
+  `agent.rs`: permission modes, models and effort per agent and their
+  flags. `store.rs`: run records. `cron.rs`: schedules. `paths.rs`: where
+  files go.
+- `app.rs`: the list's state, keys and mouse. `ui.rs`: drawing, in the look
+  of the Git Panel and Multiaccount plugins (keep them alike).
+  `form.rs`: the edit form. `editor.rs`: the prompt editor. `pane.rs`: the
+  `open` action.
 
 ## Conventions
 

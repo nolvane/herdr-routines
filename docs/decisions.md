@@ -119,10 +119,47 @@ inside the hour repeated in autumn can run twice.
 
 ## 2026-11-10: Dependencies and licences
 
-`ratatui` (MIT), `chrono`, `serde`, `serde_json` and `toml` (each MIT OR
-Apache-2.0). All allow use and redistribution in this MIT-licensed plugin
+`ratatui` (MIT), `chrono`, `serde`, `serde_json`, `toml` and
+`unicode-width` (each MIT OR Apache-2.0; `unicode-width` measures text for
+the prompt editor and comes with ratatui already). All allow use and redistribution in this MIT-licensed plugin
 with the licence notice kept. No outside service is called: the plugin talks
 only to the local Herdr server, and the agents use their own logins.
+
+## 2026-11-10: Permission mode, model and effort are fields, not arguments
+
+A routine has `permission_mode`, `model` and `effort`, picked from lists in
+the form, and `agent.rs` turns them into the agent's own flags (Claude
+Code `--permission-mode`, `--model`, `--effort`; Codex `--full-auto`,
+`--sandbox`, `--dangerously-bypass-approvals-and-sandbox`, `--model`;
+Gemini `--approval-mode`, `--model`). Only agents whose flags were checked
+get these fields; all others keep `args` for their own flags. Claude's
+modes and model aliases are the ones its `--help` lists; other models are
+typed by name. New Claude and Codex routines start in Auto.
+
+Why: the owner wants to set auto mode and the model per routine without
+knowing command line flags. A scheduled run has nobody watching, so the
+default that asks before every change would leave most runs waiting.
+
+## 2026-11-10: The prompt is written in the list
+
+The prompt opens in an editor inside the list (`editor.rs`): word wrap,
+arrows and Home/End on the lines as shown, mouse placement, paste, undo.
+`Ctrl+O` still hands the text to `$VISUAL`/`$EDITOR` for those who prefer
+theirs.
+
+Why: the owner found the jump into nano or vim unintuitive. A small text
+area keeps the look and keys of the list and needs no editor set up.
+
+## 2026-11-10: Same look and controls as the other plugins
+
+The list follows the Herdr Git Panel and Multiaccount plugins: title with
+tabs in the header, two-line rows with a heading bar, a footer with
+clickable keys, rounded dialogs, a keys overlay under `?` with the version
+linked in its border, `q` asking in the footer, the mouse for tabs, rows,
+lists and buttons, and the same colours.
+
+Why: the owner uses these plugins side by side and wants them to work the
+same way.
 
 ## 2026-11-10: Name
 

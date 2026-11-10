@@ -1,5 +1,6 @@
 //! The form to create or change a routine.
 
+use crate::agent;
 use crate::cron::Cron;
 use crate::routine::{Missed, Routine, RoutineFile, AGENTS};
 
@@ -30,6 +31,16 @@ impl Repeat {
             Repeat::Custom => "Custom (cron)",
         }
     }
+
+    fn detail(self) -> &'static str {
+        match self {
+            Repeat::Hourly => "At a minute of every hour",
+            Repeat::Daily => "At a time every day",
+            Repeat::Weekdays => "At a time Monday to Friday",
+            Repeat::Weekly => "At a time on one day of the week",
+            Repeat::Custom => "Any cron schedule, such as 15 8-18 * * 1-5",
+        }
+    }
 }
 
 pub const WEEKDAYS: [&str; 7] = [
@@ -42,20 +53,26 @@ pub const WEEKDAYS: [&str; 7] = [
     "Sunday",
 ];
 
+/// The model picker's last entry, which asks for a typed name.
+pub const OTHER_MODEL: &str = "\u{0}other";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Field {
     Name,
+    Prompt,
     Agent,
-    Args,
+    Mode,
+    Model,
+    Effort,
     Folder,
     Repeat,
-    Time,
     Weekday,
+    Time,
     Cron,
     Missed,
     Limit,
+    Args,
     Enabled,
-    Prompt,
     Save,
 }
 
@@ -63,8 +80,11 @@ impl Field {
     pub fn label(self, repeat: Repeat) -> &'static str {
         match self {
             Field::Name => "Name",
+            Field::Prompt => "Prompt",
             Field::Agent => "Agent",
-            Field::Args => "Agent arguments",
+            Field::Mode => "Permission mode",
+            Field::Model => "Model",
+            Field::Effort => "Effort",
             Field::Folder => "Folder",
             Field::Repeat => "Repeat",
             Field::Time if repeat == Repeat::Hourly => "Minute",
@@ -72,14 +92,14 @@ impl Field {
             Field::Weekday => "Day",
             Field::Cron => "Cron schedule",
             Field::Missed => "If missed",
-            Field::Limit => "Time limit (minutes)",
+            Field::Limit => "Time limit",
+            Field::Args => "Extra arguments",
             Field::Enabled => "On",
-            Field::Prompt => "Prompt",
             Field::Save => "Save",
         }
     }
 
-    /// Typed into, as opposed to picked with ← →.
+    /// Typed into, as opposed to picked from a list.
     pub fn is_text(self) -> bool {
         matches!(
             self,
@@ -87,24 +107,64 @@ impl Field {
         )
     }
 
+    /// Picked from a list (⏎ opens it, ← → steps through it).
+    pub fn is_choice(self) -> bool {
+        matches!(
+            self,
+            Field::Agent
+                | Field::Mode
+                | Field::Model
+                | Field::Effort
+                | Field::Repeat
+                | Field::Weekday
+                | Field::Missed
+                | Field::Enabled
+        )
+    }
+
     pub fn hint(self) -> &'static str {
         match self {
-            Field::Name => "What the routine does, as shown in the list",
-            Field::Agent => "← → picks the coding agent Herdr starts",
-            Field::Args => "Passed to the agent, such as --model opus (optional)",
-            Field::Folder => "The folder the agent starts in",
-            Field::Repeat => "← → picks how often it runs",
-            Field::Time => "24-hour time, such as 08:15 (for every hour: the minute, such as 15)",
-            Field::Weekday => "← → picks the day",
-            Field::Cron => "minute hour day month weekday, such as 15 8-18 * * 1-5",
-            Field::Missed => {
-                "When Herdr or the computer was off at the time: run once afterwards, or skip"
+            Field::Name => "What the routine does, as shown in the list.",
+            Field::Prompt => "What the agent is asked to do. ⏎ opens the editor.",
+            Field::Agent => "The coding agent Herdr starts for each run.",
+            Field::Mode => {
+                "What the agent may do without asking. A run waits in its tab when the agent asks something."
             }
-            Field::Limit => "After this the run counts as timed out; its tab stays open",
-            Field::Enabled => "Space or ← → switches it on or off",
-            Field::Prompt => "⏎ opens the prompt in your editor ($VISUAL, $EDITOR or nano)",
-            Field::Save => "⏎ saves the routine (or Ctrl+S anywhere)",
+            Field::Model => "The model the agent uses. Other… takes any model name.",
+            Field::Effort => "How hard the agent thinks before it answers.",
+            Field::Folder => "The folder the agent starts in, such as ~/projects/site.",
+            Field::Repeat => "How often it runs.",
+            Field::Time => "24-hour time, such as 08:15. For every hour: the minute, such as 15.",
+            Field::Weekday => "The day of the week it runs.",
+            Field::Cron => "minute hour day month weekday, such as 15 8-18 * * 1-5.",
+            Field::Missed => {
+                "When Herdr or the computer was off at the time: run once afterwards, or skip it."
+            }
+            Field::Limit => {
+                "Minutes until a run counts as timed out. Its tab stays open; the agent is not stopped."
+            }
+            Field::Args => {
+                "More arguments for the agent's command line, for experts. Usually empty."
+            }
+            Field::Enabled => "Off keeps the routine but never runs it.",
+            Field::Save => "Saves the routine (Ctrl+S anywhere in the form).",
         }
+    }
+}
+
+/// An entry of a choice field's list.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Item {
+    pub value: String,
+    pub label: String,
+    pub detail: String,
+}
+
+fn item(value: &str, label: &str, detail: &str) -> Item {
+    Item {
+        value: value.into(),
+        label: label.into(),
+        detail: detail.into(),
     }
 }
 
@@ -114,6 +174,9 @@ pub struct Form {
     pub id: Option<String>,
     pub name: String,
     pub agent: usize,
+    pub mode: String,
+    pub model: String,
+    pub effort: String,
     pub args: String,
     pub folder: String,
     pub repeat: Repeat,
@@ -134,6 +197,9 @@ impl Form {
             id: None,
             name: String::new(),
             agent: 0,
+            mode: agent::default_mode(AGENTS[0]).into(),
+            model: String::new(),
+            effort: String::new(),
             args: String::new(),
             folder: folder.to_string(),
             repeat: Repeat::Weekdays,
@@ -154,6 +220,9 @@ impl Form {
         f.id = Some(r.id.clone());
         f.name = r.file.name.clone();
         f.agent = AGENTS.iter().position(|a| *a == r.file.agent).unwrap_or(0);
+        f.mode = r.file.permission_mode.clone();
+        f.model = r.file.model.clone();
+        f.effort = r.file.effort.clone();
         f.args = join_args(&r.file.args);
         f.cron = r.file.schedule.clone();
         let (repeat, time, weekday) = preset_of(&r.file.schedule);
@@ -167,15 +236,24 @@ impl Form {
         f
     }
 
-    /// The fields shown for the current repeat choice.
+    pub fn agent(&self) -> &'static str {
+        AGENTS[self.agent]
+    }
+
+    /// The fields shown for the current agent and repeat choice.
     pub fn fields(&self) -> Vec<Field> {
-        let mut v = vec![
-            Field::Name,
-            Field::Agent,
-            Field::Args,
-            Field::Folder,
-            Field::Repeat,
-        ];
+        let a = self.agent();
+        let mut v = vec![Field::Name, Field::Prompt, Field::Agent];
+        if !agent::modes(a).is_empty() {
+            v.push(Field::Mode);
+        }
+        if !agent::models(a).is_empty() {
+            v.push(Field::Model);
+        }
+        if !agent::efforts(a).is_empty() {
+            v.push(Field::Effort);
+        }
+        v.extend([Field::Folder, Field::Repeat]);
         match self.repeat {
             Repeat::Custom => v.push(Field::Cron),
             Repeat::Weekly => {
@@ -187,8 +265,8 @@ impl Form {
         v.extend([
             Field::Missed,
             Field::Limit,
+            Field::Args,
             Field::Enabled,
-            Field::Prompt,
             Field::Save,
         ]);
         v
@@ -201,7 +279,13 @@ impl Form {
 
     pub fn move_by(&mut self, delta: i32) {
         let n = self.fields().len() as i32;
-        self.field = ((self.field as i32 + delta).rem_euclid(n)) as usize;
+        self.field = (self.field as i32 + delta).clamp(0, n - 1) as usize;
+    }
+
+    pub fn select(&mut self, f: Field) {
+        if let Some(i) = self.fields().iter().position(|x| *x == f) {
+            self.field = i;
+        }
     }
 
     fn text_mut(&mut self, f: Field) -> Option<&mut String> {
@@ -221,8 +305,14 @@ impl Form {
         if let Some(t) = self.text_mut(f) {
             t.push(c);
             self.dirty = true;
-        } else if c == ' ' {
-            self.cycle(1);
+        }
+    }
+
+    pub fn paste(&mut self, text: &str) {
+        let f = self.current();
+        if let Some(t) = self.text_mut(f) {
+            t.push_str(text);
+            self.dirty = true;
         }
     }
 
@@ -242,28 +332,152 @@ impl Form {
         }
     }
 
-    /// ← → on a choice field.
-    pub fn cycle(&mut self, delta: i32) {
-        let step = |i: usize, n: usize| ((i as i32 + delta).rem_euclid(n as i32)) as usize;
-        match self.current() {
-            Field::Agent => self.agent = step(self.agent, AGENTS.len()),
+    /// The value a choice field has now.
+    pub fn value(&self, f: Field) -> String {
+        match f {
+            Field::Agent => self.agent().into(),
+            Field::Mode => self.mode.clone(),
+            Field::Model => self.model.clone(),
+            Field::Effort => self.effort.clone(),
+            Field::Repeat => self.repeat.label().into(),
+            Field::Weekday => WEEKDAYS[self.weekday].into(),
+            Field::Missed => self.missed.label().into(),
+            Field::Enabled => if self.enabled { "Yes" } else { "No" }.into(),
+            _ => String::new(),
+        }
+    }
+
+    /// How a choice field's value shows.
+    pub fn shown(&self, f: Field) -> String {
+        let a = self.agent();
+        match f {
+            Field::Mode => agent::label(agent::modes(a), &self.mode),
+            Field::Model => agent::label(agent::models(a), &self.model),
+            Field::Effort => agent::label(agent::efforts(a), &self.effort),
+            _ => self.value(f),
+        }
+    }
+
+    /// The line under a choice's value: what it means.
+    pub fn detail(&self, f: Field) -> String {
+        let v = self.value(f);
+        self.items(f)
+            .into_iter()
+            .find(|i| i.value == v)
+            .map(|i| i.detail)
+            .unwrap_or_default()
+    }
+
+    /// A choice field's list.
+    pub fn items(&self, f: Field) -> Vec<Item> {
+        let a = self.agent();
+        let from = |list: &[agent::Choice]| -> Vec<Item> {
+            list.iter()
+                .map(|c| item(c.value, c.label, c.detail))
+                .collect()
+        };
+        match f {
+            Field::Agent => AGENTS.iter().map(|a| item(a, a, "")).collect(),
+            Field::Mode => from(agent::modes(a)),
+            Field::Model => {
+                let mut v = from(agent::models(a));
+                if !self.model.is_empty() && !v.iter().any(|i| i.value == self.model) {
+                    v.push(item(&self.model, &self.model, "Typed in"));
+                }
+                v.push(item(OTHER_MODEL, "Other…", "Type any model name"));
+                v
+            }
+            Field::Effort => from(agent::efforts(a)),
+            Field::Repeat => Repeat::ALL
+                .iter()
+                .map(|r| item(r.label(), r.label(), r.detail()))
+                .collect(),
+            Field::Weekday => WEEKDAYS.iter().map(|d| item(d, d, "")).collect(),
+            Field::Missed => [Missed::RunOnce, Missed::Skip]
+                .iter()
+                .map(|m| item(m.label(), m.label(), m.detail()))
+                .collect(),
+            Field::Enabled => vec![
+                item("Yes", "Yes", "Runs on its schedule"),
+                item("No", "No", "Kept, but never runs"),
+            ],
+            _ => Vec::new(),
+        }
+    }
+
+    /// Sets a choice field to a value from its list (or a typed model).
+    pub fn choose(&mut self, f: Field, value: &str) {
+        if value == OTHER_MODEL {
+            return;
+        }
+        match f {
+            Field::Agent => {
+                let Some(i) = AGENTS.iter().position(|a| *a == value) else {
+                    return;
+                };
+                if i == self.agent {
+                    return;
+                }
+                self.agent = i;
+                let a = self.agent();
+                if agent::find(agent::modes(a), &self.mode).is_none() || self.mode.is_empty() {
+                    self.mode = agent::default_mode(a).into();
+                }
+                // Model names belong to one agent.
+                self.model.clear();
+                if agent::find(agent::efforts(a), &self.effort).is_none() {
+                    self.effort.clear();
+                }
+                // The list of fields changed: stay on the agent.
+                self.select(Field::Agent);
+            }
+            Field::Mode => self.mode = value.into(),
+            Field::Model => self.model = value.trim().into(),
+            Field::Effort => self.effort = value.into(),
             Field::Repeat => {
                 // Switching to custom starts from the schedule so far.
                 if let Ok(c) = self.schedule() {
                     self.cron = c;
                 }
-                let i = Repeat::ALL
-                    .iter()
-                    .position(|r| *r == self.repeat)
-                    .unwrap_or(0);
-                self.repeat = Repeat::ALL[step(i, Repeat::ALL.len())];
+                if let Some(r) = Repeat::ALL.iter().find(|r| r.label() == value) {
+                    self.repeat = *r;
+                }
+                self.select(Field::Repeat);
             }
-            Field::Weekday => self.weekday = step(self.weekday, 7),
-            Field::Missed => self.missed = self.missed.toggled(),
-            Field::Enabled => self.enabled = !self.enabled,
+            Field::Weekday => {
+                if let Some(i) = WEEKDAYS.iter().position(|d| *d == value) {
+                    self.weekday = i;
+                }
+            }
+            Field::Missed => {
+                self.missed = if value == Missed::Skip.label() {
+                    Missed::Skip
+                } else {
+                    Missed::RunOnce
+                }
+            }
+            Field::Enabled => self.enabled = value == "Yes",
             _ => return,
         }
         self.dirty = true;
+    }
+
+    /// ← → on a choice field: the next or previous entry of its list.
+    pub fn cycle(&mut self, delta: i32) {
+        let f = self.current();
+        let items: Vec<Item> = self
+            .items(f)
+            .into_iter()
+            .filter(|i| i.value != OTHER_MODEL)
+            .collect();
+        if items.is_empty() {
+            return;
+        }
+        let now = self.value(f);
+        let i = items.iter().position(|i| i.value == now).unwrap_or(0) as i32;
+        let n = items.len() as i32;
+        let next = items[(i + delta).rem_euclid(n) as usize].value.clone();
+        self.choose(f, &next);
     }
 
     /// The cron text the choices stand for.
@@ -305,7 +519,10 @@ impl Form {
             name: self.name.trim().to_string(),
             enabled: self.enabled,
             schedule,
-            agent: AGENTS[self.agent].to_string(),
+            agent: self.agent().to_string(),
+            permission_mode: self.mode.clone(),
+            model: self.model.clone(),
+            effort: self.effort.clone(),
             args: split_args(&self.args)?,
             folder: self.folder.trim().to_string(),
             missed: self.missed,
@@ -376,7 +593,7 @@ pub fn split_args(s: &str) -> Result<Vec<String>, String> {
                     cur.push(n);
                     has = true;
                 }
-                None => return Err("agent arguments: a backslash at the end".into()),
+                None => return Err("extra arguments: a backslash at the end".into()),
             },
             (Some('"'), '"') => quote = None,
             (Some(_), c) => cur.push(c),
@@ -397,7 +614,7 @@ pub fn split_args(s: &str) -> Result<Vec<String>, String> {
         }
     }
     if quote.is_some() {
-        return Err("agent arguments: a quote is not closed".into());
+        return Err("extra arguments: a quote is not closed".into());
     }
     if has {
         out.push(cur);
@@ -472,6 +689,47 @@ mod tests {
         assert!(f.build().is_err());
         f.limit = "30".into();
         assert!(f.build().is_ok());
+    }
+
+    #[test]
+    fn agent_choices_follow_the_agent() {
+        let mut f = Form::new("~");
+        assert_eq!(f.mode, "auto");
+        assert!(f.fields().contains(&Field::Effort));
+        f.choose(Field::Model, "opus");
+        f.choose(Field::Effort, "high");
+        f.choose(Field::Agent, "amp");
+        assert_eq!(
+            (f.mode.as_str(), f.model.as_str(), f.effort.as_str()),
+            ("", "", "")
+        );
+        assert!(!f.fields().contains(&Field::Mode));
+        assert_eq!(f.current(), Field::Agent);
+        f.choose(Field::Agent, "codex");
+        assert_eq!(f.mode, "auto");
+        assert!(f.fields().contains(&Field::Model));
+        f.choose(Field::Model, "some-model");
+        assert!(f
+            .items(Field::Model)
+            .iter()
+            .any(|i| i.value == "some-model"));
+        f.name = "R".into();
+        f.prompt = "go".into();
+        let (file, _) = f.build().unwrap();
+        assert_eq!(file.model, "some-model");
+    }
+
+    #[test]
+    fn cycling_steps_through_the_list() {
+        let mut f = Form::new("~");
+        f.select(Field::Mode);
+        f.cycle(1);
+        assert_eq!(f.mode, "acceptEdits");
+        f.cycle(-2);
+        assert_eq!(f.mode, "");
+        f.select(Field::Model);
+        f.cycle(-1);
+        assert_eq!(f.model, "haiku", "Other… is skipped");
     }
 
     #[test]

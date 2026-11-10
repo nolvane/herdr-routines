@@ -121,7 +121,7 @@ pub fn launch(paths: &Paths, settings: &Settings, routine: &Routine, mut run: Ru
             &run.agent_name,
             &routine.file.agent,
             &place.pane_id,
-            &routine.file.args,
+            &crate::agent::flags(&routine.file),
         );
         match &started {
             Ok(()) => break,

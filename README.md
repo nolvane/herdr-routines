@@ -11,19 +11,36 @@ Routines run as long as the Herdr server runs, also when no Herdr window is
 open.
 
 ```
- Routines (3) │ Runs (41)                                      ● Scheduler running
-──────────────────────────────────────────────────────────────────────────────────
-    Name            Schedule                                     Agent   Next          Last run
- ●  Inbox clean up  Weekdays, hourly at :15 from 08:15 to 18:15  claude  in 12 min     ✓ Finished · 48 min ago
- ●  Dependency scan Mondays at 07:00                             codex   Mon 07:00     ✓ Finished · 6 d ago
- ○  Release notes   Monthly on the 1st at 09:00                  claude  off           never
+ ◷ Agent routines    Routines (3)   Runs (41)                          ● scheduler on
+
+    Routine                                     Schedule                  Last run
+ ●  Inbox clean up                              Weekdays, hourly at :15   ✓ Finished
+    claude · Sonnet · Auto · ~/mail             next in 12 min            48 min ago · took 3 min
+
+ ●  Dependency scan                             Mondays at 07:00          ✓ Finished
+    codex · Auto · ~/code/app                   next Mon 07:00            6 d ago · took 9 min
+
+ ○  Release notes                               Monthly on the 1st        –
+    claude · Opus · Plan only · ~/code/app      off                       no run yet
+
+ ⏎ edit  n new  r run now  space on/off  ? all keys  q close
 ```
 
 ## What it does
 
 - **List of routines** with their schedule in words, the next time and the
   last run. Switch a routine on or off with one key, run it now, edit it,
-  write its prompt in your editor, or create and delete routines.
+  write its prompt, or create and delete routines. Works with the keyboard
+  and the mouse, like the other Herdr plugins of this author; `?` shows all
+  keys.
+- **Permission mode, model and effort** per routine, picked from a list:
+  for Claude Code the permission modes (Auto, Accept edits, Plan only and
+  more), the models (Fable, Opus, Sonnet, Haiku or any typed name) and the
+  effort; for Codex and Gemini their modes and any model name. New routines
+  start in Auto, since nobody watches a scheduled run.
+- **Prompt editor** in the list: type, paste, move with the arrows or the
+  mouse, undo with `Ctrl+Z`, keep with `Ctrl+S`. `Ctrl+O` opens the prompt
+  in your own editor instead.
 - **Runs** of all routines, newest first: status, how it was started (on
   time, catch-up or by hand), how long it took. `⏎` jumps to the run's tab,
   `l` shows its saved output once the tab is closed.
@@ -72,26 +89,30 @@ Update with `herdr plugin update`.
 
 ## Keys
 
-In the list of routines:
+`?` in the list shows every key. The main ones:
 
 | Key | Does |
 | --- | --- |
 | `↑` `↓` | Move |
-| `⏎` | Jump to the last run's tab, or show its output when the tab is closed |
+| `⏎` | Edit the routine (in Runs: go to the run's tab) |
+| `n` | New routine |
+| `p` | Write the prompt |
 | `r` | Run now (asks first) |
 | `space` | Switch on or off |
-| `e` | Edit |
-| `p` | Open the prompt in your editor (`$VISUAL`, `$EDITOR`, else `nano`) |
-| `n` | New routine |
+| `o` | Go to the tab of the last run |
+| `l` | What the last run wrote |
 | `d` | Delete with its run history (asks first) |
-| `l` | Output of the last run |
 | `←` `→` | Switch between routines and runs |
 | `S` | Start the scheduler when it is off |
 | `q` | Close the list (asks first); routines keep running |
 
-In the form, `↑` `↓` move between fields, `←` `→` pick a choice, typing
-edits a text field, `Ctrl+U` clears it, `⏎` on "Prompt" opens your editor and
-`Ctrl+S` or "Save" saves. `Esc` cancels.
+The mouse works too: click a tab or a row, double click to open, scroll with
+the wheel, click the keys in the footer.
+
+In the form, `↑` `↓` move between fields, `⏎` opens the list of a choice
+(or the prompt editor), `←` `→` step through a choice, typing edits a text
+field, `Ctrl+U` clears it and `Ctrl+S` or "Save" saves. `Esc` goes back and
+asks first when something changed.
 
 ## Routines are files
 
@@ -107,7 +128,12 @@ enabled = true
 schedule = "0 7 * * 1"
 # Any kind `herdr agent start --kind` accepts
 agent = "codex"
-# Passed to the agent (optional)
+# Optional, for claude, codex and gemini; left out means the agent's default
+permission_mode = "auto"
+# model = "<a model name the agent knows>"
+# Optional, for claude: low, medium, high, xhigh or max
+# effort = "high"
+# More arguments for the agent's command line (optional)
 args = []
 folder = "~/code/app"
 # "run-once" or "skip"
@@ -126,10 +152,17 @@ values, ranges `8-18`, steps `*/15`, lists `1,15`, and month and day names
 (`jan`, `mon`). Day of week 0 and 7 are Sunday. The form offers every hour,
 every day, weekdays and once a week, and any cron expression under "Custom".
 
-**Unattended runs:** the agent runs with the settings and permissions it has
-in that folder. If a routine should work without stopping for approvals,
-give the agent the permission mode it needs through its own settings or
-`args`, as you would when starting it yourself.
+**Permission modes** become the agent's own flags:
+
+| Agent | `permission_mode` | Flag |
+| --- | --- | --- |
+| claude | `auto`, `acceptEdits`, `plan`, `dontAsk`, `bypassPermissions`, `manual` | `--permission-mode <mode>` |
+| codex | `auto`, `read-only`, `full-access` | `--full-auto`, `--sandbox read-only`, `--dangerously-bypass-approvals-and-sandbox` |
+| gemini | `auto_edit`, `yolo` | `--approval-mode <mode>` |
+
+Left out, the agent runs with the settings and permissions it has in that
+folder. With a mode that asks before changes, a run waits in its tab until
+you answer. Other agents take their flags through `args`.
 
 Runs are kept in the plugin's state directory
 (`~/.local/state/herdr/plugins/herdr-routines/runs/`), 50 per routine.

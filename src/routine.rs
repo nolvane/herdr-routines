@@ -52,10 +52,10 @@ impl Missed {
         }
     }
 
-    pub fn toggled(self) -> Missed {
+    pub fn detail(self) -> &'static str {
         match self {
-            Missed::RunOnce => Missed::Skip,
-            Missed::Skip => Missed::RunOnce,
+            Missed::RunOnce => "One catch-up run once Herdr runs again",
+            Missed::Skip => "Wait for the next time",
         }
     }
 }
@@ -84,7 +84,17 @@ pub struct RoutineFile {
     /// A Herdr agent kind, such as `claude` or `codex`.
     #[serde(default = "default_agent")]
     pub agent: String,
-    /// Arguments for the agent, such as `["--model", "opus"]`.
+    /// The agent's permission mode, such as `auto` (see `agent::modes`);
+    /// empty for the agent's own default.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub permission_mode: String,
+    /// The model, such as `opus`; empty for the agent's own default.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub model: String,
+    /// How hard the agent thinks, such as `high`; empty for its default.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub effort: String,
+    /// Extra arguments for the agent, passed after the ones above.
     #[serde(default)]
     pub args: Vec<String>,
     /// The folder the agent starts in.
@@ -130,6 +140,9 @@ impl Routine {
         }
         if !AGENTS.contains(&file.agent.as_str()) {
             return Some(format!("unknown agent \"{}\"", file.agent));
+        }
+        if let Some(problem) = crate::agent::check(file) {
+            return Some(problem);
         }
         if !paths::expand(&file.folder).is_dir() {
             return Some(format!("folder {} does not exist", file.folder));
@@ -204,6 +217,9 @@ pub fn load_all(paths: &Paths) -> Vec<Routine> {
                     enabled: false,
                     schedule: String::new(),
                     agent: default_agent(),
+                    permission_mode: String::new(),
+                    model: String::new(),
+                    effort: String::new(),
                     args: Vec::new(),
                     folder: default_folder(),
                     missed: Missed::default(),
@@ -309,6 +325,9 @@ mod tests {
             enabled: true,
             schedule: "0 8 * * 1-5".into(),
             agent: "claude".into(),
+            permission_mode: "auto".into(),
+            model: "opus".into(),
+            effort: String::new(),
             args: vec![],
             folder: "~".into(),
             missed: Missed::RunOnce,

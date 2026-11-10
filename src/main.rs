@@ -12,8 +12,10 @@
 //! - `fire <id>` starts a routine now
 //! - `routines` prints the routines and their latest run as JSON
 
+mod agent;
 mod app;
 mod cron;
+mod editor;
 mod form;
 mod herdr;
 mod pane;
@@ -23,16 +25,51 @@ mod runner;
 mod scheduler;
 mod store;
 mod theme;
+mod ui;
 
 use paths::Paths;
+use ratatui::crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+};
 use routine::{Routine, Settings};
 use store::Trigger;
 
-fn list(paths: Paths) -> std::io::Result<()> {
-    let mut app = app::App::new(paths);
-    let mut terminal = ratatui::init();
-    let result = app.run(&mut terminal);
+/// The list's screen, with the mouse and pasting on.
+pub fn enter_terminal() -> ratatui::DefaultTerminal {
+    // ratatui's own panic hook restores raw mode and the screen; this one
+    // also turns mouse reporting and bracketed paste off again.
+    static HOOK: std::sync::Once = std::sync::Once::new();
+    HOOK.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let _ = ratatui::crossterm::execute!(
+                std::io::stdout(),
+                DisableBracketedPaste,
+                DisableMouseCapture
+            );
+            previous(info);
+        }));
+    });
+    let terminal = ratatui::init();
+    let _ =
+        ratatui::crossterm::execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste);
+    terminal
+}
+
+pub fn leave_terminal() {
+    let _ = ratatui::crossterm::execute!(
+        std::io::stdout(),
+        DisableBracketedPaste,
+        DisableMouseCapture
+    );
     ratatui::restore();
+}
+
+fn list(paths: Paths) -> std::io::Result<()> {
+    let app = app::App::new(paths);
+    let mut terminal = enter_terminal();
+    let result = app.run(&mut terminal);
+    leave_terminal();
     pane::forget_self();
     result
 }
@@ -77,6 +114,9 @@ fn routines_json(paths: &Paths) -> String {
                 "schedule": r.file.schedule,
                 "schedule_text": r.schedule_text(),
                 "agent": r.file.agent,
+                "permission_mode": r.file.permission_mode,
+                "model": r.file.model,
+                "effort": r.file.effort,
                 "folder": r.file.folder,
                 "problem": r.problem,
                 "next": r.cron().filter(|_| r.file.enabled).and_then(|c| c.next_after(&now)).map(|t| t.to_rfc3339()),
