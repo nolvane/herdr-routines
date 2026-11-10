@@ -38,20 +38,48 @@ impl Approvals {
             .map_err(|e| format!("cannot save the approval: {e}"))
     }
 
-    /// Whether the routine's files on disk are the ones the owner approved:
-    /// `routine.toml` and the text file its agent uses.
-    pub fn approves(&self, paths: &Paths, id: &str, agent: &str) -> bool {
+    /// Whether these files, read once, are the ones the owner approved:
+    /// `routine.toml` and the text file its agent uses. The caller runs
+    /// exactly these files, so what is checked is what runs.
+    pub fn approves(&self, id: &str, agent: &str, files: &Snapshot) -> bool {
         let Some(approved) = self.0.get(id) else {
             return false;
         };
-        let now = snapshot(paths, id);
         ["routine.toml", Routine::text_file(agent)]
             .iter()
-            .all(|f| approved.get(*f).is_some() && approved.get(*f) == now.get(*f))
+            .all(|f| approved.get(*f).is_some() && approved.get(*f) == files.get(*f))
     }
 }
 
-/// The routine's files as they are on disk now.
+/// Changes `approved.json` under its lock, so two lists approving at the
+/// same moment do not drop each other's approval.
+fn update(paths: &Paths, change: impl FnOnce(&mut Approvals) -> bool) -> Result<(), String> {
+    paths::locked(&paths.approvals_lock_file(), || {
+        let mut all = Approvals::load(paths);
+        if change(&mut all) {
+            all.save(paths)
+        } else {
+            Ok(())
+        }
+    })
+}
+
+/// Only the files that decide what the routine does: `routine.toml` and the
+/// text file of its agent. Another text file left in the folder (from
+/// before a switch between agent and shell) is never approved along.
+fn deciding(files: Snapshot) -> Snapshot {
+    let agent = files
+        .get("routine.toml")
+        .and_then(|t| toml::from_str::<crate::routine::RoutineFile>(t).ok())
+        .map(|f| f.agent);
+    let text = agent.as_deref().map(Routine::text_file);
+    files
+        .into_iter()
+        .filter(|(name, _)| name == "routine.toml" || Some(name.as_str()) == text)
+        .collect()
+}
+
+/// The routine's files as they are on disk now, each read once.
 pub fn snapshot(paths: &Paths, id: &str) -> Snapshot {
     let dir = paths.routine_dir(id);
     FILES
@@ -67,32 +95,39 @@ pub fn snapshot(paths: &Paths, id: &str) -> Snapshot {
 /// Approves exactly these files of the routine (shown to the owner or
 /// written by the list), replacing what was approved before.
 pub fn approve(paths: &Paths, id: &str, files: Snapshot) -> Result<(), String> {
-    let mut all = Approvals::load(paths);
-    all.0.insert(id.to_string(), files);
-    all.save(paths)
+    let files = deciding(files);
+    update(paths, |all| {
+        all.0.insert(id.to_string(), files);
+        true
+    })
 }
 
 /// Approves one file the list just wrote, keeping the approval of the
 /// routine's other files. Does nothing for a routine that waits for
 /// approval, so saving one file never approves another file that something
 /// else changed.
-pub fn approve_file(paths: &Paths, id: &str, was_approved: bool, file: &str, text: &str) {
+pub fn approve_file(
+    paths: &Paths,
+    id: &str,
+    was_approved: bool,
+    file: &str,
+    text: &str,
+) -> Result<(), String> {
     if !was_approved {
-        return;
+        return Ok(());
     }
-    let mut all = Approvals::load(paths);
-    if let Some(files) = all.0.get_mut(id) {
-        files.insert(file.to_string(), text.to_string());
-        let _ = all.save(paths);
-    }
+    update(paths, |all| match all.0.get_mut(id) {
+        Some(files) => {
+            files.insert(file.to_string(), text.to_string());
+            true
+        }
+        None => false,
+    })
 }
 
 /// Forgets a deleted routine.
 pub fn forget(paths: &Paths, id: &str) {
-    let mut all = Approvals::load(paths);
-    if all.0.remove(id).is_some() {
-        let _ = all.save(paths);
-    }
+    let _ = update(paths, |all| all.0.remove(id).is_some());
 }
 
 #[cfg(test)]
@@ -117,36 +152,44 @@ mod tests {
         paths::write_atomic(&p.routine_dir(id).join(file), text.as_bytes()).unwrap();
     }
 
+    const TOML: &str = "name = \"A\"\nschedule = \"0 9 * * *\"\n";
+
+    fn approved(p: &Paths, agent: &str) -> bool {
+        Approvals::load(p).approves("a", agent, &snapshot(p, "a"))
+    }
+
     #[test]
     fn a_change_outside_the_list_needs_approval_again() {
         let p = paths("change");
-        write(&p, "a", "routine.toml", "name = \"A\"\n");
+        write(&p, "a", "routine.toml", TOML);
         write(&p, "a", "prompt.md", "Say hi");
-        assert!(!Approvals::load(&p).approves(&p, "a", "claude"));
+        assert!(!approved(&p, "claude"));
         approve(&p, "a", snapshot(&p, "a")).unwrap();
-        assert!(Approvals::load(&p).approves(&p, "a", "claude"));
+        assert!(approved(&p, "claude"));
         // Something else changes the prompt: it waits again.
         write(&p, "a", "prompt.md", "Say bye");
-        assert!(!Approvals::load(&p).approves(&p, "a", "claude"));
-        // Switching to a shell command needs the command approved.
-        approve(&p, "a", snapshot(&p, "a")).unwrap();
+        assert!(!approved(&p, "claude"));
+        // A command file lying next to an agent routine is not approved
+        // along, so switching to a shell command needs its own approval.
         write(&p, "a", "command.sh", "echo hi");
-        assert!(!Approvals::load(&p).approves(&p, "a", "shell"));
+        approve(&p, "a", snapshot(&p, "a")).unwrap();
+        assert!(!Approvals::load(&p).0["a"].contains_key("command.sh"));
+        assert!(!approved(&p, "shell"));
         let _ = std::fs::remove_dir_all(p.config.parent().unwrap());
     }
 
     #[test]
     fn saving_one_file_keeps_another_change_waiting() {
         let p = paths("one-file");
-        write(&p, "a", "routine.toml", "name = \"A\"\n");
+        write(&p, "a", "routine.toml", TOML);
         write(&p, "a", "prompt.md", "Say hi");
         approve(&p, "a", snapshot(&p, "a")).unwrap();
         // An agent changes routine.toml; the owner then edits the prompt.
-        write(&p, "a", "routine.toml", "name = \"A\"\nargs = [\"x\"]\n");
-        let was = Approvals::load(&p).approves(&p, "a", "claude");
+        write(&p, "a", "routine.toml", &format!("{TOML}args = [\"x\"]\n"));
+        let was = approved(&p, "claude");
         write(&p, "a", "prompt.md", "Say hello");
-        approve_file(&p, "a", was, "prompt.md", "Say hello");
-        assert!(!Approvals::load(&p).approves(&p, "a", "claude"));
+        approve_file(&p, "a", was, "prompt.md", "Say hello").unwrap();
+        assert!(!approved(&p, "claude"));
         forget(&p, "a");
         assert!(Approvals::load(&p).0.is_empty());
         let _ = std::fs::remove_dir_all(p.config.parent().unwrap());

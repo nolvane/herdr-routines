@@ -312,48 +312,97 @@ pub fn flags(file: &RoutineFile) -> Vec<String> {
 /// Flags that set how much an agent may do without asking. They belong in
 /// the permission mode field, which the list shows, never in the extra
 /// arguments, where they would quietly change the mode the list shows.
-fn permission_flags(agent: &str) -> &'static [&'static str] {
+///
+/// Long options are compared without dashes, underscores or case, so
+/// `--approval-mode` and `--approvalMode` both match; one-letter options
+/// match also when their value is attached (`-sdanger-full-access`) or
+/// when they sit in a group (`-dy`). Also listed are options that grant
+/// rights another way: tool allow lists, settings files and config
+/// profiles.
+fn permission_options(agent: &str) -> (&'static [&'static str], &'static [char]) {
     match agent {
-        "claude" => &[
-            "--permission-mode",
-            "--dangerously-skip-permissions",
-            "--allow-dangerously-skip-permissions",
-        ],
-        "codex" => &[
-            "--full-auto",
-            "--dangerously-bypass-approvals-and-sandbox",
-            "--yolo",
-            "--sandbox",
-            "-s",
-            "--ask-for-approval",
-            "-a",
-        ],
-        "gemini" => &["--approval-mode", "--yolo", "-y"],
-        _ => &[],
+        "claude" => (
+            &[
+                "permissionmode",
+                "dangerouslyskippermissions",
+                "allowdangerouslyskippermissions",
+                "allowedtools",
+                "settings",
+                "permissionprompttool",
+            ],
+            &[],
+        ),
+        "codex" => (
+            &[
+                "fullauto",
+                "dangerouslybypassapprovalsandsandbox",
+                "yolo",
+                "sandbox",
+                "askforapproval",
+                "profile",
+            ],
+            &['s', 'a', 'p'],
+        ),
+        "gemini" => (&["approvalmode", "yolo", "allowedtools"], &['y']),
+        _ => (&[], &[]),
     }
+}
+
+fn normalized(name: &str) -> String {
+    name.trim_start_matches('-')
+        .chars()
+        .filter(|c| *c != '-' && *c != '_')
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// A Codex config setting (`-c key=value`) that changes the sandbox, the
+/// approvals or the profile.
+fn codex_permission_setting(value: &str) -> bool {
+    let key = value
+        .trim_start_matches(['=', '"', '\''])
+        .split('=')
+        .next()
+        .unwrap_or("")
+        .to_lowercase();
+    ["sandbox", "approval", "profile"]
+        .iter()
+        .any(|k| key.contains(k))
 }
 
 /// The first extra argument that changes the agent's permissions, if any.
 fn permission_arg(agent: &str, args: &[String]) -> Option<String> {
-    let flags = permission_flags(agent);
+    let (long, short) = permission_options(agent);
     for (i, arg) in args.iter().enumerate() {
-        let name = arg.split_once('=').map_or(arg.as_str(), |(n, _)| n);
-        if flags.contains(&name) {
-            return Some(arg.clone());
-        }
-        // Codex settings such as `-c sandbox_mode="danger-full-access"`.
-        if agent == "codex" {
-            let value = match name {
-                "-c" | "--config" => match arg.split_once('=') {
-                    Some((_, v)) => Some(v),
-                    None => args.get(i + 1).map(String::as_str),
-                },
-                _ => None,
+        let next = args.get(i + 1).map(String::as_str).unwrap_or("");
+        if let Some(body) = arg.strip_prefix("--") {
+            let (name, value) = match body.split_once('=') {
+                Some((n, v)) => (n, Some(v)),
+                None => (body, None),
             };
-            if let Some(v) = value {
-                let key = v.trim_start_matches(['"', '\'']);
-                if key.starts_with("sandbox") || key.starts_with("approval") {
-                    return Some(format!("{arg} {v}"));
+            if long.contains(&normalized(name).as_str()) {
+                return Some(arg.clone());
+            }
+            if agent == "codex"
+                && normalized(name) == "config"
+                && codex_permission_setting(value.unwrap_or(next))
+            {
+                return Some(format!("{arg} {next}").trim().to_string());
+            }
+        } else if let Some(body) = arg.strip_prefix('-') {
+            let first = body.chars().next();
+            // An attached value (`-sdanger-full-access`) or a group (`-dy`).
+            let group = !body.is_empty() && body.chars().all(|c| c.is_ascii_alphabetic());
+            if first.is_some_and(|c| short.contains(&c))
+                || (group && body.chars().any(|c| short.contains(&c)))
+            {
+                return Some(arg.clone());
+            }
+            if agent == "codex" && first == Some('c') {
+                let attached = &body[1..];
+                let value = if attached.is_empty() { next } else { attached };
+                if codex_permission_setting(value) {
+                    return Some(format!("{arg} {next}").trim().to_string());
                 }
             }
         }
@@ -485,6 +534,17 @@ mod tests {
         assert!(with("codex", &["-c", "sandbox_mode=\"danger-full-access\""]).is_some());
         assert!(with("codex", &["--config=approval_policy=never"]).is_some());
         assert!(with("gemini", &["--yolo"]).is_some());
+        // Attached values, groups, other spellings and indirect grants.
+        assert!(with("codex", &["-sdanger-full-access"]).is_some());
+        assert!(with("codex", &["-anever"]).is_some());
+        assert!(with("codex", &["-csandbox_mode=danger-full-access"]).is_some());
+        assert!(with("codex", &["-c", "profiles.x.approval_policy=never"]).is_some());
+        assert!(with("codex", &["--profile", "yolo"]).is_some());
+        assert!(with("gemini", &["--approvalMode=yolo"]).is_some());
+        assert!(with("gemini", &["-dy"]).is_some());
+        assert!(with("gemini", &["--allowed-tools", "run_shell_command"]).is_some());
+        assert!(with("claude", &["--allowedTools", "Bash"]).is_some());
+        assert!(with("claude", &["--settings", "{}"]).is_some());
         // Other arguments stay free.
         assert!(with("claude", &["--verbose", "--add-dir", "../docs"]).is_none());
         assert!(with("codex", &["-c", "model_reasoning_effort=high"]).is_none());

@@ -144,8 +144,6 @@ pub enum ConfirmFor {
     Delete(String),
     DiscardForm,
     Autostart,
-    /// Approves exactly the files shown in the question.
-    Approve(String, crate::approval::Snapshot),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -164,6 +162,9 @@ pub struct LogView {
     pub max: u16,
     /// The file the output comes from, which `f` opens.
     pub file: Option<std::path::PathBuf>,
+    /// The approval view (`a`): the routine and exactly the files shown,
+    /// approved with `y` once read to the end.
+    pub approve: Option<(String, crate::approval::Snapshot)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -418,13 +419,15 @@ impl App {
     }
 
     fn toggle(&mut self) {
-        let Some(r) = self.selected_routine().cloned() else {
+        let Some(id) = self.selected_routine().map(|r| r.id.clone()) else {
             return;
         };
-        if r.unreadable || (r.problem.is_some() && !r.file.enabled) {
-            return self.flash("Fix the routine first (⏎ edits it)", YELLOW);
-        }
-        let mut r = r;
+        // From disk, not from the list: the files may have changed since
+        // the list was read, and what is saved must be what is approved.
+        let mut r = match Routine::load(&self.paths, &id) {
+            Ok(r) if r.problem.is_none() || r.file.enabled => r,
+            _ => return self.flash("Fix the routine first (⏎ edits it)", YELLOW),
+        };
         r.file.enabled = !r.file.enabled;
         // Switching keeps a routine that waits for approval waiting: only
         // `a` approves what something else wrote.
@@ -527,6 +530,7 @@ impl App {
             scroll: if has_result { 0 } else { u16::MAX },
             max: 0,
             file,
+            approve: None,
         });
     }
 
@@ -670,22 +674,33 @@ impl App {
             None => routine::new_id(&self.paths, &file.name),
         };
         let name = file.name.clone();
+        // A routine that waits for approval keeps waiting: approving is
+        // what `a` does, after showing everything it would run.
+        let waiting = form.id.as_ref().is_some_and(|id| !self.is_approved(id));
         let r = Routine {
             id: id.clone(),
             file,
             prompt,
             problem: None,
             unreadable: false,
-            approved: true,
+            approved: !waiting,
         };
-        // The owner saw every field in the form: what it saves is approved.
-        r.save_approved(&self.paths)?;
+        if waiting {
+            r.save(&self.paths)?;
+        } else {
+            // The owner wrote it in the form: what it saves is approved.
+            r.save_approved(&self.paths)?;
+        }
         self.reload();
         if let Some(i) = self.routines.iter().position(|r| r.id == id) {
             self.sel_routine = i;
         }
         self.view = View::Routines;
-        Ok(format!("Saved {name}"))
+        Ok(if waiting {
+            format!("Saved {name}; it still waits for approval (a)")
+        } else {
+            format!("Saved {name}")
+        })
     }
 
     fn try_save(&mut self) {
@@ -716,26 +731,10 @@ impl App {
                 }
                 return;
             }
-            EditTarget::Prompt(id, name) => {
-                let was = self.is_approved(id);
-                paths::write_atomic(&self.paths.routine_dir(id).join(name), text.as_bytes()).map(
-                    |_| {
-                        crate::approval::approve_file(&self.paths, id, was, name, &text);
-                        "Saved"
-                    },
-                )
-            }
-            EditTarget::File(id) => {
-                let was = self.is_approved(id);
-                paths::write_atomic(
-                    &self.paths.routine_dir(id).join("routine.toml"),
-                    text.as_bytes(),
-                )
-                .map(|_| {
-                    crate::approval::approve_file(&self.paths, id, was, "routine.toml", &text);
-                    "routine.toml saved"
-                })
-            }
+            EditTarget::Prompt(id, name) => self.write_file(id, name, &text).map(|_| "Saved"),
+            EditTarget::File(id) => self
+                .write_file(id, "routine.toml", &text)
+                .map(|_| "routine.toml saved"),
         };
         match result {
             Ok(msg) => self.flash(msg, GREEN),
@@ -745,6 +744,15 @@ impl App {
             }
         }
         self.reload();
+    }
+
+    /// Writes one file of a routine from the editor. It stays approved when
+    /// it was; one that waits for approval keeps waiting.
+    fn write_file(&self, id: &str, name: &str, text: &str) -> Result<(), String> {
+        let was = self.is_approved(id);
+        paths::write_atomic(&self.paths.routine_dir(id).join(name), text.as_bytes())
+            .map_err(|e| e.to_string())?;
+        crate::approval::approve_file(&self.paths, id, was, name, text)
     }
 
     fn close_form(&mut self) {
@@ -801,8 +809,9 @@ impl App {
         Routine::load(&self.paths, id).is_ok_and(|r| r.approved)
     }
 
-    /// `a`: shows what a routine changed outside the list would run, and
-    /// approves exactly that after `y`.
+    /// `a`: shows everything a routine changed outside the list would run,
+    /// from one read of its files, and approves exactly those files with
+    /// `y` once the owner has scrolled to the end.
     fn ask_approve(&mut self) {
         let Some(r) = self.selected_routine().cloned() else {
             return;
@@ -814,56 +823,39 @@ impl App {
             return self.flash("Fix the routine first (⏎ edits it)", YELLOW);
         }
         let files = crate::approval::snapshot(&self.paths, &r.id);
-        // What the files say now, read again so the question shows exactly
-        // what `y` approves.
-        let Ok(now) = Routine::load(&self.paths, &r.id) else {
-            return self.flash("The routine cannot be read", RED);
+        let approvals = crate::approval::Approvals::load(&self.paths);
+        let now = match Routine::from_files(&r.id, &files, &approvals) {
+            Ok(now) => now,
+            Err(e) => return self.flash(format!("Cannot read it: {e}"), RED),
         };
-        if crate::approval::snapshot(&self.paths, &r.id) != files {
-            return self.flash("It is being changed; try again in a moment", YELLOW);
+        if now.approved {
+            self.reload();
+            return self.flash("It is approved: it runs as saved", MUTED);
         }
-        let f = &now.file;
-        let mut lines = vec![
-            "It was created or changed outside the list (by an agent or an editor).".into(),
-            "It runs on schedule only once you approve exactly this:".into(),
-            String::new(),
-            format!("Schedule: {}", now.schedule_text()),
-            format!("Folder: {}", f.folder),
-        ];
-        if now.is_shell() {
-            lines.push("Runs: a shell command, as you, without asking".into());
-            lines.push(String::new());
-            lines.push("Command:".into());
-        } else {
-            let mode = if f.permission_mode.is_empty() {
-                "agent default".to_string()
-            } else {
-                crate::agent::label(crate::agent::modes(&f.agent), &f.permission_mode)
-            };
-            lines.push(format!("Agent: {} · {mode}", f.agent));
-            let flags = crate::agent::flags(f);
-            if !flags.is_empty() {
-                lines.push(format!("Options: {}", flags.join(" ")));
-            }
-            lines.push(String::new());
-            lines.push("Prompt:".into());
-        }
-        let text: Vec<&str> = now.prompt.lines().collect();
-        for l in text.iter().take(8) {
-            lines.push(format!("  {}", visible_text(l)));
-        }
-        if text.len() > 8 {
-            lines.push(format!("  … {} more lines (p shows all)", text.len() - 8));
-        }
-        if let Some(p) = &now.problem {
-            lines.push(String::new());
-            lines.push(format!("It cannot run yet: {p}"));
-        }
-        self.mode = Mode::Confirm(Confirm {
-            question: format!("Approve {}?", f.name),
-            lines,
-            purpose: ConfirmFor::Approve(r.id, files),
+        self.mode = Mode::Log(LogView {
+            title: visible_text(&format!("Approve {}?", now.file.name)),
+            lines: approval_lines(&now),
+            scroll: 0,
+            // Unknown until drawn, so `y` cannot approve unseen text.
+            max: u16::MAX,
+            file: None,
+            approve: Some((r.id, files)),
         });
+    }
+
+    /// `y` in the approval view: approves the files it showed, unless they
+    /// changed while it was open.
+    fn approve_shown(&mut self, id: String, files: crate::approval::Snapshot) {
+        self.mode = Mode::Normal;
+        if crate::approval::snapshot(&self.paths, &id) != files {
+            self.reload();
+            return self.flash("It changed meanwhile; a shows it again", YELLOW);
+        }
+        match crate::approval::approve(&self.paths, &id, files) {
+            Ok(()) => self.flash("Approved: it runs as shown", GREEN),
+            Err(e) => self.flash(e, RED),
+        }
+        self.reload();
     }
 
     fn ask_delete(&mut self) {
@@ -927,18 +919,6 @@ impl App {
                 self.reload();
             }
             ConfirmFor::DiscardForm => self.form = None,
-            ConfirmFor::Approve(id, files) => {
-                // Changed again while the question was open: show it anew.
-                if crate::approval::snapshot(&self.paths, &id) != files {
-                    self.reload();
-                    return self.flash("It changed meanwhile; a shows it again", YELLOW);
-                }
-                match crate::approval::approve(&self.paths, &id, files) {
-                    Ok(()) => self.flash("Approved: it runs as shown", GREEN),
-                    Err(e) => self.flash(e, RED),
-                }
-                self.reload();
-            }
         }
     }
 
@@ -1183,6 +1163,12 @@ impl App {
             Mode::Log(mut log) => {
                 let page = 10;
                 match k.code {
+                    KeyCode::Char('y') if log.approve.is_some() && log.scroll >= log.max => {
+                        if let Some((id, files)) = log.approve.take() {
+                            self.approve_shown(id, files);
+                        }
+                        return;
+                    }
                     KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter | KeyCode::Char('l') => {
                         self.mode = Mode::Normal;
                         return;
@@ -1707,6 +1693,71 @@ pub fn visible_text(s: &str) -> String {
         .collect()
 }
 
+/// The approval view: every setting of the routine and its whole prompt
+/// or command, as shown text.
+fn approval_lines(r: &Routine) -> Vec<String> {
+    let f = &r.file;
+    let mut lines = vec![
+        "It was created or changed outside the list (by an agent or an editor). It runs on schedule only once you approve exactly what follows.".to_string(),
+        String::new(),
+        format!("Name: {}", f.name),
+        format!(
+            "Schedule: {}{}",
+            r.schedule_text(),
+            if f.enabled { "" } else { " (switched off)" }
+        ),
+        format!("When a time is missed: {}", f.missed.detail()),
+        format!("Folder: {}", f.folder),
+        format!(
+            "Time limit: {} minutes{}",
+            f.time_limit_minutes,
+            if f.stop_at_limit { ", then it is stopped" } else { "" }
+        ),
+    ];
+    if f.retries > 0 {
+        lines.push(format!(
+            "Retries: {} after a failure, {} minutes apart",
+            f.retries, f.retry_delay_minutes
+        ));
+    }
+    if r.is_shell() {
+        lines.push("Runs: a shell command, as you, without asking".into());
+    } else {
+        if !f.check_command.trim().is_empty() {
+            lines.push(format!(
+                "Check first (a shell command, as you): {}",
+                f.check_command
+            ));
+        }
+        if f.remember {
+            lines.push("Remembers the results of its last ten runs".into());
+        }
+        let mode = if f.permission_mode.is_empty() {
+            "agent default".to_string()
+        } else {
+            agent::label(agent::modes(&f.agent), &f.permission_mode)
+        };
+        lines.push(format!("Agent: {} · {mode}", f.agent));
+        let flags = agent::flags(f);
+        if !flags.is_empty() {
+            lines.push(format!("Options: {}", flags.join(" ")));
+        }
+    }
+    lines.push(String::new());
+    lines.push(if r.is_shell() { "Command:" } else { "Prompt:" }.into());
+    if r.prompt.trim().is_empty() {
+        lines.push("  (empty)".into());
+    }
+    lines.extend(r.prompt.lines().map(|l| format!("  {l}")));
+    if let Some(p) = &r.problem {
+        lines.push(String::new());
+        lines.push(format!("It cannot run yet: {p}"));
+    }
+    lines.push(String::new());
+    lines.push("y approves exactly this. Esc leaves it waiting.".into());
+    lines.iter().map(|l| visible_text(l)).collect()
+}
+
 /// What Claude is told when it creates a routine with the person.
 pub fn agent_brief(paths: &Paths) -> String {
     let dir = paths::shorten(&paths.routines_dir());
@@ -1937,12 +1988,22 @@ mod tests {
         press(&mut a, KeyCode::Char('r'));
         assert_eq!(a.mode, Mode::Normal, "no run before approval");
         press(&mut a, KeyCode::Char('a'));
-        let Mode::Confirm(c) = &a.mode else {
-            panic!("asks first: {:?}", a.mode)
+        let Mode::Log(v) = &a.mode else {
+            panic!("shows it first: {:?}", a.mode)
         };
-        assert!(c.lines.iter().any(|l| l.starts_with("Options:")), "{c:?}");
-        let all = screen(&mut a, 120, 40).join("\n");
+        assert!(v.lines.iter().any(|l| l.starts_with("Options:")), "{v:?}");
+        assert!(v.lines.iter().any(|l| l == "  Then stop."), "whole prompt");
+        // `y` before it was shown, or before the end was read, does nothing.
+        press(&mut a, KeyCode::Char('y'));
+        assert!(matches!(a.mode, Mode::Log(_)));
+        let all = screen(&mut a, 60, 12).join("\n");
         assert!(all.contains("Approve Weekly cleanup?"), "{all}");
+        assert!(all.contains("read to the end"), "{all}");
+        press(&mut a, KeyCode::Char('y'));
+        assert!(!Routine::load(&a.paths, "weekly-cleanup").unwrap().approved);
+        press(&mut a, KeyCode::End);
+        let all = screen(&mut a, 60, 12).join("\n");
+        assert!(all.contains("y approve"), "{all}");
         press(&mut a, KeyCode::Char('y'));
         assert!(a.routines.iter().all(|r| r.approved));
         // Switching on and off keeps it approved.
@@ -1956,6 +2017,44 @@ mod tests {
         a.sel_routine = a.routines.iter().position(|r| !r.approved).unwrap();
         press(&mut a, KeyCode::Char(' '));
         assert!(!Routine::load(&a.paths, "weekly-cleanup").unwrap().approved);
+    }
+
+    #[test]
+    fn the_approval_view_shows_what_it_approves() {
+        let mut a = app("approve-changed");
+        a.sel_routine = a.routines.iter().position(|r| !r.approved).unwrap();
+        press(&mut a, KeyCode::Char('a'));
+        screen(&mut a, 120, 40);
+        // Something writes again while the view is open.
+        let dir = a.paths.routine_dir("weekly-cleanup");
+        paths::write_atomic(&dir.join("prompt.md"), b"Something else.").unwrap();
+        press(&mut a, KeyCode::Char('y'));
+        assert_eq!(a.mode, Mode::Normal);
+        assert!(
+            !Routine::load(&a.paths, "weekly-cleanup").unwrap().approved,
+            "only what was shown is approved"
+        );
+    }
+
+    #[test]
+    fn saving_the_form_keeps_a_waiting_routine_waiting() {
+        let mut a = app("form-waiting");
+        a.sel_routine = a.routines.iter().position(|r| !r.approved).unwrap();
+        press(&mut a, KeyCode::Enter);
+        assert!(a.form.is_some());
+        a.form.as_mut().unwrap().name = "Weekly cleanup 2".into();
+        a.form.as_mut().unwrap().dirty = true;
+        a.try_save();
+        assert!(a.form.is_none(), "saved");
+        let r = Routine::load(&a.paths, "weekly-cleanup").unwrap();
+        assert_eq!(r.file.name, "Weekly cleanup 2");
+        assert!(!r.approved, "a approves it, not the form");
+        // A routine that was approved stays approved when saved.
+        a.sel_routine = a.routines.iter().position(|r| r.approved).unwrap();
+        press(&mut a, KeyCode::Enter);
+        a.form.as_mut().unwrap().dirty = true;
+        a.try_save();
+        assert!(Routine::load(&a.paths, "morning-report").unwrap().approved);
     }
 
     #[test]

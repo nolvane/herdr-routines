@@ -74,15 +74,17 @@ pub struct PaneInfo {
 /// The pane's tab and terminal, or `None` when the pane is gone.
 pub fn pane_info(pane: &str) -> Result<Option<PaneInfo>, Error> {
     match call(&["pane", "get", pane]) {
-        Ok(v) => {
-            let p = &v["result"]["pane"];
-            Ok(Some(PaneInfo {
-                tab_id: s(&p["tab_id"]),
-                terminal_id: s(&p["terminal_id"]),
-            }))
-        }
+        Ok(v) => Ok(Some(pane_info_from(&v))),
         Err(e) if e.code == "pane_not_found" => Ok(None),
         Err(e) => Err(e),
+    }
+}
+
+fn pane_info_from(v: &Value) -> PaneInfo {
+    let p = &v["result"]["pane"];
+    PaneInfo {
+        tab_id: s(&p["tab_id"]),
+        terminal_id: s(&p["terminal_id"]),
     }
 }
 
@@ -266,4 +268,29 @@ pub fn notify(title: &str, body: &str, sound: &str) {
         "--sound",
         sound,
     ]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Herdr 0.9.5's answers, trimmed (taken from a throwaway session).
+    #[test]
+    fn reads_tab_and_terminal_of_a_pane() {
+        let get = r#"{"id":"cli:pane:get","result":{"pane":{"agent_status":"unknown","pane_id":"w1:p1","tab_id":"w1:t1","terminal_id":"term_65ff00fc5d6f11","workspace_id":"w1"},"type":"pane_info"}}"#;
+        let v: Value = serde_json::from_str(get).unwrap();
+        assert_eq!(
+            pane_info_from(&v),
+            PaneInfo {
+                tab_id: "w1:t1".into(),
+                terminal_id: "term_65ff00fc5d6f11".into()
+            }
+        );
+        let created = r#"{"result":{"root_pane":{"pane_id":"w1:p1","tab_id":"w1:t1","terminal_id":"term_65ff00fc5d6f11"},"tab":{"tab_id":"w1:t1"}}}"#;
+        let v: Value = serde_json::from_str(created).unwrap();
+        assert_eq!(
+            s(&v["result"]["root_pane"]["terminal_id"]),
+            "term_65ff00fc5d6f11"
+        );
+    }
 }

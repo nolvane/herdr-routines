@@ -272,7 +272,7 @@ pub fn all_runs(paths: &Paths) -> Vec<Run> {
 pub fn prune(paths: &Paths, routine_id: &str, keep: usize) {
     let runs = runs_of(paths, routine_id);
     for run in runs.iter().skip(keep).filter(|r| !r.status.active()) {
-        for ext in ["json", "log", "sh", "run", "exit", "out"] {
+        for ext in ["json", "log", "sh", "run", "exit", "out", "prompt"] {
             let _ = std::fs::remove_file(run.file(paths, ext));
         }
     }

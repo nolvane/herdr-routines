@@ -131,7 +131,7 @@ fn remember(paths: &Paths, run: &Run) {
     );
     entries.truncate(MEMORY_ENTRIES);
     let text = entries.join(&format!("\n\n{MEMORY_SEPARATOR}\n\n")) + "\n";
-    let _ = std::fs::create_dir_all(path.parent().expect("has a parent"));
+    let _ = paths::create_private_dir(path.parent().expect("has a parent"));
     let _ = paths::write_atomic(&path, text.as_bytes());
 }
 
@@ -249,8 +249,14 @@ pub fn launch(paths: &Paths, settings: &Settings, routine: &Routine, mut run: Ru
     } else {
         full_prompt(paths, routine, check_output.as_deref())
     };
-    // What the agent gets, also for handing it over later (see `watch`).
-    let _ = paths::write_atomic(&run.file(paths, "prompt"), prompt.as_bytes());
+    // What the agent gets, also for handing it over later (see `watch`):
+    // the approved prompt as it was at launch, even when the routine
+    // changes meanwhile.
+    if let Err(e) = paths::write_atomic(&run.file(paths, "prompt"), prompt.as_bytes()) {
+        run.finish(Status::Failed, format!("Could not keep the prompt: {e}"));
+        let _ = run.save(paths);
+        return run;
+    }
     let place = match herdr::open_tab(
         &settings.workspace,
         &folder.to_string_lossy(),
@@ -360,16 +366,23 @@ fn clean_prompt(text: &str) -> String {
 /// restarted Herdr hands out the same pane ids again, so the id alone could
 /// point at another tab of the person.
 fn own_pane(run: &Run) -> Result<bool, herdr::Error> {
+    Ok(own_pane_info(run)?.is_some())
+}
+
+/// The run's pane as Herdr sees it now, if it is still the run's own: the
+/// same terminal, or for older records without one, the same tab. A pane
+/// the person moved to another tab stays the run's own.
+fn own_pane_info(run: &Run) -> Result<Option<herdr::PaneInfo>, herdr::Error> {
     if run.pane_id.is_empty() {
-        return Ok(false);
+        return Ok(None);
     }
-    Ok(match herdr::pane_info(&run.pane_id)? {
-        Some(p) => {
+    Ok(herdr::pane_info(&run.pane_id)?.filter(|p| {
+        if run.terminal_id.is_empty() {
             p.tab_id == run.tab_id
-                && (run.terminal_id.is_empty() || p.terminal_id == run.terminal_id)
+        } else {
+            p.terminal_id == run.terminal_id
         }
-        None => false,
-    })
+    }))
 }
 
 /// The wrapper a shell routine runs through: the routine's command in the
@@ -506,15 +519,27 @@ fn save_log(paths: &Paths, run: &Run) {
     }
 }
 
+/// The routine's settings count for a run only while it is still approved
+/// and still uses the run's agent.
+fn approved_routine<'a>(run: &Run, routine: Option<&'a Routine>) -> Option<&'a Routine> {
+    routine.filter(|r| r.can_run() && r.file.agent == run.agent)
+}
+
+/// The prompt a late hand-over types in: the one kept when the run was
+/// launched, so a change made since never reaches the agent. Records from
+/// before the kept prompt take the routine's, if still approved.
+fn prompt_for(paths: &Paths, run: &Run, routine: Option<&Routine>) -> Option<String> {
+    std::fs::read_to_string(run.file(paths, "prompt"))
+        .ok()
+        .or_else(|| approved_routine(run, routine).map(|r| r.prompt.clone()))
+}
+
 /// Follows an active run one step. Returns whether the record changed.
 pub fn watch(paths: &Paths, settings: &Settings, run: &mut Run, routine: Option<&Routine>) -> bool {
     let now = Local::now();
-    // What was prepared for the agent at launch (with the check output and
-    // memory), else the routine's prompt.
-    let prepared = std::fs::read_to_string(run.file(paths, "prompt")).ok();
-    let prompt = prepared
-        .as_deref()
-        .or_else(|| routine.map(|r| r.prompt.as_str()));
+    let routine = approved_routine(run, routine);
+    let prompt = prompt_for(paths, run, routine);
+    let prompt = prompt.as_deref();
     let limit_minutes = routine.map_or(120, |r| r.file.time_limit_minutes);
     let stop_at_limit = routine.is_some_and(|r| r.file.stop_at_limit);
     let remembers = routine.is_some_and(|r| r.file.remember);
@@ -754,9 +779,17 @@ pub fn tidy(paths: &Paths, settings: &Settings, run: &mut Run, workspace_in_view
     }
     // Gone, or the id now means another pane: the run's tab is not there
     // any more, and the other tab is not the plugin's to close.
-    match own_pane(run) {
-        Ok(true) => {}
-        Ok(false) => {
+    match own_pane_info(run) {
+        // Still in the tab it opened in: that tab can close.
+        Ok(Some(p)) if p.tab_id == run.tab_id => {}
+        // Moved to another tab by the person: keep its output, leave it.
+        Ok(Some(_)) => {
+            save_log(paths, run);
+            run.tab_closed = true;
+            let _ = run.save(paths);
+            return true;
+        }
+        Ok(None) => {
             run.tab_closed = true;
             let _ = run.save(paths);
             return true;
@@ -783,15 +816,19 @@ pub fn show(paths: &Paths, run: &Run) -> Result<(), String> {
     if run.server != paths.server_id() {
         return Err("its tab is in another Herdr session".into());
     }
-    match own_pane(run) {
-        Ok(true) => herdr::focus(&Place {
-            workspace_id: run.workspace_id.clone(),
-            tab_id: run.tab_id.clone(),
+    match own_pane_info(run) {
+        Ok(Some(p)) => herdr::focus(&Place {
+            workspace_id: if p.tab_id == run.tab_id {
+                run.workspace_id.clone()
+            } else {
+                String::new()
+            },
+            tab_id: p.tab_id,
             pane_id: run.pane_id.clone(),
             terminal_id: run.terminal_id.clone(),
         })
         .map_err(|e| e.to_string()),
-        Ok(false) => Err("its tab is closed".into()),
+        Ok(None) => Err("its tab is closed".into()),
         Err(e) => Err(e.to_string()),
     }
 }
@@ -799,6 +836,42 @@ pub fn show(paths: &Paths, run: &Run) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_late_hand_over_types_the_prompt_kept_at_launch() {
+        let dir =
+            std::env::temp_dir().join(format!("herdr-routines-runner-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let p = Paths {
+            config: dir.join("config"),
+            state: dir.join("state"),
+            socket: dir.join("sock"),
+        };
+        let file: crate::routine::RoutineFile =
+            toml::from_str("name = \"A\"\nschedule = \"0 9 * * *\"\n").unwrap();
+        let mut routine = Routine {
+            id: "a".into(),
+            file,
+            prompt: "Changed since.".into(),
+            problem: None,
+            unreadable: false,
+            approved: true,
+        };
+        let mut run = Run::new("a", "A", "claude", Trigger::Manual, None);
+        run.id = "20261110-080000-000".into();
+        // An older record without a kept prompt: the approved routine's.
+        assert_eq!(
+            prompt_for(&p, &run, Some(&routine)).as_deref(),
+            Some("Changed since.")
+        );
+        routine.approved = false;
+        assert_eq!(prompt_for(&p, &run, Some(&routine)), None);
+        paths::write_atomic(&run.file(&p, "prompt"), b"Approved at launch.").unwrap();
+        assert_eq!(
+            prompt_for(&p, &run, Some(&routine)).as_deref(),
+            Some("Approved at launch.")
+        );
+    }
 
     #[test]
     fn shell_wrapper_quotes_paths() {

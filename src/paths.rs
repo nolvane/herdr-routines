@@ -89,6 +89,33 @@ impl Paths {
     pub fn lock_file(&self, id: &str) -> PathBuf {
         self.runs_dir(id).join(".lock")
     }
+
+    /// Held while `approved.json` is read, changed and written.
+    pub fn approvals_lock_file(&self) -> PathBuf {
+        self.state.join(".approved.lock")
+    }
+
+    /// Routines that were due while they waited for approval and were
+    /// already announced, so the notification comes once per wait.
+    pub fn waiting_file(&self) -> PathBuf {
+        self.state.join("waiting.json")
+    }
+}
+
+/// Runs `f` while holding an exclusive lock on this file (created owner-only
+/// when missing). Where the file system has no locks, `f` still runs.
+pub fn locked<T>(file: &Path, f: impl FnOnce() -> T) -> T {
+    use std::os::unix::fs::OpenOptionsExt;
+    let lock = create_private_dir(file.parent().unwrap_or(Path::new("."))).and_then(|_| {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .mode(0o600)
+            .open(file)
+    });
+    let _held = lock.ok().filter(|l| l.lock().is_ok());
+    f()
 }
 
 fn server_id_of(socket: &Path) -> String {
@@ -180,16 +207,21 @@ pub fn write_atomic(path: &Path, content: &[u8]) -> std::io::Result<()> {
         .file_name()
         .map(|n| n.to_string_lossy())
         .unwrap_or_default();
+    // Unique per write: the process, a counter for its threads, the time.
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.subsec_nanos())
         .unwrap_or(0);
-    let tmp = dir.join(format!(".{name}.tmp{}-{nanos}", std::process::id()));
-    let written = create_private_file(&tmp).and_then(|mut f| f.write_all(content));
-    if let Err(e) = written {
+    let tmp = dir.join(format!(".{name}.tmp{}-{n}-{nanos}", std::process::id()));
+    // A name that exists belongs to someone else: fail without touching it.
+    let mut file = create_private_file(&tmp)?;
+    if let Err(e) = file.write_all(content) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
+    drop(file);
     std::fs::rename(&tmp, path).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
     })

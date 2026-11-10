@@ -315,11 +315,30 @@ approved there with `a`. `approved.json` in the state folder keeps the
 approved content of `routine.toml` and the prompt or command file; the
 scheduler, `fire` and "run now" compare it byte for byte with the files and
 skip a routine that differs (no catch-up for times passed while it waited).
-`a` shows schedule, folder, agent, mode, every option and the prompt or
-command, and approves exactly what it showed. Saving the form approves
-what it saves; saving one file in the editor keeps another file's pending
-change pending; switching on or off never approves a pending change.
-Routines from before this version wait for one approval.
+`a` reads the files once and shows every setting, every option and the
+whole prompt or command, wrapped so nothing hides past the edge; `y`
+works only once the owner has scrolled to the end, and approves exactly
+the bytes shown (if the files changed meanwhile, nothing is approved).
+Hidden characters are dropped from what is shown, and a routine that has
+any in its name, folder, model, arguments or prompt shows a problem and
+does not run. Saving the form approves what it saves for a routine that
+was approved; one that waits keeps waiting, so `a` stays the one place
+that approves a change made elsewhere. Saving one file in the editor
+keeps another file's pending change pending; switching on or off reloads
+the files and never approves a pending change. A run keeps its approved
+prompt next to its record, so a prompt handed over later (after a
+question at start) is the one approved at launch. When a waiting
+routine's time comes, the scheduler notifies once per wait
+(`waiting.json`). Routines from before this version wait for one
+approval.
+
+The cron features cover the same ground: the check command, retries,
+stop at the limit and memory live in `routine.toml`, so they are part of
+what is approved, and the approval view lists them (the check command
+runs as a shell command before the agent). An `@once` routine that ran
+is switched off with its approval kept, as `space` would. Stopping a run
+at its limit closes its tab only when it is still the run's own, and the
+memory folder is owner-only like the rest of the state folder.
 
 Why: the security audit of 2026-11-10 found that any writer of the routine
 files, such as an agent steered by text in a repository, could raise a
@@ -332,7 +351,9 @@ for approval, Claude-made routines included.
 Limits: `approved.json` is a file of the same user. A process that
 deliberately writes it can still approve its own routine; such a process
 has the owner's account anyway. The check stops agents that create or edit
-routines the normal way.
+routines the normal way. It does not cover the agent's own settings in the
+routine's folder (such as `.claude/settings.json`), which the agent reads
+at start as in any session there.
 
 ## 2026-11-10: Extra arguments cannot set permissions
 
@@ -401,4 +422,6 @@ without quotes or backslashes, which every common shell reads the same way.
 fails, instead of falling back to an unlocked build.
 
 Why: the fallback resolved newer, unreviewed dependency versions on the
-user's machine at install time.
+user's machine at install time. `rust-version = "1.89"` in `Cargo.toml`
+names the oldest Rust that builds it (`File::lock` came in 1.89), so an
+older toolchain fails with a clear message.

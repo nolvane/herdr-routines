@@ -1319,27 +1319,54 @@ fn draw_log(frame: &mut Frame, app: &mut App, mut log: LogView) {
     );
     let inner = dialog(frame, area, &log.title);
     let visible = inner.height.saturating_sub(1);
-    log.max = (log.lines.len() as u16).saturating_sub(visible);
-    log.scroll = log.scroll.min(log.max);
-    let lines: Vec<Line> = log
+    // Long lines wrap, so nothing hides past the right edge.
+    let rows: Vec<String> = log
         .lines
         .iter()
+        .flat_map(|l| hard_wrap(&l.replace('\t', "    "), inner.width as usize))
+        .collect();
+    let total = rows.len().min(u16::MAX as usize) as u16;
+    log.max = total.saturating_sub(visible);
+    log.scroll = log.scroll.min(log.max);
+    let lines: Vec<Line> = rows
+        .into_iter()
         .skip(log.scroll as usize)
         .take(visible as usize)
-        .map(|l| Line::from(Span::styled(l.replace('\t', "    "), Style::new().fg(TEXT))))
+        .map(|l| Line::from(Span::styled(l, Style::new().fg(TEXT))))
         .collect();
     frame.render_widget(
         Paragraph::new(Text::from(lines)),
         Rect::new(inner.x, inner.y, inner.width, visible),
     );
-    let mut foot = vec![
-        Span::styled("Esc", bold(MUTED)),
-        Span::styled(" close  ", Style::new().fg(FAINT)),
-    ];
+    let y = inner.y + inner.height.saturating_sub(1);
+    let mut foot = Vec::new();
+    let mut x = inner.x;
+    if log.approve.is_some() {
+        if log.scroll >= log.max {
+            foot.push(Span::styled(
+                " y approve ",
+                Style::new()
+                    .fg(theme::on(GREEN))
+                    .bg(GREEN)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            foot.push(Span::raw("  "));
+            app.hits.push((Rect::new(x, y, 11, 1), Hit::Key('y')));
+            x += 13;
+        } else {
+            foot.push(Span::styled("↓", bold(MUTED)));
+            foot.push(Span::styled(
+                " read to the end to approve  ",
+                Style::new().fg(FAINT),
+            ));
+            x += 30;
+        }
+    }
+    foot.push(Span::styled("Esc", bold(MUTED)));
+    foot.push(Span::styled(" close  ", Style::new().fg(FAINT)));
+    app.hits.push((Rect::new(x, y, 3, 1), Hit::Key('\u{1b}')));
     if log.file.is_some() {
-        let y = inner.y + inner.height.saturating_sub(1);
-        app.hits
-            .push((Rect::new(inner.x + 9, y, 13, 1), Hit::Key('f')));
+        app.hits.push((Rect::new(x + 9, y, 13, 1), Hit::Key('f')));
         foot.push(Span::styled("f", bold(MUTED)));
         foot.push(Span::styled(" open file  ", Style::new().fg(FAINT)));
     }
@@ -1349,20 +1376,50 @@ fn draw_log(frame: &mut Frame, app: &mut App, mut log: LogView) {
             format!(
                 " scroll · lines {}–{} of {}",
                 log.scroll + 1,
-                (log.scroll + visible).min(log.lines.len() as u16),
-                log.lines.len()
+                (log.scroll + visible).min(total),
+                total
             ),
             Style::new().fg(FAINT),
         ));
     }
-    let y = inner.y + inner.height.saturating_sub(1);
-    app.hits
-        .push((Rect::new(inner.x, y, 3, 1), Hit::Key('\u{1b}')));
     frame.render_widget(
         Paragraph::new(Line::from(foot)),
         Rect::new(inner.x, y, inner.width, 1),
     );
     app.mode = Mode::Log(log);
+}
+
+/// Splits a line into rows of at most `width` columns and keeps every
+/// character (unlike `wrap`, which joins words): it breaks after the last
+/// space that fits, or inside a word that is longer than a row.
+pub fn hard_wrap(text: &str, width: usize) -> Vec<String> {
+    use unicode_width::UnicodeWidthChar;
+    let width = width.max(1);
+    let mut rest: Vec<char> = text.chars().collect();
+    let mut out = Vec::new();
+    loop {
+        let (mut n, mut used) = (0, 0);
+        while n < rest.len() {
+            let w = rest[n].width().unwrap_or(0);
+            if used + w > width {
+                break;
+            }
+            used += w;
+            n += 1;
+        }
+        if n == rest.len() {
+            out.push(rest.into_iter().collect());
+            return out;
+        }
+        // A character wider than the row still takes one.
+        let n = n.max(1);
+        let cut = rest[..n]
+            .iter()
+            .rposition(|c| *c == ' ')
+            .filter(|&i| i > 0)
+            .map_or(n, |i| i + 1);
+        out.push(rest.drain(..cut).collect());
+    }
 }
 
 /// Word wrap for plain text.
@@ -1580,6 +1637,16 @@ mod tests {
         assert_eq!(offset(5, 10, 3), 3);
         assert_eq!(offset(9, 10, 3), 7);
         assert_eq!(wrap("a bb ccc dddd", 10), vec!["a bb ccc", "dddd"]);
+    }
+
+    #[test]
+    fn hard_wrap_keeps_every_character() {
+        assert_eq!(hard_wrap("", 5), vec![""]);
+        assert_eq!(hard_wrap("ab  cd ef", 5), vec!["ab  ", "cd ef"]);
+        assert_eq!(hard_wrap("abcdefgh", 3), vec!["abc", "def", "gh"]);
+        assert_eq!(hard_wrap("  rm -rf x", 6), vec!["  rm ", "-rf x"]);
+        let long = "x".repeat(50) + " hidden";
+        assert_eq!(hard_wrap(&long, 20).concat(), long);
     }
 
     #[test]

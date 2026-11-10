@@ -13,6 +13,8 @@ use crate::runner;
 use crate::schedule::Schedule;
 use crate::store::{self, Checked, Status, Trigger};
 use chrono::{DateTime, Duration, Local};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -57,18 +59,7 @@ pub fn due(routine: &Routine, last_checked: DateTime<Local>, now: DateTime<Local
 /// free and each start a run. Without the lock (a file system that has no
 /// locks) `f` still runs.
 pub fn with_lock<T>(paths: &Paths, routine_id: &str, f: impl FnOnce() -> T) -> T {
-    use std::os::unix::fs::OpenOptionsExt;
-    let file = paths.lock_file(routine_id);
-    let lock = paths::create_private_dir(file.parent().unwrap_or(&paths.state)).and_then(|_| {
-        std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .mode(0o600)
-            .open(&file)
-    });
-    let _held = lock.ok().filter(|l| l.lock().is_ok());
-    f()
+    paths::locked(&paths.lock_file(routine_id), f)
 }
 
 /// Whether the routine's previous run still holds it.
@@ -138,6 +129,34 @@ fn fire_attempt(
     }))
 }
 
+/// Routines that were due while they waited for approval and whose owner
+/// was told, so the notification comes once per wait.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+struct Waiting(BTreeSet<String>);
+
+impl Waiting {
+    fn load(paths: &Paths) -> Waiting {
+        std::fs::read(paths.waiting_file())
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default()
+    }
+
+    fn save(&self, paths: &Paths) {
+        if let Ok(text) = serde_json::to_vec_pretty(self) {
+            let _ = paths::write_atomic(&paths.waiting_file(), &text);
+        }
+    }
+
+    fn insert(&mut self, id: String) -> bool {
+        self.0.insert(id)
+    }
+
+    fn retain(&mut self, keep: impl FnMut(&String) -> bool) {
+        self.0.retain(keep)
+    }
+}
+
 /// One round: start what is due, follow active runs, close old tabs.
 fn tick(
     paths: &Paths,
@@ -147,6 +166,8 @@ fn tick(
     let settings = Settings::load(paths);
     let routines = routine::load_all(paths);
     let now = Local::now();
+    let mut waiting = Waiting::load(paths);
+    let waiting_before = waiting.clone();
 
     let server = paths.server_id();
     let mut started = Started::load(paths);
@@ -161,6 +182,22 @@ fn tick(
             }
             continue;
         };
+        // A time passed while it waited for approval: tell the owner, once
+        // per wait, since nothing else shows that it did not run.
+        if r.file.enabled
+            && !r.approved
+            && !r.unreadable
+            && due(r, last, now) != Due::Not
+            && waiting.insert(r.id.clone())
+        {
+            let name = crate::app::visible_text(&r.file.name);
+            paths::log(paths, &format!("{}: due, but waits for approval", r.id));
+            herdr::notify(
+                &format!("{name} waits for your approval"),
+                "It did not run: it changed outside the list. a in the routines list shows it.",
+                "request",
+            );
+        }
         // Off, broken or changed outside the list without the owner's
         // approval: no run, and no catch-up for the times passed meanwhile.
         if !r.file.enabled || !r.can_run() {
@@ -197,10 +234,11 @@ fn tick(
             }
         };
         if once && launch.is_some() {
-            // A single run switches its routine off once it started.
+            // A single run switches its routine off once it started. It
+            // ran approved, so it stays approved (off), as `space` would.
             let mut done = r.clone();
             done.file.enabled = false;
-            let _ = done.save(paths);
+            let _ = done.save_approved(paths);
         }
         launches.extend(launch);
     }
@@ -213,6 +251,11 @@ fn tick(
         .0
         .retain(|id, _| routines.iter().any(|r| &r.id == id));
     started.save(paths);
+    // Approved or gone: the next wait is announced again.
+    waiting.retain(|id| routines.iter().any(|r| &r.id == id && !r.approved));
+    if waiting != waiting_before {
+        waiting.save(paths);
+    }
 
     // Reachability check, so a gone server ends the loop.
     let in_view = workspace_in_view(&settings.workspace)?;

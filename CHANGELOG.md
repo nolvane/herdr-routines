@@ -9,9 +9,14 @@ All notable changes to this plugin. The format follows
 
 - Approval of routines changed outside the list: a routine runs only as
   saved in the list or approved there with `a`, which shows everything it
-  would run first. Routines created by an agent, "Describe it to Claude"
-  included, wait for this approval. Routines that existed before this
-  version wait for one approval too.
+  would run, the whole prompt or command included, and approves with `y`
+  once read to the end. Routines created by an agent, "Describe it to
+  Claude" included, wait for this approval, also when saved again in the
+  form. Routines that existed before this version wait for one approval
+  too. Herdr notifies once when a waiting routine's time comes.
+- Routines whose name, folder, model, arguments or prompt hold hidden
+  characters (zero-width, direction overrides and the like) show a problem
+  and do not run.
 - The list shows a routine's extra arguments under its name, and "run now"
   shows the full options.
 
@@ -23,13 +28,17 @@ All notable changes to this plugin. The format follows
 - The plugin's folders and files are readable only by you (0700 and
   0600), also folders an older version created.
 - The build stops when `Cargo.lock` does not match instead of resolving
-  newer dependency versions at install time.
+  newer dependency versions at install time. Building needs Rust 1.89 or
+  newer.
+- Long lines in the output view wrap instead of being cut off.
 
 ### Fixed
 
 - A run's prompt goes to the run's own agent by name, and tabs are closed,
   read and shown only when Herdr confirms they are still the run's own, so
   a reused pane or tab id after a Herdr restart cannot hit another tab.
+- A prompt handed over late (after a question at start) is the one
+  approved when the run started, not a later change.
 - Two processes can no longer start the same routine at the same moment.
 - Control characters are removed from a prompt before it is typed into the
   agent, and hidden direction and zero-width characters from shown output.

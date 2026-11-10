@@ -155,6 +155,40 @@ pub struct Routine {
     pub approved: bool,
 }
 
+/// Whether the text holds characters that do not show on screen or show as
+/// something else: control characters (line breaks and tabs are fine in a
+/// multi-line text), Unicode format characters (zero-width, direction
+/// overrides, soft hyphen, tag characters), variation selectors beyond
+/// the two emoji ones, and private-use characters.
+pub fn has_hidden(text: &str, multi_line: bool) -> bool {
+    text.chars().any(|c| {
+        if c.is_control() {
+            return !(multi_line && matches!(c, '\n' | '\t' | '\r'));
+        }
+        matches!(
+            c,
+            '\u{00AD}'
+                | '\u{034F}'
+                | '\u{061C}'
+                | '\u{115F}'..='\u{1160}'
+                | '\u{17B4}'..='\u{17B5}'
+                | '\u{180B}'..='\u{180F}'
+                | '\u{200B}'..='\u{200C}'
+                | '\u{200E}'..='\u{200F}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2060}'..='\u{206F}'
+                | '\u{3164}'
+                | '\u{FE00}'..='\u{FE0D}'
+                | '\u{FEFF}'
+                | '\u{FFA0}'
+                | '\u{FFF0}'..='\u{FFFB}'
+                | '\u{E000}'..='\u{F8FF}'
+                | '\u{E0000}'..='\u{E0FFF}'
+                | '\u{F0000}'..='\u{10FFFF}'
+        )
+    })
+}
+
 /// Whether a folder name can be a routine id: lower case letters, digits
 /// and dashes, as `new_id` makes them. Ids become parts of file paths and
 /// of the line a shell routine's tab runs, so nothing else is allowed.
@@ -183,6 +217,30 @@ impl Routine {
     pub fn check(file: &RoutineFile, prompt: &str) -> Option<String> {
         if file.name.trim().is_empty() {
             return Some("the name is empty".into());
+        }
+        // Text the owner cannot see on screen but an agent or a shell reads
+        // (such as instructions hidden in Unicode tag characters) makes what
+        // is shown for approval differ from what runs.
+        let fields = [
+            ("name", file.name.as_str()),
+            ("folder", file.folder.as_str()),
+            ("model", file.model.as_str()),
+            ("check command", file.check_command.as_str()),
+        ];
+        for (what, text) in fields {
+            if has_hidden(text, false) {
+                return Some(format!("the {what} has hidden characters"));
+            }
+        }
+        if file.args.iter().any(|a| has_hidden(a, false)) {
+            return Some("the extra arguments have hidden characters".into());
+        }
+        if has_hidden(prompt, true) {
+            return Some(if file.agent == SHELL {
+                "the command has hidden characters".into()
+            } else {
+                "the prompt has hidden characters".into()
+            });
         }
         if let Err(e) = Schedule::parse(&file.schedule) {
             return Some(format!("schedule: {e}"));
@@ -244,15 +302,28 @@ impl Routine {
                 "the folder name \"{id}\" may only have lower case letters, digits and dashes"
             ));
         }
-        let dir = paths.routine_dir(id);
-        let text = std::fs::read_to_string(dir.join("routine.toml"))
-            .map_err(|e| format!("cannot read routine.toml: {e}"))?;
+        Routine::from_files(id, &approval::snapshot(paths, id), approvals)
+    }
+
+    /// The routine from one read of its files. Its approval is judged
+    /// against exactly these bytes, so a file swapped between the check and
+    /// the run cannot slip through.
+    pub fn from_files(
+        id: &str,
+        files: &Snapshot,
+        approvals: &Approvals,
+    ) -> Result<Routine, String> {
+        let text = files
+            .get("routine.toml")
+            .ok_or_else(|| "cannot read routine.toml".to_string())?;
         let file: RoutineFile =
-            toml::from_str(&text).map_err(|e| format!("routine.toml: {}", e.message()))?;
-        let prompt =
-            std::fs::read_to_string(dir.join(Routine::text_file(&file.agent))).unwrap_or_default();
+            toml::from_str(text).map_err(|e| format!("routine.toml: {}", e.message()))?;
+        let prompt = files
+            .get(Routine::text_file(&file.agent))
+            .cloned()
+            .unwrap_or_default();
         let problem = Routine::check(&file, &prompt);
-        let approved = approvals.approves(paths, id, &file.agent);
+        let approved = approvals.approves(id, &file.agent, files);
         Ok(Routine {
             id: id.to_string(),
             file,
@@ -559,6 +630,26 @@ mod tests {
         // Deleting forgets the approval.
         Routine::delete(&p, "morning-report").unwrap();
         assert!(Approvals::load(&p).0.is_empty());
+    }
+
+    #[test]
+    fn hidden_characters_are_a_problem() {
+        let mut f = sample();
+        assert_eq!(Routine::check(&f, "Line one\n\tLine two 👍🏽 ❤️"), None);
+        // Instructions hidden in Unicode tag characters.
+        let tags: String = "ignore"
+            .chars()
+            .map(|c| char::from_u32(0xE0000 + c as u32).unwrap())
+            .collect();
+        assert!(Routine::check(&f, &format!("Summarise{tags}")).is_some());
+        assert!(Routine::check(&f, "Run \u{202E}txt.sh").is_some());
+        assert!(Routine::check(&f, "a\u{200B}b").is_some());
+        assert!(Routine::check(&f, "a\u{1b}[2Jb").is_some());
+        f.args = vec!["--x\u{200F}".into()];
+        assert!(Routine::check(&f, "go").is_some());
+        f = sample();
+        f.name = "Report\u{FE01}".into();
+        assert!(Routine::check(&f, "go").is_some());
     }
 
     #[test]

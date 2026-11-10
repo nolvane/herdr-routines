@@ -58,10 +58,14 @@ off; a yellow warning sign marks a routine with a problem.
 - **Your approval:** a routine runs only as you saved it in the list or
   approved it there. When anything else creates or changes its files (an
   agent, an editor outside the list), it waits, marked "Changed outside the
-  list", until you press `a`, see what it would run (schedule, folder,
-  agent, permission mode, every option and the prompt or command) and
-  approve it with `y`. So an agent cannot quietly give a routine more
-  rights or turn it into a shell command that runs unattended.
+  list", until you press `a`, read what it would run (every setting, every
+  option and the whole prompt or command) to the end and approve it with
+  `y`. When a waiting routine's time comes, Herdr tells you once. So an
+  agent that writes routine files the normal way cannot make the
+  scheduler run something you have not seen, such as a stronger
+  permission mode or a shell command. It does not cover the agent's own
+  settings in the routine's folder (such as `.claude/settings.json`),
+  which the agent reads at start like in any other session.
 - **Prompt editor** in the list: type, paste, move with the arrows or the
   mouse, mark text with Shift and the arrows or by dragging, copy, cut and
   paste with `Ctrl+C`, `Ctrl+X`, `Ctrl+V`, undo with `Ctrl+Z`. `Esc`
@@ -106,7 +110,7 @@ off; a yellow warning sign marks a routine with a problem.
 
 ## Install
 
-Needs Herdr 0.9.0 or newer and Rust (`cargo`) to build.
+Needs Herdr 0.9.0 or newer and Rust 1.89 or newer (`cargo`) to build.
 
 ```sh
 herdr plugin install nolvane/herdr-routines --yes
