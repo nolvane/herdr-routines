@@ -150,6 +150,11 @@ theirs.
 Why: the owner found the jump into nano or vim unintuitive. A small text
 area keeps the look and keys of the list and needs no editor set up.
 
+Few keys, like a notes app: `Esc` closes the editor and keeps the text,
+`Ctrl+Z` and `Ctrl+Y` undo and redo, and the footer shows only these
+(written `Ctrl+…`, not `^…`). There is no "discard?" question; undo takes
+a change back. Why: the owner found save-or-cancel keys too complicated.
+
 ## 2026-11-10: Same look and controls as the other plugins
 
 The list follows the Herdr Git Panel and Multiaccount plugins: title with

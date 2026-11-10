@@ -95,7 +95,6 @@ pub enum ConfirmFor {
     Run(String),
     Delete(String),
     DiscardForm,
-    DiscardEditor,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -466,19 +465,6 @@ impl App {
         self.reload();
     }
 
-    fn close_editor(&mut self) {
-        match &self.editor {
-            Some(ed) if ed.text.changed() => {
-                self.mode = Mode::Confirm(Confirm {
-                    question: "Discard the changes?".into(),
-                    lines: vec!["What you wrote since opening the editor is lost.".into()],
-                    purpose: ConfirmFor::DiscardEditor,
-                })
-            }
-            _ => self.editor = None,
-        }
-    }
-
     fn close_form(&mut self) {
         match &self.form {
             Some(f) if f.dirty => {
@@ -543,7 +529,6 @@ impl App {
                 self.reload();
             }
             ConfirmFor::DiscardForm => self.form = None,
-            ConfirmFor::DiscardEditor => self.editor = None,
         }
     }
 
@@ -797,9 +782,10 @@ impl App {
     fn editor_key(&mut self, k: KeyEvent) {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         match k.code {
+            // Like a notes app: leaving keeps what you wrote; Ctrl+Z undoes.
+            KeyCode::Esc => self.save_editor(),
             KeyCode::Char('s') if ctrl => self.save_editor(),
             KeyCode::Char('o') if ctrl => self.external = true,
-            KeyCode::Esc => self.close_editor(),
             _ => {
                 if let Some(ed) = self.editor.as_mut() {
                     ed.text.key(&k);
@@ -1421,18 +1407,18 @@ mod tests {
     }
 
     #[test]
-    fn the_editor_asks_before_dropping_changes() {
+    fn esc_keeps_what_was_written_and_ctrl_z_undoes() {
         let mut a = app("editor");
         press(&mut a, KeyCode::Char('p'));
         assert!(a.editor.is_some());
         press(&mut a, KeyCode::Char('!'));
+        press(&mut a, KeyCode::Char('?'));
+        a.key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL));
+        press(&mut a, KeyCode::Char('.'));
         press(&mut a, KeyCode::Esc);
-        assert!(matches!(a.mode, Mode::Confirm(_)));
-        press(&mut a, KeyCode::Char('n'));
-        assert!(a.editor.is_some(), "no keeps the editor");
-        a.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
         assert!(a.editor.is_none());
+        assert!(matches!(a.mode, Mode::Normal));
         let r = Routine::load(&a.paths, "morning-report").unwrap();
-        assert_eq!(r.prompt, "Do task 0.\nThen stop.!");
+        assert_eq!(r.prompt, "Do task 0.\nThen stop..");
     }
 }

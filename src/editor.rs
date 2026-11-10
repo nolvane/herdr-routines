@@ -74,7 +74,6 @@ pub struct TextArea {
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
     last: Last,
-    original: String,
 }
 
 impl TextArea {
@@ -92,7 +91,6 @@ impl TextArea {
             undo: Vec::new(),
             redo: Vec::new(),
             last: Last::Other,
-            original: text.to_string(),
         }
     }
 
@@ -102,10 +100,6 @@ impl TextArea {
             .map(|l| l.iter().collect::<String>())
             .collect::<Vec<_>>()
             .join("\n")
-    }
-
-    pub fn changed(&self) -> bool {
-        self.text() != self.original
     }
 
     /// New text from outside (the person's own editor), as one undo step.
@@ -515,7 +509,6 @@ mod tests {
     fn typing_and_text_round_trip() {
         let mut t = TextArea::new("Hello\n\nworld\n");
         assert_eq!(t.text(), "Hello\n\nworld\n");
-        assert!(!t.changed());
         t.go_to_end();
         typed(&mut t, "Bye");
         key(&mut t, KeyCode::Enter);
@@ -524,7 +517,6 @@ mod tests {
         key(&mut t, KeyCode::Backspace);
         key(&mut t, KeyCode::Backspace);
         assert_eq!(t.text(), "Hello\n\nworld\nBye");
-        assert!(t.changed());
     }
 
     #[test]

@@ -48,8 +48,8 @@ off; a yellow warning sign marks a routine with a problem.
   finished; any other code marks the run as failed and Herdr shows a
   notification.
 - **Prompt editor** in the list: type, paste, move with the arrows or the
-  mouse, undo with `Ctrl+Z`, keep with `Ctrl+S`. `Ctrl+O` opens the prompt
-  in your own editor instead.
+  mouse, undo with `Ctrl+Z`. `Esc` closes it and keeps what you wrote.
+  `Ctrl+O` opens the prompt in your own editor instead.
 - **Runs** of all routines, newest first: status, how it was started (on
   time, catch-up or by hand), how long it took. `⏎` jumps to the run's tab,
   `l` shows its saved output once the tab is closed.

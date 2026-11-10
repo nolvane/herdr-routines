@@ -833,10 +833,9 @@ fn draw_footer(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let keys: Vec<(&str, &str, Option<Hit>)> = if app.editor.is_some() {
         vec![
-            ("^S", "save", Some(Hit::Ctrl('s'))),
-            ("Esc", "cancel", Some(Hit::Key('\u{1b}'))),
-            ("^Z", "undo", Some(Hit::Ctrl('z'))),
-            ("^O", "your editor", Some(Hit::Ctrl('o'))),
+            ("Esc", "done", Some(Hit::Key('\u{1b}'))),
+            ("Ctrl+Z", "undo", Some(Hit::Ctrl('z'))),
+            ("Ctrl+Y", "redo", Some(Hit::Ctrl('y'))),
         ]
     } else if let Some(form) = &app.form {
         let f = form.current();
@@ -852,7 +851,7 @@ fn draw_footer(frame: &mut Frame, app: &mut App, area: Rect) {
         }
         v.extend([
             ("↑ ↓", "field", None),
-            ("^S", "save", Some(Hit::Ctrl('s'))),
+            ("Ctrl+S", "save", Some(Hit::Ctrl('s'))),
             ("Esc", "back", Some(Hit::Key('\u{1b}'))),
         ]);
         if !f.is_text() {
@@ -1230,11 +1229,10 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
         (
             "Prompt editor",
             &[
-                ("arrows  Home End", "move; ⏎ starts a new line"),
-                ("Ctrl+S", "keep the prompt"),
-                ("Esc", "cancel (asks when something changed)"),
+                ("Esc", "done, keeps what you wrote"),
                 ("Ctrl+Z  Ctrl+Y", "undo / redo"),
-                ("Ctrl+O", "open in your own editor ($VISUAL, $EDITOR)"),
+                ("arrows  Mouse", "move; ⏎ starts a new line"),
+                ("Ctrl+O", "open in another editor ($VISUAL, $EDITOR)"),
             ],
         ),
         (
