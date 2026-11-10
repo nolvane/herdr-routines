@@ -1367,6 +1367,7 @@ mod tests {
         for (w, h) in [(90, 34), (80, 24)] {
             let lines = screen(&mut a, w, h);
             assert!(lines.iter().any(|l| l.contains("▎ Permission mode")));
+            assert!(lines.iter().any(|l| l.contains("‹ Auto ›")));
             assert!(lines.iter().any(|l| l.contains("▎ What the agent may do")));
         }
     }

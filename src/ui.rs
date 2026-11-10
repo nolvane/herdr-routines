@@ -520,18 +520,21 @@ fn field_value(form: &Form, f: Field, selected: bool, room: usize) -> Vec<Span<'
             ]
         }
         f if f.is_choice() => {
-            let mut v = vec![if f == Field::Enabled {
+            // ‹ › show that ← → step through the choices.
+            let arrow = Style::new().fg(if selected { ACCENT } else { FAINT });
+            let value = if f == Field::Enabled {
                 Span::styled(
                     form.shown(f),
                     Style::new().fg(if form.enabled { GREEN } else { RED }),
                 )
             } else {
                 text(form.shown(f))
-            }];
+            };
+            let mut v = vec![Span::styled("‹ ", arrow), value, Span::styled(" ›", arrow)];
             let detail = form.detail(f);
             // The short detail only when it fits whole; the explanation
             // below the form says more.
-            let left = room.saturating_sub(form.shown(f).width() + 2);
+            let left = room.saturating_sub(form.shown(f).width() + 6);
             if !detail.is_empty() && detail.width() <= left {
                 v.push(Span::styled(format!("  {detail}"), Style::new().fg(FAINT)));
             }
