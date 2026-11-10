@@ -62,7 +62,6 @@ pub fn refresh(paths: &Paths, agent: &str) {
             .unwrap_or_default();
         // Keep a good list when the agent printed nothing this time.
         if !names.is_empty() || std::fs::metadata(&path).is_err() || empty {
-            let _ = std::fs::create_dir_all(path.parent().expect("has a parent"));
             let _ = paths::write_atomic(&path, names.join("\n").as_bytes());
         } else {
             // Touch it, so the next try waits.

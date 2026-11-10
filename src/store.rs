@@ -100,6 +100,11 @@ pub struct Run {
     pub pane_id: String,
     #[serde(default)]
     pub agent_name: String,
+    /// The terminal Herdr made for the run's pane. Unlike pane and tab ids,
+    /// which a restarted Herdr hands out again, it is random, so it tells
+    /// whether a pane id still means the run's own pane.
+    #[serde(default)]
+    pub terminal_id: String,
     /// The agent was seen working since the prompt went in.
     #[serde(default)]
     pub seen_working: bool,
@@ -166,6 +171,7 @@ impl Run {
             tab_id: String::new(),
             pane_id: String::new(),
             agent_name: String::new(),
+            terminal_id: String::new(),
             seen_working: false,
             prompted: None,
             turns_before: None,
@@ -199,6 +205,17 @@ impl Run {
             .join(format!("{}.{ext}", self.id))
     }
 
+    /// How Herdr calls reach the run's agent: by its unique name, so a
+    /// prompt or a state check never lands on another agent that now sits
+    /// in a pane with the same id. Older records have only the pane.
+    pub fn agent_target(&self) -> &str {
+        if self.agent_name.is_empty() {
+            &self.pane_id
+        } else {
+            &self.agent_name
+        }
+    }
+
     pub fn finish(&mut self, status: Status, message: impl Into<String>) {
         self.status = status;
         self.message = message.into();
@@ -208,14 +225,28 @@ impl Run {
     }
 }
 
-/// The runs of one routine, newest first.
+/// Whether a run id has the form `Run::new` gives it (digits and dashes).
+fn valid_run_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 32 && id.chars().all(|c| c.is_ascii_digit() || c == '-')
+}
+
+/// The runs of one routine, newest first. A record counts only when it
+/// names the folder and file it is in, since its routine and run ids
+/// become the paths of its log, scripts and later writes and deletes.
 pub fn runs_of(paths: &Paths, routine_id: &str) -> Vec<Run> {
+    if !crate::routine::valid_id(routine_id) {
+        return Vec::new();
+    }
     let mut out: Vec<Run> = std::fs::read_dir(paths.runs_dir(routine_id))
         .into_iter()
         .flatten()
         .flatten()
         .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
-        .filter_map(|e| serde_json::from_slice(&std::fs::read(e.path()).ok()?).ok())
+        .filter_map(|e| {
+            let run: Run = serde_json::from_slice(&std::fs::read(e.path()).ok()?).ok()?;
+            let stem = e.path().file_stem()?.to_string_lossy().to_string();
+            (run.routine_id == routine_id && run.id == stem && valid_run_id(&run.id)).then_some(run)
+        })
         .collect();
     out.sort_by(|a: &Run, b: &Run| b.id.cmp(&a.id));
     out
@@ -302,5 +333,29 @@ mod tests {
         assert_eq!(left.len(), 3);
         assert!(left.iter().any(|r| r.status == Status::Running));
         assert_eq!(all_runs(&p).len(), 3);
+    }
+
+    #[test]
+    fn records_that_point_elsewhere_are_ignored() {
+        let p = temp_paths("forged");
+        let mut ok = Run::new("a", "A", "claude", Trigger::Manual, None);
+        ok.id = "20261110-080000-000".into();
+        ok.save(&p).unwrap();
+        // A record whose ids would lead its writes and deletes elsewhere.
+        let mut forged = ok.clone();
+        forged.routine_id = "../../config".into();
+        forged.id = "../x".into();
+        let text = serde_json::to_vec(&forged).unwrap();
+        paths::write_atomic(&p.runs_dir("a").join("20261110-090000-000.json"), &text).unwrap();
+        // A record copied under another name.
+        paths::write_atomic(
+            &p.runs_dir("a").join("20261110-100000-000.json"),
+            &serde_json::to_vec(&ok).unwrap(),
+        )
+        .unwrap();
+        let runs = runs_of(&p, "a");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].id, ok.id);
+        assert!(runs_of(&p, "../a").is_empty());
     }
 }

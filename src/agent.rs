@@ -309,8 +309,68 @@ pub fn flags(file: &RoutineFile) -> Vec<String> {
     out
 }
 
+/// Flags that set how much an agent may do without asking. They belong in
+/// the permission mode field, which the list shows, never in the extra
+/// arguments, where they would quietly change the mode the list shows.
+fn permission_flags(agent: &str) -> &'static [&'static str] {
+    match agent {
+        "claude" => &[
+            "--permission-mode",
+            "--dangerously-skip-permissions",
+            "--allow-dangerously-skip-permissions",
+        ],
+        "codex" => &[
+            "--full-auto",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--yolo",
+            "--sandbox",
+            "-s",
+            "--ask-for-approval",
+            "-a",
+        ],
+        "gemini" => &["--approval-mode", "--yolo", "-y"],
+        _ => &[],
+    }
+}
+
+/// The first extra argument that changes the agent's permissions, if any.
+fn permission_arg(agent: &str, args: &[String]) -> Option<String> {
+    let flags = permission_flags(agent);
+    for (i, arg) in args.iter().enumerate() {
+        let name = arg.split_once('=').map_or(arg.as_str(), |(n, _)| n);
+        if flags.contains(&name) {
+            return Some(arg.clone());
+        }
+        // Codex settings such as `-c sandbox_mode="danger-full-access"`.
+        if agent == "codex" {
+            let value = match name {
+                "-c" | "--config" => match arg.split_once('=') {
+                    Some((_, v)) => Some(v),
+                    None => args.get(i + 1).map(String::as_str),
+                },
+                _ => None,
+            };
+            if let Some(v) = value {
+                let key = v.trim_start_matches(['"', '\'']);
+                if key.starts_with("sandbox") || key.starts_with("approval") {
+                    return Some(format!("{arg} {v}"));
+                }
+            }
+        }
+    }
+    None
+}
+
 /// What is wrong with the agent settings, if anything.
 pub fn check(file: &RoutineFile) -> Option<String> {
+    if let Some(arg) = permission_arg(&file.agent, &file.args) {
+        return Some(format!(
+            "the extra arguments change permissions ({arg}); use the permission mode instead"
+        ));
+    }
+    if file.model.starts_with('-') {
+        return Some("the model name starts with -".into());
+    }
     let mode = &file.permission_mode;
     if !mode.is_empty() && find(modes(&file.agent), mode).is_none() {
         return Some(format!("{} has no permission mode \"{mode}\"", file.agent));
@@ -408,6 +468,29 @@ mod tests {
         assert!(models("amp").is_empty());
         assert!(models("shell").is_empty());
         assert_eq!(models("cursor").len(), 1);
+    }
+
+    #[test]
+    fn extra_arguments_cannot_change_permissions() {
+        let with = |agent: &str, args: &[&str]| {
+            let mut f = file(agent, "", "", "");
+            f.args = args.iter().map(|s| s.to_string()).collect();
+            check(&f)
+        };
+        assert!(with("claude", &["--permission-mode", "bypassPermissions"]).is_some());
+        assert!(with("claude", &["--permission-mode=bypassPermissions"]).is_some());
+        assert!(with("claude", &["--dangerously-skip-permissions"]).is_some());
+        assert!(with("codex", &["--dangerously-bypass-approvals-and-sandbox"]).is_some());
+        assert!(with("codex", &["-s", "danger-full-access"]).is_some());
+        assert!(with("codex", &["-c", "sandbox_mode=\"danger-full-access\""]).is_some());
+        assert!(with("codex", &["--config=approval_policy=never"]).is_some());
+        assert!(with("gemini", &["--yolo"]).is_some());
+        // Other arguments stay free.
+        assert!(with("claude", &["--verbose", "--add-dir", "../docs"]).is_none());
+        assert!(with("codex", &["-c", "model_reasoning_effort=high"]).is_none());
+        assert!(with("amp", &["--dangerously-skip-permissions"]).is_none());
+        // A model is a name, not a flag.
+        assert!(check(&file("codex", "", "--yolo", "")).is_some());
     }
 
     #[test]

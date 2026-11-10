@@ -202,6 +202,14 @@ pub fn launch(paths: &Paths, settings: &Settings, routine: &Routine, mut run: Ru
         let _ = run.save(paths);
         return run;
     }
+    if !routine.approved {
+        run.finish(
+            Status::Failed,
+            "Cannot run: it changed outside the list and waits for approval",
+        );
+        let _ = run.save(paths);
+        return run;
+    }
     let folder = paths::expand(&routine.file.folder);
     // The check command decides whether there is anything to do.
     let mut check_output = None;
@@ -258,6 +266,7 @@ pub fn launch(paths: &Paths, settings: &Settings, routine: &Routine, mut run: Ru
     run.workspace_id = place.workspace_id;
     run.tab_id = place.tab_id;
     run.pane_id = place.pane_id.clone();
+    run.terminal_id = place.terminal_id;
     if routine.is_shell() {
         return launch_shell(paths, routine, run);
     }
@@ -320,9 +329,47 @@ pub fn launch(paths: &Paths, settings: &Settings, routine: &Routine, mut run: Ru
     run
 }
 
-/// Text in single quotes for any shell.
+/// Text in single quotes for `/bin/sh`.
 fn quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// A path in single quotes that every common shell reads the same way:
+/// sh, bash and zsh take single quotes literally, and fish does too as
+/// long as the text has no quote and no backslash. `None` for a path with
+/// either, or with a control character a line editor would act on.
+fn portable_quote(s: &str) -> Option<String> {
+    if s.chars().any(|c| c == '\'' || c == '\\' || c.is_control()) {
+        return None;
+    }
+    Some(format!("'{s}'"))
+}
+
+/// The prompt as it is typed into the agent: no control characters, which
+/// could end the paste early or press keys in the agent's screen (such as
+/// the one that switches its permission mode). Line breaks and tabs stay.
+fn clean_prompt(text: &str) -> String {
+    text.replace("\r\n", "\n")
+        .chars()
+        .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
+        .collect()
+}
+
+/// Whether the run's pane id still means the pane Herdr made for the run:
+/// the same tab and, for records that have it, the same terminal. A
+/// restarted Herdr hands out the same pane ids again, so the id alone could
+/// point at another tab of the person.
+fn own_pane(run: &Run) -> Result<bool, herdr::Error> {
+    if run.pane_id.is_empty() {
+        return Ok(false);
+    }
+    Ok(match herdr::pane_info(&run.pane_id)? {
+        Some(p) => {
+            p.tab_id == run.tab_id
+                && (run.terminal_id.is_empty() || p.terminal_id == run.terminal_id)
+        }
+        None => false,
+    })
 }
 
 /// The wrapper a shell routine runs through: the routine's command in the
@@ -350,6 +397,14 @@ fn launch_shell(paths: &Paths, routine: &Routine, mut run: Run) -> Run {
     let script = run.file(paths, "sh");
     let wrap = run.file(paths, "run");
     let exit = run.file(paths, "exit");
+    let Some(quoted_wrap) = portable_quote(&wrap.to_string_lossy()) else {
+        run.finish(
+            Status::Failed,
+            "The state folder's path has a quote or backslash; a shell command cannot run from it",
+        );
+        let _ = run.save(paths);
+        return run;
+    };
     let shell = std::env::var("SHELL")
         .ok()
         .filter(|s| !s.trim().is_empty())
@@ -365,7 +420,7 @@ fn launch_shell(paths: &Paths, routine: &Routine, mut run: Run) -> Run {
         let _ = run.save(paths);
         return run;
     }
-    let line = format!("/bin/sh {}", quote(&wrap.to_string_lossy()));
+    let line = format!("/bin/sh {quoted_wrap}");
     let mut result = herdr::pane_run(&run.pane_id, &line);
     for _ in 0..3 {
         if result.is_ok() {
@@ -406,7 +461,7 @@ fn watch_shell(paths: &Paths, settings: &Settings, run: &mut Run) {
                 "request",
             );
         }
-    } else if !herdr::pane_exists(&run.pane_id).unwrap_or(true) {
+    } else if !own_pane(run).unwrap_or(true) {
         run.finish(
             Status::Closed,
             "The tab was closed before the command ended",
@@ -418,8 +473,8 @@ fn watch_shell(paths: &Paths, settings: &Settings, run: &mut Run) {
 /// Types the prompt into the agent, noting its completed turns first so
 /// that one more turn later means the prompt is done.
 fn hand_over(run: &mut Run, prompt: &str) -> Result<(), herdr::Error> {
-    let turns = herdr::agent_state(&run.pane_id)?.map(|(_, t)| t);
-    herdr::agent_prompt(&run.pane_id, prompt)?;
+    let turns = herdr::agent_state(run.agent_target())?.map(|(_, t)| t);
+    herdr::agent_prompt(run.agent_target(), &clean_prompt(prompt))?;
     run.turns_before = turns;
     run.seen_working = false;
     run.prompted = Some(Local::now());
@@ -440,7 +495,8 @@ fn notify_needs_you(run: &mut Run) {
 }
 
 fn save_log(paths: &Paths, run: &Run) {
-    if run.pane_id.is_empty() {
+    // Only the run's own pane: never copy another tab's output.
+    if !own_pane(run).unwrap_or(false) {
         return;
     }
     if let Ok(text) = herdr::read(&run.pane_id, LOG_LINES) {
@@ -481,7 +537,7 @@ pub fn watch(paths: &Paths, settings: &Settings, run: &mut Run, routine: Option<
     if run.agent == SHELL {
         watch_shell(paths, settings, run);
     } else {
-        let (state, turns) = match herdr::agent_state(&run.pane_id) {
+        let (state, turns) = match herdr::agent_state(run.agent_target()) {
             Ok(Some((s, t))) => (Some(s), t),
             Ok(None) => (None, 0),
             // Herdr unreachable: try again next time.
@@ -494,7 +550,7 @@ pub fn watch(paths: &Paths, settings: &Settings, run: &mut Run, routine: Option<
         }
         match state.as_deref() {
             None => {
-                let pane_alive = herdr::pane_exists(&run.pane_id).unwrap_or(true);
+                let pane_alive = own_pane(run).unwrap_or(true);
                 if run.seen_working && pane_alive {
                     run.finish(Status::Finished, "The agent ended");
                 } else if pane_alive {
@@ -571,7 +627,7 @@ pub fn watch(paths: &Paths, settings: &Settings, run: &mut Run, routine: Option<
                 Status::TimedOut,
                 format!("Stopped after {minutes}, its time limit"),
             );
-            if herdr::close_tab(&run.tab_id).is_ok() {
+            if own_pane(run).unwrap_or(false) && herdr::close_tab(&run.tab_id).is_ok() {
                 run.tab_closed = true;
             }
             herdr::notify(
@@ -645,10 +701,9 @@ pub fn occupied(paths: &Paths, run: &Run) -> bool {
     }
     if run.agent == SHELL {
         // Still running until it notes its exit code.
-        return !run.file(paths, "exit").exists()
-            && herdr::pane_exists(&run.pane_id).unwrap_or(true);
+        return !run.file(paths, "exit").exists() && own_pane(run).unwrap_or(true);
     }
-    match herdr::agent_status(&run.pane_id) {
+    match herdr::agent_status(run.agent_target()) {
         Ok(Some(s)) => s != "idle" && s != "done",
         Ok(None) => false,
         // Cannot tell: better wait than run twice.
@@ -663,12 +718,15 @@ pub fn tidy(paths: &Paths, settings: &Settings, run: &mut Run, workspace_in_view
     // A conversation can go on after the run: keep its log current while
     // the tab is open.
     if !run.tab_closed && run.agent != SHELL && !run.pane_id.is_empty() && log_is_old(paths, run) {
-        if herdr::pane_exists(&run.pane_id).unwrap_or(false) {
-            save_log(paths, run);
-        } else {
-            run.tab_closed = true;
-            let _ = run.save(paths);
-            return true;
+        match own_pane(run) {
+            Ok(true) => save_log(paths, run),
+            // Gone, or the id now means another pane.
+            Ok(false) => {
+                run.tab_closed = true;
+                let _ = run.save(paths);
+                return true;
+            }
+            Err(_) => {}
         }
     }
     if run.status != Status::Finished
@@ -683,7 +741,7 @@ pub fn tidy(paths: &Paths, settings: &Settings, run: &mut Run, workspace_in_view
     if Local::now() - ended < Duration::minutes(i64::from(settings.close_finished_after_minutes)) {
         return false;
     }
-    match herdr::agent_state(&run.pane_id) {
+    match herdr::agent_state(run.agent_target()) {
         Ok(Some((s, _))) if s == "working" || s == "blocked" => return false,
         Ok(Some((_, turns))) if run.turns_at_end.is_some_and(|t| turns > t) => {
             run.turns_at_end = Some(turns);
@@ -694,10 +752,16 @@ pub fn tidy(paths: &Paths, settings: &Settings, run: &mut Run, workspace_in_view
         Err(_) => return false,
         _ => {}
     }
-    if !herdr::pane_exists(&run.pane_id).unwrap_or(false) {
-        run.tab_closed = true;
-        let _ = run.save(paths);
-        return true;
+    // Gone, or the id now means another pane: the run's tab is not there
+    // any more, and the other tab is not the plugin's to close.
+    match own_pane(run) {
+        Ok(true) => {}
+        Ok(false) => {
+            run.tab_closed = true;
+            let _ = run.save(paths);
+            return true;
+        }
+        Err(_) => return false,
     }
     if workspace_in_view {
         return false;
@@ -719,11 +783,12 @@ pub fn show(paths: &Paths, run: &Run) -> Result<(), String> {
     if run.server != paths.server_id() {
         return Err("its tab is in another Herdr session".into());
     }
-    match herdr::pane_exists(&run.pane_id) {
+    match own_pane(run) {
         Ok(true) => herdr::focus(&Place {
             workspace_id: run.workspace_id.clone(),
             tab_id: run.tab_id.clone(),
             pane_id: run.pane_id.clone(),
+            terminal_id: run.terminal_id.clone(),
         })
         .map_err(|e| e.to_string()),
         Ok(false) => Err("its tab is closed".into()),
@@ -764,6 +829,27 @@ mod tests {
         assert_eq!(extract_result(log), "Cleaned 3 files.\nNothing open.");
         assert_eq!(extract_result("no markers"), "");
         assert_eq!(last_line("a\nlast one\n\n"), "last one");
+    }
+
+    #[test]
+    fn the_typed_line_reads_the_same_in_every_shell() {
+        assert_eq!(
+            portable_quote("/state/runs/a b/1.run").as_deref(),
+            Some("'/state/runs/a b/1.run'")
+        );
+        // fish reads \' inside single quotes as a quote; a line editor acts
+        // on control characters.
+        assert_eq!(portable_quote("/st'ate/1.run"), None);
+        assert_eq!(portable_quote("/st\\ate/1.run"), None);
+        assert_eq!(portable_quote("/state/\u{15}1.run"), None);
+    }
+
+    #[test]
+    fn prompts_lose_control_characters() {
+        assert_eq!(
+            clean_prompt("Do this:\r\n- a\tb\u{1b}[Z\u{7}\n- c"),
+            "Do this:\n- a\tb[Z\n- c"
+        );
     }
 
     #[test]

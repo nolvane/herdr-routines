@@ -307,3 +307,98 @@ works for every agent. Why routine ids stay slugs (not UUIDs, which the
 owner asked about): the folder name is made once from the first name and
 never changes on rename, runs and memory hang off it, and it stays readable
 for people and agents who edit the files.
+
+## 2026-11-10: A routine changed outside the list waits for approval
+
+A routine runs only in the exact form the owner saved in the list or
+approved there with `a`. `approved.json` in the state folder keeps the
+approved content of `routine.toml` and the prompt or command file; the
+scheduler, `fire` and "run now" compare it byte for byte with the files and
+skip a routine that differs (no catch-up for times passed while it waited).
+`a` shows schedule, folder, agent, mode, every option and the prompt or
+command, and approves exactly what it showed. Saving the form approves
+what it saves; saving one file in the editor keeps another file's pending
+change pending; switching on or off never approves a pending change.
+Routines from before this version wait for one approval.
+
+Why: the security audit of 2026-11-10 found that any writer of the routine
+files, such as an agent steered by text in a repository, could raise a
+routine's permission mode, add permission flags or turn it into a shell
+command that the scheduler then ran unattended. Agents are meant to write
+routines ("Routines are plain files", "Create a routine by describing it to
+Claude"), so the owner chose that every change made outside the list waits
+for approval, Claude-made routines included.
+
+Limits: `approved.json` is a file of the same user. A process that
+deliberately writes it can still approve its own routine; such a process
+has the owner's account anyway. The check stops agents that create or edit
+routines the normal way.
+
+## 2026-11-10: Extra arguments cannot set permissions
+
+For Claude Code, Codex and Gemini, `args` may not hold the flags that
+set permissions (`--permission-mode`, `--dangerously-skip-permissions`,
+`--sandbox`, `--approval-mode`, `--yolo`, Codex `-c sandbox_mode=…` and
+the like); the routine shows the problem instead. The list shows `args`
+under the routine's name, and "run now" and `a` show the full options.
+
+Why: `args` come after the mode flags, so they could change the mode the
+list shows without anyone seeing it.
+
+## 2026-11-10: Owner-only files, safe writes
+
+The config and state folders are `0700` and every file the plugin writes
+is `0600`; folders an older version created are tightened at start.
+`write_atomic` writes a new temporary file that must not exist yet
+(`create_new`, so it never writes through a planted link) and renames it.
+
+Why: logs hold up to 2000 lines of agent output, which can include secrets
+that tools printed, and scripts and prompts can hold credentials. With the
+default umask they were readable by other local accounts wherever the home
+folder is.
+
+## 2026-11-10: Runs are bound to their own agent and terminal
+
+A run records the random `terminal_id` Herdr gives its pane. Before the
+plugin reads a pane's output, closes its tab, shows it or decides it is
+gone, it checks with `herdr pane get` that the pane id still has that
+terminal and that tab. Agent calls (`agent get`, `agent prompt`) go to the
+run's unique agent name instead of its pane id.
+
+Why: pane and tab ids start over when Herdr restarts. With a reused socket
+inode, a stale run could otherwise type its prompt into, copy the output of
+or close another tab of the owner.
+
+## 2026-11-10: One start per routine at a time
+
+The scheduler and `fire` hold a lock file (`runs/<id>/.lock`, `flock`)
+while they check that a routine is free and record its new run.
+
+Why: the check and the record were two steps; two processes could both
+pass the check and start the routine twice.
+
+## 2026-11-10: Routine ids and run records are checked
+
+A routine folder name must be lower case letters, digits and dashes (what
+`new_id` makes); another name shows as a problem. A run record counts only
+when its routine id and run id match the folder and file it is in.
+
+Why: ids become file paths and part of the line a shell routine's tab runs,
+and run records are read back for writes and deletes.
+
+## 2026-11-10: No `--` before text arguments to Herdr
+
+Herdr 0.9 reads the rest of the line as the text for `agent prompt`,
+`tab rename` and `notification show`, also when it starts with `-`; a `--`
+would become part of the text (tested with a throwaway session). So none is
+added. Control characters are removed from a prompt before it is typed in,
+and the line a shell routine's tab runs uses single quotes only for paths
+without quotes or backslashes, which every common shell reads the same way.
+
+## 2026-11-10: The build uses only the locked dependencies
+
+`scripts/build.sh` runs `cargo build --release --locked` and stops when it
+fails, instead of falling back to an unlocked build.
+
+Why: the fallback resolved newer, unreviewed dependency versions on the
+user's machine at install time.

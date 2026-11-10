@@ -38,7 +38,7 @@ fn read_ids() -> Vec<String> {
 
 fn write_ids(ids: &[String]) {
     if let Some(f) = state_file() {
-        let _ = std::fs::write(f, ids.join("\n"));
+        let _ = crate::paths::write_atomic(&f, ids.join("\n").as_bytes());
     }
 }
 

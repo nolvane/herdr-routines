@@ -60,6 +60,30 @@ pub struct Place {
     pub workspace_id: String,
     pub tab_id: String,
     pub pane_id: String,
+    /// Herdr's random id of the pane's terminal (see `Run::terminal_id`).
+    pub terminal_id: String,
+}
+
+/// What Herdr says about a pane now: its tab and its terminal.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PaneInfo {
+    pub tab_id: String,
+    pub terminal_id: String,
+}
+
+/// The pane's tab and terminal, or `None` when the pane is gone.
+pub fn pane_info(pane: &str) -> Result<Option<PaneInfo>, Error> {
+    match call(&["pane", "get", pane]) {
+        Ok(v) => {
+            let p = &v["result"]["pane"];
+            Ok(Some(PaneInfo {
+                tab_id: s(&p["tab_id"]),
+                terminal_id: s(&p["terminal_id"]),
+            }))
+        }
+        Err(e) if e.code == "pane_not_found" => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// The workspace with this label, if one exists.
@@ -104,6 +128,7 @@ pub fn open_tab(workspace_label: &str, cwd: &str, tab_label: &str) -> Result<Pla
             workspace_id: ws,
             tab_id: s(&v["result"]["tab"]["tab_id"]),
             pane_id: s(&v["result"]["root_pane"]["pane_id"]),
+            terminal_id: s(&v["result"]["root_pane"]["terminal_id"]),
         });
     }
     let v = call(&[
@@ -119,6 +144,7 @@ pub fn open_tab(workspace_label: &str, cwd: &str, tab_label: &str) -> Result<Pla
         workspace_id: s(&v["result"]["workspace"]["workspace_id"]),
         tab_id: s(&v["result"]["tab"]["tab_id"]),
         pane_id: s(&v["result"]["root_pane"]["pane_id"]),
+        terminal_id: s(&v["result"]["root_pane"]["terminal_id"]),
     };
     let _ = call(&["tab", "rename", &place.tab_id, tab_label]);
     Ok(place)
@@ -142,6 +168,7 @@ pub fn open_focused_tab(cwd: &str, tab_label: &str, env: &[String]) -> Result<Pl
         workspace_id: s(&v["result"]["tab"]["workspace_id"]),
         tab_id: s(&v["result"]["tab"]["tab_id"]),
         pane_id: s(&v["result"]["root_pane"]["pane_id"]),
+        terminal_id: s(&v["result"]["root_pane"]["terminal_id"]),
     })
 }
 
@@ -191,14 +218,6 @@ pub fn agent_state(pane: &str) -> Result<Option<(String, u64)>, Error> {
             )))
         }
         Err(e) if e.code == "agent_not_found" || e.code == "pane_not_found" => Ok(None),
-        Err(e) => Err(e),
-    }
-}
-
-pub fn pane_exists(pane: &str) -> Result<bool, Error> {
-    match call(&["pane", "get", pane]) {
-        Ok(_) => Ok(true),
-        Err(e) if e.code == "pane_not_found" => Ok(false),
         Err(e) => Err(e),
     }
 }

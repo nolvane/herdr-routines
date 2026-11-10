@@ -14,6 +14,7 @@
 
 mod agent;
 mod app;
+mod approval;
 mod autostart;
 mod clipboard;
 mod cron;
@@ -85,11 +86,19 @@ fn fire(paths: &Paths, id: &str) -> Result<String, String> {
     if let Some(p) = &routine.problem {
         return Err(format!("cannot run {id}: {p}"));
     }
-    if scheduler::busy(paths, id) {
-        return Err(format!("{id} is already running"));
+    if !routine.approved {
+        return Err(format!(
+            "cannot run {id}: it changed outside the list and waits for approval there (key a)"
+        ));
     }
     let settings = Settings::load(paths);
-    let run = runner::prepare(paths, &routine, Trigger::Manual, None);
+    let run = scheduler::with_lock(paths, id, || {
+        if scheduler::busy(paths, id) {
+            return None;
+        }
+        Some(runner::prepare(paths, &routine, Trigger::Manual, None))
+    })
+    .ok_or_else(|| format!("{id} is already running"))?;
     let run = runner::launch(paths, &settings, &routine, run);
     paths::log(
         paths,
@@ -122,8 +131,10 @@ fn routines_json(paths: &Paths) -> String {
                 "permission_mode": r.file.permission_mode,
                 "model": r.file.model,
                 "effort": r.file.effort,
+                "args": r.file.args,
                 "folder": r.file.folder,
                 "problem": r.problem,
+                "approved": r.approved,
                 "next": r.schedule().filter(|_| r.file.enabled).and_then(|c| c.next_after(&now)).map(|t| t.to_rfc3339()),
                 "last_run": last.map(|l| serde_json::json!({
                     "id": l.id, "status": l.status, "started": l.started.to_rfc3339(),
@@ -139,7 +150,7 @@ fn routines_json(paths: &Paths) -> String {
 fn main() {
     let command = std::env::args().nth(1).unwrap_or_else(|| "list".into());
     let paths = Paths::from_env();
-    let _ = std::fs::create_dir_all(&paths.state);
+    paths::secure_roots(&paths);
     let code = match command.as_str() {
         "start" => {
             if let Some(pid) = scheduler::keep_running(&paths) {

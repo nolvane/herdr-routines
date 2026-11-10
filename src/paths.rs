@@ -78,6 +78,17 @@ impl Paths {
     pub fn log_file(&self) -> PathBuf {
         self.state.join("routines.log")
     }
+
+    /// The routines the owner approved, with the approved file contents.
+    pub fn approvals_file(&self) -> PathBuf {
+        self.state.join("approved.json")
+    }
+
+    /// Held while a process checks whether a routine is free and records
+    /// its new run, so two processes cannot both start it.
+    pub fn lock_file(&self, id: &str) -> PathBuf {
+        self.runs_dir(id).join(".lock")
+    }
 }
 
 fn server_id_of(socket: &Path) -> String {
@@ -126,24 +137,73 @@ pub fn shorten(path: &Path) -> String {
     }
 }
 
-/// Writes through a temporary file and a rename, so a reader never sees half
-/// a file.
-pub fn write_atomic(path: &Path, content: &[u8]) -> std::io::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+/// Creates a folder and its missing parents readable only by the owner
+/// (`0700`). Folders that already exist keep their mode.
+pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+}
+
+/// Makes the plugin's own config and state folders owner-only, also when an
+/// older version created them readable by others. Their files hold prompts,
+/// commands and agent output, which can contain secrets.
+pub fn secure_roots(paths: &Paths) {
+    use std::os::unix::fs::PermissionsExt;
+    for dir in [&paths.config, &paths.state] {
+        if create_private_dir(dir).is_ok() {
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        }
     }
-    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
-    std::fs::write(&tmp, content)?;
-    std::fs::rename(&tmp, path)
+}
+
+/// Opens a new file readable only by the owner (`0600`). Fails when the
+/// name exists, a link included, so it never writes through a planted link.
+fn create_private_file(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+}
+
+/// Writes through a temporary file and a rename, so a reader never sees half
+/// a file. The file is readable only by the owner.
+pub fn write_atomic(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let dir = path.parent().unwrap_or(Path::new("."));
+    create_private_dir(dir)?;
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy())
+        .unwrap_or_default();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let tmp = dir.join(format!(".{name}.tmp{}-{nanos}", std::process::id()));
+    let written = create_private_file(&tmp).and_then(|mut f| f.write_all(content));
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
 }
 
 /// Appends a timestamped line to the plugin log.
 pub fn log(paths: &Paths, line: &str) {
     use std::io::Write;
-    let _ = std::fs::create_dir_all(&paths.state);
+    use std::os::unix::fs::OpenOptionsExt;
+    let _ = create_private_dir(&paths.state);
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
+        .mode(0o600)
         .open(paths.log_file())
     {
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
@@ -154,6 +214,61 @@ pub fn log(paths: &Paths, line: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp(tag: &str) -> PathBuf {
+        let d =
+            std::env::temp_dir().join(format!("herdr-routines-paths-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    #[test]
+    fn writes_are_owner_only_and_never_follow_links() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = temp("modes");
+        let f = d.join("runs/x/1.log");
+        write_atomic(&f, b"secret").unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&f), 0o600);
+        assert_eq!(mode(&d.join("runs/x")), 0o700);
+        // A link planted where the target goes is replaced, not written through.
+        let outside = d.join("outside");
+        std::fs::write(&outside, b"keep").unwrap();
+        let g = d.join("runs/x/2.log");
+        std::os::unix::fs::symlink(&outside, &g).unwrap();
+        write_atomic(&g, b"new").unwrap();
+        assert_eq!(std::fs::read(&outside).unwrap(), b"keep");
+        assert_eq!(std::fs::read(&g).unwrap(), b"new");
+        // No temporary files are left behind.
+        let left: Vec<_> = std::fs::read_dir(d.join("runs/x"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(left.is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn secure_roots_tightens_existing_folders() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = temp("roots");
+        let p = Paths {
+            config: d.join("config"),
+            state: d.join("state"),
+            socket: d.join("sock"),
+        };
+        std::fs::create_dir_all(&p.config).unwrap();
+        std::fs::set_permissions(&p.config, std::fs::Permissions::from_mode(0o755)).unwrap();
+        secure_roots(&p);
+        for dir in [&p.config, &p.state] {
+            assert_eq!(
+                std::fs::metadata(dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     #[test]
     fn expands_home() {

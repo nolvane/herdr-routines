@@ -54,7 +54,14 @@ off; a yellow warning sign marks a routine with a problem.
   notification.
 - **Create with Claude:** `n`, then "Describe it to Claude", opens a tab
   where Claude asks what the routine should do, writes it and checks that
-  it loads.
+  it loads. You then approve it in the list with `a`.
+- **Your approval:** a routine runs only as you saved it in the list or
+  approved it there. When anything else creates or changes its files (an
+  agent, an editor outside the list), it waits, marked "Changed outside the
+  list", until you press `a`, see what it would run (schedule, folder,
+  agent, permission mode, every option and the prompt or command) and
+  approve it with `y`. So an agent cannot quietly give a routine more
+  rights or turn it into a shell command that runs unattended.
 - **Prompt editor** in the list: type, paste, move with the arrows or the
   mouse, mark text with Shift and the arrows or by dragging, copy, cut and
   paste with `Ctrl+C`, `Ctrl+X`, `Ctrl+V`, undo with `Ctrl+Z`. `Esc`
@@ -136,6 +143,7 @@ Update with `herdr plugin update`.
 | `n` | New routine: fill in the form, or describe it to Claude |
 | `p` | Write the prompt |
 | `r` | Run now (asks first) |
+| `a` | Approve a routine changed outside the list (shows it first) |
 | `space` | Switch on or off |
 | `o` | Go to the tab of the last run |
 | `l` | Result and output of the last run |
@@ -197,7 +205,9 @@ runs in your `$SHELL`, line by line like a script.
 
 You, the list or another agent can create and change these files; the
 scheduler reads them every few seconds. A routine with a mistake shows up in
-the list with what is wrong.
+the list with what is wrong. A change made outside the list takes effect
+once you approve it with `a` in the list (see "Your approval" above). The
+folder name is the routine's id: lower case letters, digits and dashes.
 
 **Schedules** are cron expressions with five fields in local time: `*`,
 values, ranges `8-18`, steps `*/15`, lists `1,15`, and month and day names
@@ -217,7 +227,11 @@ and any cron expression under "Custom".
 
 Left out, the agent runs with the settings and permissions it has in that
 folder. With a mode that asks before changes, a run waits in its tab until
-you answer. Other agents take their flags through `args`.
+you answer. Other agents take their flags through `args`. For Claude Code,
+Codex and Gemini, `args` may not set permissions (such as
+`--dangerously-skip-permissions` or `--sandbox`): that is what
+`permission_mode` is for, so the list always shows the real mode. The list
+shows `args` under the routine's name.
 
 Runs are kept in the plugin's state directory
 (`~/.local/state/herdr/plugins/herdr-routines/`), 50 per routine: under
@@ -227,7 +241,9 @@ a shell command), the prompt it got (`.prompt`) and, for shell commands,
 the script. The run id is its start time, such as `20261110-193702-582`.
 The routine id is the folder name, made from the first name and never
 changed, so renaming a routine keeps its runs. `memory/<routine id>.md`
-holds the earlier results of a routine that remembers.
+holds the earlier results of a routine that remembers. The plugin's
+folders and files are readable only by you, since prompts, commands and
+saved output can hold secrets.
 
 **Start at login** (`A` in the list) writes a launch agent
 (`~/Library/LaunchAgents/herdr-routines.herdr-server.plist`) on macOS or a
@@ -246,7 +262,7 @@ where the list opens.
 
 ```sh
 herdr-routines routines   # all routines and their last run as JSON
-herdr-routines fire <id>  # run a routine now
+herdr-routines fire <id>  # run an approved routine now
 herdr-routines status     # whether the scheduler runs
 ```
 

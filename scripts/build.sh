@@ -20,7 +20,12 @@ if ! command -v cargo >/dev/null 2>&1; then
   exit 1
 fi
 
-cargo build --release --locked 2>&1 || cargo build --release
+# Only the dependency versions pinned in Cargo.lock, never newer ones
+# resolved at install time: a failed build stops here instead.
+if ! cargo build --release --locked 2>&1; then
+  echo "build failed; nothing was installed (Cargo.lock must match Cargo.toml)" >&2
+  exit 1
+fi
 cp target/release/herdr-routines ./herdr-routines.new
 mv -f ./herdr-routines.new ./herdr-routines
 echo "built $(pwd)/herdr-routines"

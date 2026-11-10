@@ -26,6 +26,8 @@ each run in its own tab. What it does and how users install it:
   records. `schedule.rs`: cron, `@once` and `@start`; `cron.rs`: cron
   itself. `shell.rs`: commands in the login shell with a time limit.
   `autostart.rs`: Herdr at login. `paths.rs`: where files go.
+  `approval.rs`: the owner's approval of routines changed outside the
+  list.
 - `app.rs`: the list's state, keys and mouse. `ui.rs`: drawing, in the look
   of the Git Panel and Multiaccount plugins (keep them alike).
   `form.rs`: the edit form. `editor.rs`: the prompt editor. `pane.rs`: the
@@ -40,7 +42,15 @@ each run in its own tab. What it does and how users install it:
   Examples and tests use made-up routines and folders.
 - Deleting a routine, running one by hand and closing the list ask for `y`
   first. Switching a routine on or off does not, since the same key undoes it.
-- Files that other processes read are written through `paths::write_atomic`.
+- Files that other processes read are written through `paths::write_atomic`
+  (owner-only, never through a link). New folders use
+  `paths::create_private_dir`.
+- A routine runs only when `Routine::can_run` holds: no problem and
+  approved (`approval.rs`). Anything the list saves for the owner goes
+  through `Routine::save_approved` or `approval::approve_file`; plain
+  `Routine::save` leaves the routine waiting for approval.
+- Herdr calls about a run's agent use `Run::agent_target`; calls about its
+  pane check `own_pane` first (same tab and terminal).
 - The scheduler and a `fire` process both write run records: a record in
   `Starting` belongs to the process that launches it; the scheduler only
   takes over records that are `Running` or `NeedsYou`, or `Starting` for

@@ -1,6 +1,7 @@
 //! Routines and settings, stored as small TOML files a person or an agent
 //! can edit by hand.
 
+use crate::approval::{self, Approvals, Snapshot};
 use crate::paths::{self, Paths};
 use crate::schedule::Schedule;
 use serde::{Deserialize, Serialize};
@@ -148,6 +149,22 @@ pub struct Routine {
     pub problem: Option<String>,
     /// `routine.toml` could not be read: the other fields are stand-ins.
     pub unreadable: bool,
+    /// The files are the ones the owner saved in the list or approved
+    /// there; anything else waits for approval and does not run (see
+    /// `approval`).
+    pub approved: bool,
+}
+
+/// Whether a folder name can be a routine id: lower case letters, digits
+/// and dashes, as `new_id` makes them. Ids become parts of file paths and
+/// of the line a shell routine's tab runs, so nothing else is allowed.
+pub fn valid_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && !id.starts_with('-')
+        && id
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
 impl Routine {
@@ -212,7 +229,21 @@ impl Routine {
         }
     }
 
+    /// Whether the scheduler, `fire` and the list may start it.
+    pub fn can_run(&self) -> bool {
+        self.problem.is_none() && self.approved
+    }
+
     pub fn load(paths: &Paths, id: &str) -> Result<Routine, String> {
+        Routine::load_with(paths, id, &Approvals::load(paths))
+    }
+
+    fn load_with(paths: &Paths, id: &str, approvals: &Approvals) -> Result<Routine, String> {
+        if !valid_id(id) {
+            return Err(format!(
+                "the folder name \"{id}\" may only have lower case letters, digits and dashes"
+            ));
+        }
         let dir = paths.routine_dir(id);
         let text = std::fs::read_to_string(dir.join("routine.toml"))
             .map_err(|e| format!("cannot read routine.toml: {e}"))?;
@@ -221,16 +252,23 @@ impl Routine {
         let prompt =
             std::fs::read_to_string(dir.join(Routine::text_file(&file.agent))).unwrap_or_default();
         let problem = Routine::check(&file, &prompt);
+        let approved = approvals.approves(paths, id, &file.agent);
         Ok(Routine {
             id: id.to_string(),
             file,
             prompt,
             problem,
             unreadable: false,
+            approved,
         })
     }
 
-    pub fn save(&self, paths: &Paths) -> Result<(), String> {
+    /// Writes the routine's files and returns what it wrote, so the list
+    /// can approve exactly that.
+    pub fn save(&self, paths: &Paths) -> Result<Snapshot, String> {
+        if !valid_id(&self.id) {
+            return Err(format!("invalid routine id \"{}\"", self.id));
+        }
         let dir = paths.routine_dir(&self.id);
         let text = toml::to_string(&self.file).map_err(|e| e.to_string())?;
         let name = Routine::text_file(&self.file.agent);
@@ -240,11 +278,9 @@ impl Routine {
             "The prompt"
         };
         let header = format!("# A Herdr routine. {what} is in {name} next to this file.\n");
-        paths::write_atomic(
-            &dir.join("routine.toml"),
-            format!("{header}{text}").as_bytes(),
-        )
-        .map_err(|e| format!("cannot save: {e}"))?;
+        let toml_text = format!("{header}{text}");
+        paths::write_atomic(&dir.join("routine.toml"), toml_text.as_bytes())
+            .map_err(|e| format!("cannot save: {e}"))?;
         paths::write_atomic(&dir.join(name), self.prompt.as_bytes())
             .map_err(|e| format!("cannot save {}: {e}", what.to_lowercase()))?;
         // A routine switched between agent and shell keeps one text file.
@@ -253,13 +289,37 @@ impl Routine {
                 let _ = std::fs::remove_file(dir.join(other));
             }
         }
-        Ok(())
+        Ok(Snapshot::from([
+            ("routine.toml".to_string(), toml_text),
+            (name.to_string(), self.prompt.clone()),
+        ]))
     }
 
+    /// Saves the routine as the owner wrote it in the list and approves
+    /// exactly those files.
+    pub fn save_approved(&self, paths: &Paths) -> Result<(), String> {
+        let written = self.save(paths)?;
+        approval::approve(paths, &self.id, written)
+    }
+
+    /// Deletes a routine folder. A folder with an invalid name (shown in the
+    /// list with its problem) can be deleted too, as long as the name is one
+    /// plain folder inside the routines folder.
     pub fn delete(paths: &Paths, id: &str) -> Result<(), String> {
+        use std::path::Component;
+        let mut parts = std::path::Path::new(id).components();
+        if !matches!(
+            (parts.next(), parts.next()),
+            (Some(Component::Normal(_)), None)
+        ) {
+            return Err(format!("invalid routine id \"{id}\""));
+        }
         std::fs::remove_dir_all(paths.routine_dir(id)).map_err(|e| e.to_string())?;
-        let _ = std::fs::remove_dir_all(paths.runs_dir(id));
-        let _ = std::fs::remove_file(crate::runner::memory_file(paths, id));
+        if valid_id(id) {
+            let _ = std::fs::remove_dir_all(paths.runs_dir(id));
+            let _ = std::fs::remove_file(crate::runner::memory_file(paths, id));
+        }
+        approval::forget(paths, id);
         Ok(())
     }
 }
@@ -271,6 +331,7 @@ pub fn load_all(paths: &Paths) -> Vec<Routine> {
     let Ok(entries) = std::fs::read_dir(paths.routines_dir()) else {
         return out;
     };
+    let approvals = Approvals::load(paths);
     for entry in entries.flatten() {
         if !entry.path().is_dir() {
             continue;
@@ -279,7 +340,7 @@ pub fn load_all(paths: &Paths) -> Vec<Routine> {
         if id.starts_with('.') {
             continue;
         }
-        match Routine::load(paths, &id) {
+        match Routine::load_with(paths, &id, &approvals) {
             Ok(r) => out.push(r),
             Err(e) => out.push(Routine {
                 id: id.clone(),
@@ -304,6 +365,7 @@ pub fn load_all(paths: &Paths) -> Vec<Routine> {
                 prompt: String::new(),
                 problem: Some(e),
                 unreadable: true,
+                approved: false,
             }),
         }
     }
@@ -434,6 +496,7 @@ mod tests {
             prompt: "Write the report.".into(),
             problem: None,
             unreadable: false,
+            approved: false,
         };
         r.save(&p).unwrap();
         let back = Routine::load(&p, "morning-report").unwrap();
@@ -454,6 +517,7 @@ mod tests {
             prompt: "Write the report.".into(),
             problem: None,
             unreadable: false,
+            approved: false,
         };
         r.save(&p).unwrap();
         r.file.agent = SHELL.into();
@@ -467,6 +531,50 @@ mod tests {
         let back = Routine::load(&p, "backup").unwrap();
         assert_eq!(back.prompt, "./backup.sh --all");
         assert_eq!(back.problem, None);
+    }
+
+    #[test]
+    fn only_routines_saved_in_the_list_or_approved_run() {
+        let p = temp_paths("approval");
+        let r = Routine {
+            id: "morning-report".into(),
+            file: sample(),
+            prompt: "Write the report.".into(),
+            problem: None,
+            unreadable: false,
+            approved: false,
+        };
+        // Written by something else (an agent): waits for approval.
+        r.save(&p).unwrap();
+        let back = Routine::load(&p, "morning-report").unwrap();
+        assert!(!back.approved && !back.can_run());
+        // Saved in the list: approved.
+        r.save_approved(&p).unwrap();
+        assert!(Routine::load(&p, "morning-report").unwrap().can_run());
+        // An agent raises the permission mode: waits again.
+        let mut raised = r.clone();
+        raised.file.permission_mode = "bypassPermissions".into();
+        raised.save(&p).unwrap();
+        assert!(!load_all(&p)[0].approved);
+        // Deleting forgets the approval.
+        Routine::delete(&p, "morning-report").unwrap();
+        assert!(Approvals::load(&p).0.is_empty());
+    }
+
+    #[test]
+    fn folder_names_must_be_plain_ids() {
+        assert!(valid_id("morning-report-2"));
+        for bad in ["", "..", "a/b", "Big", "a b", "a'b", "-x", "a\\b", "ä"] {
+            assert!(!valid_id(bad), "{bad}");
+        }
+        let p = temp_paths("names");
+        std::fs::create_dir_all(p.routine_dir("My_Routine")).unwrap();
+        let all = load_all(&p);
+        assert!(all[0].unreadable && all[0].problem.is_some());
+        assert!(Routine::load(&p, "../../etc").is_err());
+        assert!(Routine::delete(&p, "..").is_err());
+        assert!(Routine::delete(&p, "/tmp").is_err());
+        Routine::delete(&p, "My_Routine").unwrap();
     }
 
     #[test]

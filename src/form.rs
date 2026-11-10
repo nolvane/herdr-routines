@@ -1028,6 +1028,7 @@ mod tests {
             prompt: "Sum up the year.".into(),
             problem: None,
             unreadable: false,
+            approved: true,
         };
         let back = Form::edit(&r);
         assert_eq!(back.repeat, Repeat::Once);

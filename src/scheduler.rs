@@ -52,6 +52,25 @@ pub fn due(routine: &Routine, last_checked: DateTime<Local>, now: DateTime<Local
     }
 }
 
+/// Runs `f` while holding the routine's lock file, so the scheduler, a
+/// `fire` process and a scheduler handing over cannot all find the routine
+/// free and each start a run. Without the lock (a file system that has no
+/// locks) `f` still runs.
+pub fn with_lock<T>(paths: &Paths, routine_id: &str, f: impl FnOnce() -> T) -> T {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = paths.lock_file(routine_id);
+    let lock = paths::create_private_dir(file.parent().unwrap_or(&paths.state)).and_then(|_| {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .mode(0o600)
+            .open(&file)
+    });
+    let _held = lock.ok().filter(|l| l.lock().is_ok());
+    f()
+}
+
 /// Whether the routine's previous run still holds it.
 pub fn busy(paths: &Paths, routine_id: &str) -> bool {
     store::runs_of(paths, routine_id)
@@ -81,21 +100,27 @@ fn fire_attempt(
     slot: Option<DateTime<Local>>,
     attempt: u32,
 ) -> Option<JoinHandle<()>> {
-    if busy(paths, &routine.id) {
+    let prepared = with_lock(paths, &routine.id, || {
+        if busy(paths, &routine.id) {
+            if let Some(slot) = slot {
+                runner::skip(paths, routine, trigger, slot);
+            }
+            return None;
+        }
+        let mut run = runner::prepare(paths, routine, trigger, slot);
+        if attempt > 0 {
+            run.attempt = attempt;
+            let _ = run.save(paths);
+        }
+        Some(run)
+    });
+    let Some(run) = prepared else {
         paths::log(
             paths,
             &format!("{}: previous run still going, skipped", routine.id),
         );
-        if let Some(slot) = slot {
-            runner::skip(paths, routine, trigger, slot);
-        }
         return None;
-    }
-    let mut run = runner::prepare(paths, routine, trigger, slot);
-    if attempt > 0 {
-        run.attempt = attempt;
-        let _ = run.save(paths);
-    }
+    };
     paths::log(
         paths,
         &format!("{}: start run {} ({:?})", routine.id, run.id, trigger),
@@ -136,7 +161,9 @@ fn tick(
             }
             continue;
         };
-        if !r.file.enabled || r.problem.is_some() {
+        // Off, broken or changed outside the list without the owner's
+        // approval: no run, and no catch-up for the times passed meanwhile.
+        if !r.file.enabled || !r.can_run() {
             continue;
         }
         if at_start {
@@ -348,7 +375,7 @@ fn socket_identity(socket: &Path) -> Option<(u64, u64)> {
 /// The loop itself.
 pub fn run(paths: &Paths) -> i32 {
     let me = std::process::id();
-    let _ = std::fs::create_dir_all(&paths.state);
+    let _ = paths::create_private_dir(&paths.state);
     // Taking over the pid file tells an older instance to hand over and exit.
     let content = format!("{me}\n{}\n", paths.socket.display());
     if paths::write_atomic(&paths.pid_file(), content.as_bytes()).is_err() {
@@ -434,6 +461,7 @@ mod tests {
             prompt: "go".into(),
             problem: None,
             unreadable: false,
+            approved: true,
         }
     }
 

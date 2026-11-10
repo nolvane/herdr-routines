@@ -5,6 +5,38 @@ All notable changes to this plugin. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Approval of routines changed outside the list: a routine runs only as
+  saved in the list or approved there with `a`, which shows everything it
+  would run first. Routines created by an agent, "Describe it to Claude"
+  included, wait for this approval. Routines that existed before this
+  version wait for one approval too.
+- The list shows a routine's extra arguments under its name, and "run now"
+  shows the full options.
+
+### Changed
+
+- Extra arguments may no longer set permissions for Claude Code, Codex or
+  Gemini; use the permission mode.
+- Routine folder names must be lower case letters, digits and dashes.
+- The plugin's folders and files are readable only by you (0700 and
+  0600), also folders an older version created.
+- The build stops when `Cargo.lock` does not match instead of resolving
+  newer dependency versions at install time.
+
+### Fixed
+
+- A run's prompt goes to the run's own agent by name, and tabs are closed,
+  read and shown only when Herdr confirms they are still the run's own, so
+  a reused pane or tab id after a Herdr restart cannot hit another tab.
+- Two processes can no longer start the same routine at the same moment.
+- Control characters are removed from a prompt before it is typed into the
+  agent, and hidden direction and zero-width characters from shown output.
+- Run records that name another folder than their own are ignored.
+- A shell routine refuses to run from a state folder whose path has a quote
+  or backslash, which some shells would read differently.
+
 ## [0.1.0] - 2026-11-10
 
 ### Added

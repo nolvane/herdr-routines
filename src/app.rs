@@ -144,6 +144,8 @@ pub enum ConfirmFor {
     Delete(String),
     DiscardForm,
     Autostart,
+    /// Approves exactly the files shown in the question.
+    Approve(String, crate::approval::Snapshot),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -424,7 +426,14 @@ impl App {
         }
         let mut r = r;
         r.file.enabled = !r.file.enabled;
-        match r.save(&self.paths) {
+        // Switching keeps a routine that waits for approval waiting: only
+        // `a` approves what something else wrote.
+        let saved = if r.approved {
+            r.save_approved(&self.paths)
+        } else {
+            r.save(&self.paths).map(|_| ())
+        };
+        match saved {
             Ok(()) => {
                 let state = if r.file.enabled { "on" } else { "off" };
                 let color = if r.file.enabled { GREEN } else { RED };
@@ -472,7 +481,7 @@ impl App {
             .as_ref()
             .and_then(|f| std::fs::read_to_string(f).ok())
             .unwrap_or_default();
-        let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+        let mut lines: Vec<String> = text.lines().map(visible_text).collect();
         while lines.last().is_some_and(|l| l.trim().is_empty()) {
             lines.pop();
         }
@@ -554,7 +563,7 @@ impl App {
             format!("HERDR_PLUGIN_CONFIG_DIR={}", config.display()),
             format!("HERDR_PLUGIN_STATE_DIR={}", self.paths.state.display()),
         ];
-        if let Err(e) = std::fs::create_dir_all(self.paths.routines_dir()) {
+        if let Err(e) = paths::create_private_dir(&self.paths.routines_dir()) {
             self.flash(format!("Could not prepare the folder: {e}"), RED);
             return;
         }
@@ -667,8 +676,10 @@ impl App {
             prompt,
             problem: None,
             unreadable: false,
+            approved: true,
         };
-        r.save(&self.paths)?;
+        // The owner saw every field in the form: what it saves is approved.
+        r.save_approved(&self.paths)?;
         self.reload();
         if let Some(i) = self.routines.iter().position(|r| r.id == id) {
             self.sel_routine = i;
@@ -706,14 +717,25 @@ impl App {
                 return;
             }
             EditTarget::Prompt(id, name) => {
-                paths::write_atomic(&self.paths.routine_dir(id).join(name), text.as_bytes())
-                    .map(|_| "Saved")
+                let was = self.is_approved(id);
+                paths::write_atomic(&self.paths.routine_dir(id).join(name), text.as_bytes()).map(
+                    |_| {
+                        crate::approval::approve_file(&self.paths, id, was, name, &text);
+                        "Saved"
+                    },
+                )
             }
-            EditTarget::File(id) => paths::write_atomic(
-                &self.paths.routine_dir(id).join("routine.toml"),
-                text.as_bytes(),
-            )
-            .map(|_| "routine.toml saved"),
+            EditTarget::File(id) => {
+                let was = self.is_approved(id);
+                paths::write_atomic(
+                    &self.paths.routine_dir(id).join("routine.toml"),
+                    text.as_bytes(),
+                )
+                .map(|_| {
+                    crate::approval::approve_file(&self.paths, id, was, "routine.toml", &text);
+                    "routine.toml saved"
+                })
+            }
         };
         match result {
             Ok(msg) => self.flash(msg, GREEN),
@@ -745,21 +767,102 @@ impl App {
         if let Some(p) = &r.problem {
             return self.flash(format!("Cannot run: {p}"), RED);
         }
+        if !r.approved {
+            return self.flash(
+                "It changed outside the list: a shows it for approval",
+                YELLOW,
+            );
+        }
+        let mut lines = vec![if r.is_shell() {
+            format!(
+                "The command runs in a new tab in the workspace {}.",
+                Settings::load(&self.paths).workspace
+            )
+        } else {
+            format!(
+                "{} starts in a new tab in the workspace {} and gets the prompt.",
+                r.file.agent,
+                Settings::load(&self.paths).workspace
+            )
+        }];
+        let flags = crate::agent::flags(&r.file);
+        if !r.is_shell() && !flags.is_empty() {
+            lines.push(format!("Options: {}", flags.join(" ")));
+        }
         self.mode = Mode::Confirm(Confirm {
             question: format!("Run {} now?", r.file.name),
-            lines: vec![if r.is_shell() {
-                format!(
-                    "The command runs in a new tab in the workspace {}.",
-                    Settings::load(&self.paths).workspace
-                )
-            } else {
-                format!(
-                    "{} starts in a new tab in the workspace {} and gets the prompt.",
-                    r.file.agent,
-                    Settings::load(&self.paths).workspace
-                )
-            }],
+            lines,
             purpose: ConfirmFor::Run(r.id),
+        });
+    }
+
+    /// Whether the routine's files are the approved ones right now.
+    fn is_approved(&self, id: &str) -> bool {
+        Routine::load(&self.paths, id).is_ok_and(|r| r.approved)
+    }
+
+    /// `a`: shows what a routine changed outside the list would run, and
+    /// approves exactly that after `y`.
+    fn ask_approve(&mut self) {
+        let Some(r) = self.selected_routine().cloned() else {
+            return;
+        };
+        if r.approved {
+            return self.flash("It is approved: it runs as saved", MUTED);
+        }
+        if r.unreadable {
+            return self.flash("Fix the routine first (⏎ edits it)", YELLOW);
+        }
+        let files = crate::approval::snapshot(&self.paths, &r.id);
+        // What the files say now, read again so the question shows exactly
+        // what `y` approves.
+        let Ok(now) = Routine::load(&self.paths, &r.id) else {
+            return self.flash("The routine cannot be read", RED);
+        };
+        if crate::approval::snapshot(&self.paths, &r.id) != files {
+            return self.flash("It is being changed; try again in a moment", YELLOW);
+        }
+        let f = &now.file;
+        let mut lines = vec![
+            "It was created or changed outside the list (by an agent or an editor).".into(),
+            "It runs on schedule only once you approve exactly this:".into(),
+            String::new(),
+            format!("Schedule: {}", now.schedule_text()),
+            format!("Folder: {}", f.folder),
+        ];
+        if now.is_shell() {
+            lines.push("Runs: a shell command, as you, without asking".into());
+            lines.push(String::new());
+            lines.push("Command:".into());
+        } else {
+            let mode = if f.permission_mode.is_empty() {
+                "agent default".to_string()
+            } else {
+                crate::agent::label(crate::agent::modes(&f.agent), &f.permission_mode)
+            };
+            lines.push(format!("Agent: {} · {mode}", f.agent));
+            let flags = crate::agent::flags(f);
+            if !flags.is_empty() {
+                lines.push(format!("Options: {}", flags.join(" ")));
+            }
+            lines.push(String::new());
+            lines.push("Prompt:".into());
+        }
+        let text: Vec<&str> = now.prompt.lines().collect();
+        for l in text.iter().take(8) {
+            lines.push(format!("  {}", visible_text(l)));
+        }
+        if text.len() > 8 {
+            lines.push(format!("  … {} more lines (p shows all)", text.len() - 8));
+        }
+        if let Some(p) = &now.problem {
+            lines.push(String::new());
+            lines.push(format!("It cannot run yet: {p}"));
+        }
+        self.mode = Mode::Confirm(Confirm {
+            question: format!("Approve {}?", f.name),
+            lines,
+            purpose: ConfirmFor::Approve(r.id, files),
         });
     }
 
@@ -824,6 +927,18 @@ impl App {
                 self.reload();
             }
             ConfirmFor::DiscardForm => self.form = None,
+            ConfirmFor::Approve(id, files) => {
+                // Changed again while the question was open: show it anew.
+                if crate::approval::snapshot(&self.paths, &id) != files {
+                    self.reload();
+                    return self.flash("It changed meanwhile; a shows it again", YELLOW);
+                }
+                match crate::approval::approve(&self.paths, &id, files) {
+                    Ok(()) => self.flash("Approved: it runs as shown", GREEN),
+                    Err(e) => self.flash(e, RED),
+                }
+                self.reload();
+            }
         }
     }
 
@@ -1244,6 +1359,7 @@ impl App {
                     self.open_editor(&text, EditTarget::Prompt(r.id, name), &title);
                 }
                 KeyCode::Char('r') => self.ask_run(),
+                KeyCode::Char('a') => self.ask_approve(),
                 KeyCode::Char(' ') => self.toggle(),
                 KeyCode::Char('o') => {
                     let id = self.selected_routine().unwrap().id.clone();
@@ -1570,6 +1686,27 @@ pub fn open_in_browser(opener: &str, url: &str) -> bool {
     }
 }
 
+/// Text from a file as it can be shown safely: no control characters (tabs
+/// stay) and none of the invisible characters that turn text around or hide
+/// it (bidi overrides, zero-width marks), so a log or prompt cannot look
+/// different from what it is.
+pub fn visible_text(s: &str) -> String {
+    s.chars()
+        .filter(|c| {
+            let invisible = matches!(
+                c,
+                '\u{061C}'
+                    | '\u{200B}'..='\u{200F}'
+                    | '\u{202A}'..='\u{202E}'
+                    | '\u{2060}'..='\u{2064}'
+                    | '\u{2066}'..='\u{2069}'
+                    | '\u{FEFF}'
+            );
+            !invisible && (!c.is_control() || *c == '\t')
+        })
+        .collect()
+}
+
 /// What Claude is told when it creates a routine with the person.
 pub fn agent_brief(paths: &Paths) -> String {
     let dir = paths::shorten(&paths.routines_dir());
@@ -1605,7 +1742,7 @@ What to do:
 1. Ask me what the routine should do, how often and when, and in which folder, unless I already said it. Ask everything you need in one short message. Suggest sensible choices (a cheaper model for simple jobs, "auto" so nobody has to approve steps, a plain shell command when no AI is needed).
 2. For an agent routine, write prompt.md as clear instructions for an agent working alone: what to do, where, what to report at the end, and what it must not do. For a shell routine, write command.sh.
 3. Show me a short summary (name, schedule in words, agent, model, folder) and create the files once I agree. Do not change or delete other routines unless I ask.
-4. Run `{bin} routines` and check that the new routine shows "problem": null; fix the files if not. Then tell me it is ready and that it appears in the list (Ctrl+B, U)."#
+4. Run `{bin} routines` and check that the new routine shows "problem": null; fix the files if not. It shows "approved": false, which is expected: a routine that was not saved in the list runs only after I approve it there. Do not try to change that. Then tell me it is ready and that I approve it in the list (Ctrl+B, U, then a on the routine)."#
     )
 }
 
@@ -1661,15 +1798,20 @@ mod tests {
             f.name = name.to_string();
             f.prompt = format!("Do task {i}.\nThen stop.");
             let (file, prompt) = f.build().unwrap();
-            Routine {
+            let r = Routine {
                 id: routine::new_id(&paths, name),
                 file,
                 prompt,
                 problem: None,
                 unreadable: false,
+                approved: false,
+            };
+            // The first is saved in the list; the second written by an agent.
+            if i == 0 {
+                r.save_approved(&paths).unwrap();
+            } else {
+                r.save(&paths).unwrap();
             }
-            .save(&paths)
-            .unwrap();
         }
         let run = Run::new(
             "morning-report",
@@ -1783,6 +1925,45 @@ mod tests {
         press(&mut a, KeyCode::Esc);
         assert_eq!(a.runs.len(), a.all_runs.len());
         assert!(a.run_filter.is_none());
+    }
+
+    #[test]
+    fn a_routine_written_outside_the_list_waits_for_approval() {
+        let mut a = app("approve");
+        let all = screen(&mut a, 120, 30).join("\n");
+        assert!(all.contains("a approves"), "{all}");
+        // Select "Weekly cleanup" (written outside the list).
+        a.sel_routine = a.routines.iter().position(|r| !r.approved).unwrap();
+        press(&mut a, KeyCode::Char('r'));
+        assert_eq!(a.mode, Mode::Normal, "no run before approval");
+        press(&mut a, KeyCode::Char('a'));
+        let Mode::Confirm(c) = &a.mode else {
+            panic!("asks first: {:?}", a.mode)
+        };
+        assert!(c.lines.iter().any(|l| l.starts_with("Options:")), "{c:?}");
+        let all = screen(&mut a, 120, 40).join("\n");
+        assert!(all.contains("Approve Weekly cleanup?"), "{all}");
+        press(&mut a, KeyCode::Char('y'));
+        assert!(a.routines.iter().all(|r| r.approved));
+        // Switching on and off keeps it approved.
+        press(&mut a, KeyCode::Char(' '));
+        assert!(Routine::load(&a.paths, "weekly-cleanup").unwrap().approved);
+    }
+
+    #[test]
+    fn switching_does_not_approve_a_change() {
+        let mut a = app("toggle");
+        a.sel_routine = a.routines.iter().position(|r| !r.approved).unwrap();
+        press(&mut a, KeyCode::Char(' '));
+        assert!(!Routine::load(&a.paths, "weekly-cleanup").unwrap().approved);
+    }
+
+    #[test]
+    fn hidden_characters_are_dropped_from_shown_text() {
+        assert_eq!(
+            visible_text("ok\u{202E}txt.exe\u{200B}\u{1b}[2J\tend"),
+            "oktxt.exe[2J\tend"
+        );
     }
 
     #[test]

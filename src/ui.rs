@@ -287,6 +287,12 @@ fn routine_detail(r: &Routine) -> Line<'static> {
     if let Some(p) = &r.problem {
         return Line::from(Span::styled(p.clone(), Style::new().fg(RED)));
     }
+    if !r.approved {
+        return Line::from(Span::styled(
+            "Changed outside the list · a approves",
+            Style::new().fg(YELLOW),
+        ));
+    }
     let f = &r.file;
     if r.is_shell() {
         let first = r
@@ -308,6 +314,10 @@ fn routine_detail(r: &Routine) -> Line<'static> {
             "{} effort",
             agent::label(agent::efforts(&f.agent), &f.effort).to_lowercase()
         ));
+    }
+    // Extra arguments can change what the agent does: always in sight.
+    if !f.args.is_empty() {
+        parts.push(clip(&f.args.join(" "), 40));
     }
     parts.push(f.folder.clone());
     faint(parts.join(" · "))
@@ -355,11 +365,11 @@ fn draw_routines(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
     let rows: Vec<Vec<Text<'static>>> = routines
         .iter()
         .map(|r| {
-            let on = r.file.enabled && r.problem.is_none();
+            let on = r.file.enabled && r.can_run();
             cols.iter()
                 .map(|(c, _, _)| match c {
                     RCol::Mark => {
-                        let (icon, color) = icons.routine(r.file.enabled, r.problem.is_some());
+                        let (icon, color) = icons.routine(r.file.enabled, !r.can_run());
                         Text::from(Span::styled(icon, Style::new().fg(color)))
                     }
                     RCol::Routine => Text::from(vec![
@@ -372,6 +382,8 @@ fn draw_routines(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
                     RCol::Schedule => {
                         let second = if r.problem.is_some() {
                             faint("–")
+                        } else if !r.approved {
+                            Line::from(Span::styled("waits for approval", Style::new().fg(YELLOW)))
                         } else if !r.file.enabled {
                             Line::from(Span::styled("off", Style::new().fg(RED)))
                         } else {
@@ -981,11 +993,18 @@ fn draw_footer(frame: &mut Frame, app: &mut App, area: Rect) {
         }
         v
     } else {
+        let pending = app
+            .selected_routine()
+            .is_some_and(|r| !r.approved && !r.unreadable);
         match app.view {
             View::Routines => vec![
                 ("⏎", "edit", Some(Hit::Key('\n'))),
                 ("n", "new", Some(Hit::Key('n'))),
-                ("r", "run now", Some(Hit::Key('r'))),
+                if pending {
+                    ("a", "approve", Some(Hit::Key('a')))
+                } else {
+                    ("r", "run now", Some(Hit::Key('r')))
+                },
                 ("space", "on/off", Some(Hit::Key(' '))),
                 ("?", "all keys", Some(Hit::Key('?'))),
                 ("q", "close", Some(Hit::Key('q'))),
@@ -1204,7 +1223,14 @@ fn draw_confirm(frame: &mut Frame, app: &mut App, c: &crate::app::Confirm) {
     let wrapped: Vec<Line> = c
         .lines
         .iter()
-        .flat_map(|l| wrap(l, width.saturating_sub(6) as usize))
+        .flat_map(|l| {
+            // An empty line stays as a gap between parts.
+            if l.trim().is_empty() {
+                vec![String::new()]
+            } else {
+                wrap(l, width.saturating_sub(6) as usize)
+            }
+        })
         .map(|l| Line::from(Span::styled(l, Style::new().fg(MUTED))))
         .collect();
     let mut area = centered(frame.area(), width, wrapped.len() as u16 + 5);
@@ -1374,6 +1400,7 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
                 ("n", "new routine: the form, or describe it to Claude"),
                 ("p", "write the prompt or command"),
                 ("r", "run now (asks first)"),
+                ("a", "approve what changed outside the list (asks first)"),
                 ("Space", "on / off"),
                 ("o", "go to the tab of its last run"),
                 ("l", "result and output of its last run"),
