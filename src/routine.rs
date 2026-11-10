@@ -1,8 +1,8 @@
 //! Routines and settings, stored as small TOML files a person or an agent
 //! can edit by hand.
 
-use crate::cron::Cron;
 use crate::paths::{self, Paths};
+use crate::schedule::Schedule;
 use serde::{Deserialize, Serialize};
 
 /// Not an agent: the routine runs a shell command or script, no AI.
@@ -109,6 +109,34 @@ pub struct RoutineFile {
     /// After this many minutes a run counts as timed out (its tab stays).
     #[serde(default = "default_limit")]
     pub time_limit_minutes: u32,
+    /// At the time limit, stop the run (close its tab) instead of only
+    /// marking it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub stop_at_limit: bool,
+    /// A failed run is tried again this many times...
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub retries: u32,
+    /// ...this many minutes after it failed.
+    #[serde(default = "default_retry_delay")]
+    pub retry_delay_minutes: u32,
+    /// A shell command run first, in the folder. Exit code 0: the agent
+    /// runs and gets its output; anything else: nothing to do this time.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub check_command: String,
+    /// Give the agent the results of earlier runs (kept in `memory.md` in
+    /// the state folder, updated after each run).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub remember: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+fn default_retry_delay() -> u32 {
+    10
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -123,13 +151,13 @@ pub struct Routine {
 }
 
 impl Routine {
-    pub fn cron(&self) -> Option<Cron> {
-        Cron::parse(&self.file.schedule).ok()
+    pub fn schedule(&self) -> Option<Schedule> {
+        Schedule::parse(&self.file.schedule).ok()
     }
 
     pub fn schedule_text(&self) -> String {
-        match Cron::parse(&self.file.schedule) {
-            Ok(c) => c.describe(),
+        match Schedule::parse(&self.file.schedule) {
+            Ok(s) => s.describe(),
             Err(_) => format!("Invalid: {}", self.file.schedule),
         }
     }
@@ -139,8 +167,11 @@ impl Routine {
         if file.name.trim().is_empty() {
             return Some("the name is empty".into());
         }
-        if let Err(e) = Cron::parse(&file.schedule) {
+        if let Err(e) = Schedule::parse(&file.schedule) {
             return Some(format!("schedule: {e}"));
+        }
+        if file.agent == SHELL && (!file.check_command.is_empty() || file.remember) {
+            return Some("a shell command takes no check command and no memory".into());
         }
         if !AGENTS.contains(&file.agent.as_str()) {
             return Some(format!("unknown agent \"{}\"", file.agent));
@@ -228,6 +259,7 @@ impl Routine {
     pub fn delete(paths: &Paths, id: &str) -> Result<(), String> {
         std::fs::remove_dir_all(paths.routine_dir(id)).map_err(|e| e.to_string())?;
         let _ = std::fs::remove_dir_all(paths.runs_dir(id));
+        let _ = std::fs::remove_file(crate::runner::memory_file(paths, id));
         Ok(())
     }
 }
@@ -263,6 +295,11 @@ pub fn load_all(paths: &Paths) -> Vec<Routine> {
                     folder: default_folder(),
                     missed: Missed::default(),
                     time_limit_minutes: default_limit(),
+                    stop_at_limit: false,
+                    retries: 0,
+                    retry_delay_minutes: default_retry_delay(),
+                    check_command: String::new(),
+                    remember: false,
                 },
                 prompt: String::new(),
                 problem: Some(e),
@@ -371,6 +408,11 @@ mod tests {
             folder: "~".into(),
             missed: Missed::RunOnce,
             time_limit_minutes: 60,
+            stop_at_limit: false,
+            retries: 0,
+            retry_delay_minutes: 10,
+            check_command: String::new(),
+            remember: false,
         }
     }
 

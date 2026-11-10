@@ -41,6 +41,7 @@ impl Icons {
             Status::Failed => (self.pick("\u{f530}", "✗"), RED),
             Status::Skipped => (self.pick("\u{f517}", "⊘"), MUTED),
             Status::Closed => (self.pick("\u{f468}", "⊘"), MUTED),
+            Status::NothingToDo => (self.pick("\u{f4a7}", "–"), MUTED),
         }
     }
 

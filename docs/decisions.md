@@ -259,3 +259,51 @@ too often to ship as a list; the agents know their own. Sources (checked
 2026-11-10): each CLI's official reference, see the research notes in the
 pull request. Codex's `--full-auto` is gone from its current reference, so
 Auto is now `--sandbox workspace-write --ask-for-approval never`.
+
+## 2026-11-10: Cron jobs in full: retries, stop at limit, once, at start, start at login
+
+Asked for by the owner to make the plugin a full cron replacement:
+
+- **Start at login** (`autostart.rs`, `A` in the list): a launch agent
+  (macOS) or systemd user service (Linux) that runs `herdr server` at
+  login, with the PATH and shell of the moment it was turned on (launchd's
+  PATH lacks Homebrew). The plugin's startup hook then starts the scheduler.
+  It is written but not loaded, so the running server is never touched;
+  turning it off only removes the entry. Why the server and not the plugin:
+  runs open tabs, so they need the server anyway, and this keeps one
+  process tree.
+- **Output in files**: a shell command's output goes through `tee` into
+  `<run>.out`, and the exit code is moved into place only after the output
+  is complete. An agent's tab is saved to `<run>.log` every minute while it
+  is open (also after the run, while someone keeps talking in it), so a tab
+  closed by hand loses at most a minute.
+- **Retries** (`retries`, `retry_delay_minutes`): only `Failed` runs (exit
+  code not 0, agent did not start, check command broke) are retried; the
+  newest run decides, so a success ends the retries.
+- **Stop at the time limit** (`stop_at_limit`): the log is saved, then the
+  tab is closed, which ends whatever runs in it.
+- **Once and at start** (`schedule.rs`): `@once YYYY-MM-DD HH:MM` follows the
+  missed-time rule like cron and switches the routine off once started;
+  `@start` runs once per Herdr server (recorded in `started.json` against
+  `Paths::server_id`, so a scheduler restart after an update does not
+  count), and a new `@start` routine waits for the next start.
+- **Check first** (`check_command`, agents only): runs in the folder in the
+  login shell, 5-minute limit. Exit 0 starts the agent with the output
+  (first 8000 characters) added to the prompt; anything else records
+  "Nothing to do" without opening a tab.
+- **Results and memory**: every agent prompt ends with a request for a
+  summary between lines `RESULT START` and `RESULT END`, read from the saved
+  log when the run ends (a shell command's result is its last output line).
+  With `remember`, the plugin keeps the last ten results in
+  `memory/<routine>.md` in the state folder and adds them to the next
+  prompt. The plugin, not the agent, writes the file, so no agent needs
+  write access outside its folder and any agent works the same.
+- **Runs per routine**: the "n runs" link in the list (and `h`) filters
+  the Runs view to one routine.
+
+Why markers instead of a result file: writing outside the run's folder
+would make agents in stricter modes stop and ask, and parsing the answer
+works for every agent. Why routine ids stay slugs (not UUIDs, which the
+owner asked about): the folder name is made once from the first name and
+never changes on rename, runs and memory hang off it, and it stays readable
+for people and agents who edit the files.

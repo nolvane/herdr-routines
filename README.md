@@ -9,7 +9,8 @@ agent asks something and keep talking to it afterwards. A routine can also
 be a plain shell command or script, like a cron job, without any AI.
 
 Routines run as long as the Herdr server runs, also when no Herdr window is
-open.
+open. With `A` in the list, Herdr starts in the background at login, so
+routines also run after a restart without opening Herdr.
 
 ```
  ◷ Scheduled routines    Routines (3)   Runs (41)                      ● scheduler on
@@ -60,8 +61,26 @@ off; a yellow warning sign marks a routine with a problem.
   closes it and keeps what you wrote. `Ctrl+O` opens the prompt in your own
   editor instead.
 - **Runs** of all routines, newest first: status, how it was started (on
-  time, catch-up or by hand), how long it took. `⏎` jumps to the run's tab,
-  `l` shows its saved output once the tab is closed.
+  time, catch-up, retry or by hand), how long it took and what it came to.
+  "n runs" next to a routine (or `h`) shows only its runs. `⏎` jumps to the
+  run's tab, `l` shows its result and output, also after the tab is
+  closed, and `f` opens the output file.
+- **Output kept:** a shell command's whole output goes into a file; an
+  agent's tab is saved every minute while it is open, so closing the tab by
+  hand loses nothing.
+- **Results:** each agent run is asked to end with a short summary, which
+  the list shows next to the run. With "Earlier results" on, the next run
+  starts with the summaries of the last ten runs (kept in one small file per
+  routine), so a daily routine knows what it did before.
+- **Check first:** an optional shell command that runs before the agent,
+  such as "are there new files?". When it ends without an error the agent
+  starts and gets its output; otherwise the run is noted as "Nothing to do"
+  and costs nothing.
+- **Retries:** a failed run (a command ending with an error, an agent that
+  does not start) can be tried again up to three times a few minutes later.
+- **Once, or when Herdr starts:** besides repeating schedules, a routine can
+  run once on a date (then it switches itself off) or each time the Herdr
+  server starts.
 - **Needs you:** when an agent asks a question or waits for an approval, the
   run is marked and Herdr shows a notification. Answer it in the tab; the
   run carries on. This also covers questions before the agent is ready, such
@@ -73,7 +92,8 @@ off; a yellow warning sign marks a routine with a problem.
 - **No overlap:** a routine that is still running is not started again; the
   skipped time shows in the runs.
 - **Time limit** per routine: a run still going after it is marked as timed
-  out and you get a notification. Its tab stays open.
+  out and you get a notification. Its tab stays open, or, if you choose
+  "Stop the run", it is closed, which ends the agent or command.
 - **Tidy:** the tab of a finished run closes after an hour (configurable),
   unless you picked up the conversation in it.
 
@@ -118,10 +138,12 @@ Update with `herdr plugin update`.
 | `r` | Run now (asks first) |
 | `space` | Switch on or off |
 | `o` | Go to the tab of the last run |
-| `l` | What the last run wrote |
+| `l` | Result and output of the last run |
+| `h` | Only this routine's runs (`Esc` shows all again) |
 | `d` | Delete with its run history (asks first) |
 | `←` `→` | Switch between routines and runs |
 | `S` | Start the scheduler when it is off |
+| `A` | Start Herdr at login, or not any more |
 | `q` | Close the list (asks first); routines keep running |
 
 The mouse works too: click a tab or a row, double click to open, scroll with
@@ -157,6 +179,16 @@ folder = "~/code/app"
 # "run-once" or "skip"
 missed = "run-once"
 time_limit_minutes = 120
+# Optional: close the run's tab at the time limit (default: keep it)
+# stop_at_limit = true
+# Optional: try a failed run again, this many times, minutes apart
+# retries = 2
+# retry_delay_minutes = 10
+# Optional, agents only: a shell command run first; the agent starts only
+# when it ends without an error, and gets its output
+# check_command = "git fetch -q && git log --oneline HEAD..@{u}"
+# Optional, agents only: start each run with the last ten results
+# remember = true
 ```
 
 `prompt.md` holds the prompt, as you would type it to the agent. A shell
@@ -169,8 +201,11 @@ the list with what is wrong.
 
 **Schedules** are cron expressions with five fields in local time: `*`,
 values, ranges `8-18`, steps `*/15`, lists `1,15`, and month and day names
-(`jan`, `mon`). Day of week 0 and 7 are Sunday. The form offers every hour,
-every day, weekdays and once a week, and any cron expression under "Custom".
+(`jan`, `mon`). Day of week 0 and 7 are Sunday. Two more forms:
+`@once 2026-12-24 08:15` runs once (the routine then switches itself off)
+and `@start` runs each time the Herdr server starts. The form offers every
+hour, every day, weekdays, once a week, once on a date, when Herdr starts,
+and any cron expression under "Custom".
 
 **Permission modes** become the agent's own flags:
 
@@ -185,7 +220,20 @@ folder. With a mode that asks before changes, a run waits in its tab until
 you answer. Other agents take their flags through `args`.
 
 Runs are kept in the plugin's state directory
-(`~/.local/state/herdr/plugins/herdr-routines/runs/`), 50 per routine.
+(`~/.local/state/herdr/plugins/herdr-routines/`), 50 per routine: under
+`runs/<routine id>/`, each run has a record `<run id>.json` (status,
+times, result) and next to it its output (`.log` from the tab, `.out` from
+a shell command), the prompt it got (`.prompt`) and, for shell commands,
+the script. The run id is its start time, such as `20261110-193702-582`.
+The routine id is the folder name, made from the first name and never
+changed, so renaming a routine keeps its runs. `memory/<routine id>.md`
+holds the earlier results of a routine that remembers.
+
+**Start at login** (`A` in the list) writes a launch agent
+(`~/Library/LaunchAgents/herdr-routines.herdr-server.plist`) on macOS or a
+systemd user service on Linux that runs `herdr server` at login. It takes
+effect at the next login; turning it off removes the entry and leaves a
+running server alone.
 
 ## Settings
 

@@ -55,6 +55,8 @@ impl View {
 pub enum Hit {
     View(View),
     Row(usize),
+    /// The runs link of a routine row: shows that routine's runs.
+    RunsOf(usize),
     PickRow(usize),
     /// A field of the form, by its place in `Form::fields`.
     Field(usize),
@@ -141,6 +143,7 @@ pub enum ConfirmFor {
     Run(String),
     Delete(String),
     DiscardForm,
+    Autostart,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -157,6 +160,8 @@ pub struct LogView {
     pub scroll: u16,
     /// How far it can scroll, set when drawn.
     pub max: u16,
+    /// The file the output comes from, which `f` opens.
+    pub file: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -240,7 +245,12 @@ pub struct App {
     pub icons: Icons,
     pub view: View,
     pub routines: Vec<Routine>,
+    /// The runs the Runs view shows: all, or those of `run_filter`.
     pub runs: Vec<Run>,
+    /// Every run of every routine, newest first.
+    pub all_runs: Vec<Run>,
+    /// The routine whose runs the Runs view shows; None for all.
+    pub run_filter: Option<String>,
     pub sel_routine: usize,
     pub sel_run: usize,
     pub scheduler: Option<(u32, String)>,
@@ -272,6 +282,8 @@ impl App {
             view: View::Routines,
             routines: Vec::new(),
             runs: Vec::new(),
+            all_runs: Vec::new(),
+            run_filter: None,
             sel_routine: 0,
             sel_run: 0,
             scheduler: None,
@@ -295,7 +307,21 @@ impl App {
 
     pub fn reload(&mut self) {
         self.routines = routine::load_all(&self.paths);
-        self.runs = store::all_runs(&self.paths);
+        self.all_runs = store::all_runs(&self.paths);
+        if let Some(id) = &self.run_filter {
+            if !self.routines.iter().any(|r| &r.id == id) {
+                self.run_filter = None;
+            }
+        }
+        self.runs = match &self.run_filter {
+            Some(id) => self
+                .all_runs
+                .iter()
+                .filter(|r| &r.routine_id == id)
+                .cloned()
+                .collect(),
+            None => self.all_runs.clone(),
+        };
         self.scheduler = scheduler::running(&self.paths);
         self.sel_routine = self.sel_routine.min(self.routines.len().saturating_sub(1));
         self.sel_run = self.sel_run.min(self.runs.len().saturating_sub(1));
@@ -338,7 +364,29 @@ impl App {
     }
 
     pub fn latest_run(&self, id: &str) -> Option<&Run> {
-        self.runs.iter().find(|r| r.routine_id == id)
+        self.all_runs.iter().find(|r| r.routine_id == id)
+    }
+
+    /// How many runs of a routine are kept.
+    pub fn run_count(&self, id: &str) -> usize {
+        self.all_runs.iter().filter(|r| r.routine_id == id).count()
+    }
+
+    /// Shows the runs of one routine (or all with None).
+    pub fn filter_runs(&mut self, routine_id: Option<String>) {
+        self.run_filter = routine_id;
+        self.sel_run = 0;
+        self.view = View::Runs;
+        self.reload();
+    }
+
+    /// The name of the routine the runs are filtered to.
+    pub fn filter_name(&self) -> Option<&str> {
+        let id = self.run_filter.as_ref()?;
+        self.routines
+            .iter()
+            .find(|r| &r.id == id)
+            .map(|r| r.file.name.as_str())
     }
 
     // ---- actions ----------------------------------------------------------
@@ -397,11 +445,54 @@ impl App {
         }
     }
 
+    /// The file with a run's output: a shell command's (or check's) whole
+    /// output, else what its tab showed.
+    pub fn output_file(&self, run: &Run) -> Option<std::path::PathBuf> {
+        [run.file(&self.paths, "out"), run.log_path(&self.paths)]
+            .into_iter()
+            .find(|p| p.is_file())
+    }
+
+    fn open_output_file(&mut self, run: &Run) {
+        match self.output_file(run) {
+            Some(path) => {
+                if (self.opener)(OPENER, &path.to_string_lossy()) {
+                    self.flash("Opened the output file", GREEN);
+                } else {
+                    self.flash(format!("Could not run {OPENER}"), RED);
+                }
+            }
+            None => self.flash("No output saved for this run", MUTED),
+        }
+    }
+
     fn show_log(&mut self, run: &Run) {
-        let text = std::fs::read_to_string(run.log_path(&self.paths)).unwrap_or_default();
+        let file = self.output_file(run);
+        let text = file
+            .as_ref()
+            .and_then(|f| std::fs::read_to_string(f).ok())
+            .unwrap_or_default();
         let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
         while lines.last().is_some_and(|l| l.trim().is_empty()) {
             lines.pop();
+        }
+        // The result first, when there is one; then the whole output.
+        let has_result = !run.result.trim().is_empty();
+        if has_result {
+            // A command has no summary, only its last line.
+            let heading = if run.agent == routine::SHELL {
+                "Last line"
+            } else {
+                "Result"
+            };
+            let mut top = vec![heading.to_string()];
+            top.extend(run.result.lines().map(|l| format!("  {l}")));
+            top.push(String::new());
+            if !lines.is_empty() {
+                top.push("Output".to_string());
+            }
+            top.append(&mut lines);
+            lines = top;
         }
         if lines.is_empty() {
             let why = if run.status.active() {
@@ -415,7 +506,7 @@ impl App {
                 lines.push(run.message.clone());
             }
         }
-        // Open at the end, where the agent's answer is.
+        // Open at the result, or else at the end, where the answer is.
         self.mode = Mode::Log(LogView {
             title: format!(
                 "{} · {} · {}",
@@ -424,8 +515,9 @@ impl App {
                 run.status.label()
             ),
             lines,
-            scroll: u16::MAX,
+            scroll: if has_result { 0 } else { u16::MAX },
             max: 0,
+            file,
         });
     }
 
@@ -685,9 +777,44 @@ impl App {
         });
     }
 
+    /// `A`: start Herdr at login, or not any more (asks before turning on).
+    fn toggle_autostart(&mut self) {
+        if !crate::autostart::supported() {
+            self.flash("Starting at login is not supported here", MUTED);
+        } else if crate::autostart::is_on() {
+            match crate::autostart::turn_off() {
+                Ok(()) => self.flash("Herdr no longer starts at login", RED),
+                Err(e) => self.flash(format!("Could not turn it off: {e}"), RED),
+            }
+        } else {
+            self.mode = Mode::Confirm(Confirm {
+                question: "Start Herdr at login?".into(),
+                lines: vec![
+                    "Herdr then runs in the background from the moment you log in, so routines run after a restart without opening it. Opening Herdr connects to it as usual.".into(),
+                    "Takes effect at the next login. A turns it off again.".into(),
+                ],
+                purpose: ConfirmFor::Autostart,
+            });
+        }
+    }
+
     fn confirmed(&mut self, c: Confirm) {
         self.mode = Mode::Normal;
         match c.purpose {
+            ConfirmFor::Autostart => {
+                let mut bin = crate::herdr::bin();
+                if !bin.is_absolute() {
+                    if let Some((0, out)) =
+                        crate::shell::run("command -v herdr", None, Duration::from_secs(10))
+                    {
+                        bin = std::path::PathBuf::from(out.trim());
+                    }
+                }
+                match crate::autostart::turn_on(&bin.to_string_lossy()) {
+                    Ok(()) => self.flash("Herdr starts at login from now on", GREEN),
+                    Err(e) => self.flash(format!("Could not turn it on: {e}"), RED),
+                }
+            }
             ConfirmFor::Run(id) => self.fire(&id),
             ConfirmFor::Delete(id) => {
                 match Routine::delete(&self.paths, &id) {
@@ -955,6 +1082,13 @@ impl App {
                     }
                     KeyCode::Home | KeyCode::Char('g') => log.scroll = 0,
                     KeyCode::End | KeyCode::Char('G') => log.scroll = log.max,
+                    KeyCode::Char('f') => {
+                        if let Some(path) = log.file.clone() {
+                            if !(self.opener)(OPENER, &path.to_string_lossy()) {
+                                self.flash(format!("Could not run {OPENER}"), RED);
+                            }
+                        }
+                    }
                     _ => {}
                 }
                 self.mode = Mode::Log(log);
@@ -1040,7 +1174,27 @@ impl App {
     fn list_key(&mut self, k: KeyEvent) {
         match k.code {
             KeyCode::Char('q') => self.mode = Mode::AskQuit,
+            // Esc in a filtered Runs view shows all runs again.
+            KeyCode::Esc if self.run_filter.is_some() && self.view == View::Runs => {
+                self.filter_runs(None)
+            }
             KeyCode::Esc => {}
+            KeyCode::Char('h') => {
+                let id = match self.view {
+                    View::Routines => self.selected_routine().map(|r| r.id.clone()),
+                    View::Runs => self.runs.get(self.sel_run).map(|r| r.routine_id.clone()),
+                };
+                if id.is_some() && id == self.run_filter && self.view == View::Runs {
+                    self.filter_runs(None);
+                } else if id.is_some() {
+                    self.filter_runs(id);
+                }
+            }
+            KeyCode::Char('f') if self.view == View::Runs => {
+                if let Some(run) = self.runs.get(self.sel_run).cloned() {
+                    self.open_output_file(&run);
+                }
+            }
             KeyCode::Char('?') => {
                 self.help_scroll = 0;
                 self.mode = Mode::Help;
@@ -1060,6 +1214,7 @@ impl App {
             KeyCode::Char('1') => self.view = View::Routines,
             KeyCode::Char('2') => self.view = View::Runs,
             KeyCode::Char('S') => self.start_scheduler(),
+            KeyCode::Char('A') => self.toggle_autostart(),
             KeyCode::Char('i') => self.toggle_icons(),
             KeyCode::Char('n') => self.new_routine(),
             KeyCode::Enter => self.enter(),
@@ -1145,6 +1300,13 @@ impl App {
                     if double {
                         self.enter();
                     }
+                }
+            }
+            Hit::RunsOf(i) => {
+                if normal {
+                    self.sel_routine = i;
+                    let id = self.routines.get(i).map(|r| r.id.clone());
+                    self.filter_runs(id);
                 }
             }
             Hit::PickRow(i) => {
@@ -1431,6 +1593,13 @@ args = []                         # extra command line options for the agent, us
 folder = "~/code/app"             # where it runs
 missed = "run-once"               # when the computer was off at the time: "run-once" or "skip"
 time_limit_minutes = 120
+stop_at_limit = false             # true: close the run's tab at the time limit
+retries = 0                       # try a failed run again this many times (0-3)...
+retry_delay_minutes = 10          # ...this many minutes apart
+check_command = ""                # agents only: a shell command run first; the agent starts only if it exits 0, and gets its output
+remember = false                  # agents only: each run gets the results of the last ten runs
+
+Instead of cron, schedule can be "@once YYYY-MM-DD HH:MM" (runs once, then the routine switches off) or "@start" (each time Herdr starts).
 
 What to do:
 1. Ask me what the routine should do, how often and when, and in which folder, unless I already said it. Ask everything you need in one short message. Suggest sensible choices (a cheaper model for simple jobs, "auto" so nobody has to approve steps, a plain shell command when no AI is needed).
@@ -1573,6 +1742,47 @@ mod tests {
         a.view = View::Runs;
         let all = screen(&mut a, 120, 30).join("\n");
         assert!(all.contains("By hand"), "{all}");
+    }
+
+    #[test]
+    fn run_counts_link_to_the_routines_runs() {
+        let mut a = app("filter");
+        let ids: Vec<(String, String)> = a
+            .routines
+            .iter()
+            .map(|r| (r.id.clone(), r.file.name.clone()))
+            .collect();
+        for (n, (id, name)) in ids.iter().enumerate() {
+            for i in 0..=n {
+                let mut run = Run::new(id, name, "shell", store::Trigger::Manual, None);
+                run.id = format!("2026111{n}-08000{i}-000");
+                run.finish(store::Status::Finished, "");
+                run.result = format!("Result {n}.{i}");
+                run.save(&a.paths).unwrap();
+            }
+        }
+        a.reload();
+        let lines = screen(&mut a, 140, 30);
+        let count = a.run_count(&ids[1].0);
+        assert!(lines.iter().any(|l| l.contains(&format!("{count} runs ›"))));
+        let link = a
+            .hits
+            .iter()
+            .rev()
+            .find_map(|(r, h)| (*h == Hit::RunsOf(1)).then_some(*r))
+            .unwrap();
+        a.click(link.x + 1, link.y);
+        assert_eq!(a.view, View::Runs);
+        assert_eq!(a.runs.len(), count);
+        assert!(a.runs.iter().all(|r| r.routine_id == ids[1].0));
+        let lines = screen(&mut a, 140, 30);
+        assert!(lines
+            .iter()
+            .any(|l| l.contains(&format!("Runs of {}", ids[1].1))));
+        assert!(lines.iter().any(|l| l.contains("Result 1.1")));
+        press(&mut a, KeyCode::Esc);
+        assert_eq!(a.runs.len(), a.all_runs.len());
+        assert!(a.run_filter.is_none());
     }
 
     #[test]

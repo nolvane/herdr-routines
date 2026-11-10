@@ -22,6 +22,118 @@ const START_GRACE_MINUTES: i64 = 10;
 const PROMPT_GRACE_MINUTES: i64 = 3;
 /// Lines of output kept in a run's log.
 const LOG_LINES: u32 = 2000;
+/// How often the log of a run with an open tab is saved again, so it
+/// survives the tab being closed by hand.
+const LOG_EVERY_SECS: u64 = 60;
+/// How long a check command may take.
+const CHECK_LIMIT: std::time::Duration = std::time::Duration::from_secs(300);
+/// Results of earlier runs kept for a routine that remembers.
+const MEMORY_ENTRIES: usize = 10;
+/// Between two results in the memory file.
+const MEMORY_SEPARATOR: &str = "<!-- run -->";
+/// The lines around the summary an agent ends its run with.
+const RESULT_START: &str = "RESULT START";
+const RESULT_END: &str = "RESULT END";
+
+/// The prompt as the agent gets it: the routine's prompt, then what the
+/// check command printed, the results of earlier runs (when the routine
+/// remembers) and the request for a summary.
+pub fn full_prompt(paths: &Paths, routine: &Routine, check_output: Option<&str>) -> String {
+    let mut p = routine.prompt.trim_end().to_string();
+    if let Some(out) = check_output {
+        let out: String = out.chars().take(8000).collect();
+        p.push_str(&format!(
+            "\n\nThe check command `{}` printed:\n```\n{}\n```",
+            routine.file.check_command.trim(),
+            out.trim_end()
+        ));
+    }
+    if routine.file.remember {
+        let memory = std::fs::read_to_string(memory_file(paths, &routine.id)).unwrap_or_default();
+        if memory.trim().is_empty() {
+            p.push_str(
+                "\n\nThis is the first run that keeps results; there are no earlier results yet.",
+            );
+        } else {
+            p.push_str(&format!(
+                "\n\nResults of this routine's earlier runs, newest first, for context:\n\n{}",
+                memory.replace(MEMORY_SEPARATOR, "").trim_end()
+            ));
+        }
+    }
+    p.push_str(&format!(
+        "\n\nThis runs on a schedule and nobody watches. When you are done, end your last message with a short summary of the result (what you did, what you found, what is open), on lines of its own between a line {RESULT_START} and a line {RESULT_END}."
+    ));
+    p
+}
+
+/// The file with the results of a routine's earlier runs.
+pub fn memory_file(paths: &Paths, routine_id: &str) -> std::path::PathBuf {
+    paths.state.join("memory").join(format!("{routine_id}.md"))
+}
+
+/// The summary between the result lines of the agent's last answer.
+pub fn extract_result(log: &str) -> String {
+    let clean = |l: &str| {
+        l.trim()
+            .trim_start_matches(['⏺', '●', '•', '>', '│'])
+            .trim()
+            .to_string()
+    };
+    let lines: Vec<String> = log.lines().map(clean).collect();
+    let Some(end) = lines.iter().rposition(|l| l == RESULT_END) else {
+        return String::new();
+    };
+    let Some(start) = lines[..end].iter().rposition(|l| l == RESULT_START) else {
+        return String::new();
+    };
+    lines[start + 1..end]
+        .iter()
+        .map(|l| l.trim_end())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
+/// The last line with text.
+fn last_line(text: &str) -> String {
+    text.lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("")
+        .chars()
+        .take(200)
+        .collect()
+}
+
+/// Adds a run's result at the top of its routine's memory, keeping the
+/// newest [`MEMORY_ENTRIES`].
+fn remember(paths: &Paths, run: &Run) {
+    if run.result.trim().is_empty() {
+        return;
+    }
+    let path = memory_file(paths, &run.routine_id);
+    let old = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut entries: Vec<String> = old
+        .split(MEMORY_SEPARATOR)
+        .map(|e| e.trim().to_string())
+        .filter(|e| !e.is_empty())
+        .collect();
+    entries.insert(
+        0,
+        format!(
+            "Run of {}:\n{}",
+            run.started.format("%Y-%m-%d %H:%M"),
+            run.result.trim()
+        ),
+    );
+    entries.truncate(MEMORY_ENTRIES);
+    let text = entries.join(&format!("\n\n{MEMORY_SEPARATOR}\n\n")) + "\n";
+    let _ = std::fs::create_dir_all(path.parent().expect("has a parent"));
+    let _ = paths::write_atomic(&path, text.as_bytes());
+}
 
 /// An agent name Herdr accepts (`[a-z][a-z0-9_-]{0,31}`), unique per run.
 pub fn agent_name(routine_id: &str, run_id: &str) -> String {
@@ -91,6 +203,46 @@ pub fn launch(paths: &Paths, settings: &Settings, routine: &Routine, mut run: Ru
         return run;
     }
     let folder = paths::expand(&routine.file.folder);
+    // The check command decides whether there is anything to do.
+    let mut check_output = None;
+    let check = routine.file.check_command.trim();
+    if !routine.is_shell() && !check.is_empty() {
+        match crate::shell::run(check, Some(&folder), CHECK_LIMIT) {
+            Some((0, out)) => check_output = Some(out),
+            Some((code, out)) => {
+                let last = last_line(&out);
+                run.finish(
+                    Status::NothingToDo,
+                    if last.is_empty() {
+                        format!("The check ended with exit code {code}")
+                    } else {
+                        format!("Check: {last}")
+                    },
+                );
+                let _ = paths::write_atomic(&run.file(paths, "out"), out.as_bytes());
+                let _ = run.save(paths);
+                return run;
+            }
+            None => {
+                run.finish(
+                    Status::Failed,
+                    format!(
+                        "The check command did not start or took over {} minutes",
+                        CHECK_LIMIT.as_secs() / 60
+                    ),
+                );
+                let _ = run.save(paths);
+                return run;
+            }
+        }
+    }
+    let prompt = if routine.is_shell() {
+        routine.prompt.clone()
+    } else {
+        full_prompt(paths, routine, check_output.as_deref())
+    };
+    // What the agent gets, also for handing it over later (see `watch`).
+    let _ = paths::write_atomic(&run.file(paths, "prompt"), prompt.as_bytes());
     let place = match herdr::open_tab(
         &settings.workspace,
         &folder.to_string_lossy(),
@@ -136,7 +288,7 @@ pub fn launch(paths: &Paths, settings: &Settings, routine: &Routine, mut run: Ru
         }
     }
     match started {
-        Ok(()) => match hand_over(&mut run, &routine.prompt) {
+        Ok(()) => match hand_over(&mut run, &prompt) {
             Ok(()) => {}
             Err(e) if e.code == "agent_blocked" => {
                 run.status = Status::NeedsYou;
@@ -174,13 +326,20 @@ fn quote(s: &str) -> String {
 }
 
 /// The wrapper a shell routine runs through: the routine's command in the
-/// person's shell, then its exit code into a file the scheduler reads.
-fn wrapper(shell: &str, script: &Path, exit: &Path) -> String {
+/// person's shell, its whole output also into a file, then its exit code
+/// into a file the scheduler reads (moved in place only once the output is
+/// complete).
+fn wrapper(shell: &str, script: &Path, out: &Path, exit: &Path) -> String {
+    let exit = exit.to_string_lossy();
+    let tmp = format!("{exit}.tmp");
     format!(
-        "#!/bin/sh\n# herdr-routines: runs the routine's command and notes its exit code.\n{} {}\nprintf '%s' \"$?\" > {}\n",
+        "#!/bin/sh\n# herdr-routines: runs the routine's command, keeps its output and notes its exit code.\n{{ {} {}; printf '%s' \"$?\" > {}; }} 2>&1 | tee {}\nmv {} {}\n",
         quote(shell),
         quote(&script.to_string_lossy()),
-        quote(&exit.to_string_lossy()),
+        quote(&tmp),
+        quote(&out.to_string_lossy()),
+        quote(&tmp),
+        quote(&exit),
     )
 }
 
@@ -195,8 +354,12 @@ fn launch_shell(paths: &Paths, routine: &Routine, mut run: Run) -> Run {
         .ok()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "/bin/sh".into());
-    let written = paths::write_atomic(&script, routine.prompt.as_bytes())
-        .and_then(|_| paths::write_atomic(&wrap, wrapper(&shell, &script, &exit).as_bytes()));
+    let written = paths::write_atomic(&script, routine.prompt.as_bytes()).and_then(|_| {
+        paths::write_atomic(
+            &wrap,
+            wrapper(&shell, &script, &run.file(paths, "out"), &exit).as_bytes(),
+        )
+    });
     if let Err(e) = written {
         run.finish(Status::Failed, format!("Could not write the command: {e}"));
         let _ = run.save(paths);
@@ -290,18 +453,29 @@ fn save_log(paths: &Paths, run: &Run) {
 /// Follows an active run one step. Returns whether the record changed.
 pub fn watch(paths: &Paths, settings: &Settings, run: &mut Run, routine: Option<&Routine>) -> bool {
     let now = Local::now();
-    let prompt = routine.map(|r| r.prompt.as_str());
+    // What was prepared for the agent at launch (with the check output and
+    // memory), else the routine's prompt.
+    let prepared = std::fs::read_to_string(run.file(paths, "prompt")).ok();
+    let prompt = prepared
+        .as_deref()
+        .or_else(|| routine.map(|r| r.prompt.as_str()));
     let limit_minutes = routine.map_or(120, |r| r.file.time_limit_minutes);
+    let stop_at_limit = routine.is_some_and(|r| r.file.stop_at_limit);
+    let remembers = routine.is_some_and(|r| r.file.remember);
     let before = run.clone();
 
     if run.status == Status::Starting {
         if now - run.started > Duration::minutes(START_GRACE_MINUTES) {
             run.finish(Status::Failed, "Starting was interrupted");
         }
-        return finish_up(paths, settings, run, &before);
+        return finish_up(paths, run, &before, remembers);
     }
     if !run.status.active() {
         return false;
+    }
+    // Keep the log current, so it survives the tab being closed by hand.
+    if run.agent != SHELL && log_is_old(paths, run) {
+        save_log(paths, run);
     }
 
     if run.agent == SHELL {
@@ -386,31 +560,74 @@ pub fn watch(paths: &Paths, settings: &Settings, run: &mut Run, routine: Option<
 
     let limit = Duration::minutes(i64::from(limit_minutes));
     if run.status.active() && now - run.started > limit {
-        run.finish(
-            Status::TimedOut,
-            format!(
-                "Not finished after {} minutes; the tab stays open",
-                limit.num_minutes()
-            ),
-        );
-        herdr::notify(
-            &format!("{} timed out", run.routine_name),
-            "The run is past its time limit. Its tab stays open.",
-            "request",
-        );
+        let minutes = match limit.num_minutes() {
+            1 => "1 minute".to_string(),
+            n => format!("{n} minutes"),
+        };
+        if stop_at_limit {
+            // Keep what it wrote, then end it by closing its tab.
+            save_log(paths, run);
+            run.finish(
+                Status::TimedOut,
+                format!("Stopped after {minutes}, its time limit"),
+            );
+            if herdr::close_tab(&run.tab_id).is_ok() {
+                run.tab_closed = true;
+            }
+            herdr::notify(
+                &format!("{} stopped", run.routine_name),
+                &format!("The run reached its time limit of {minutes} and was stopped."),
+                "request",
+            );
+        } else {
+            run.finish(
+                Status::TimedOut,
+                format!("Not finished after {minutes}; the tab stays open"),
+            );
+            herdr::notify(
+                &format!("{} timed out", run.routine_name),
+                "The run is past its time limit. Its tab stays open.",
+                "request",
+            );
+        }
     }
-    finish_up(paths, settings, run, &before)
+    finish_up(paths, run, &before, remembers)
 }
 
-fn finish_up(paths: &Paths, _settings: &Settings, run: &mut Run, before: &Run) -> bool {
+/// Saves a run that just ended: its log, its result and, for a routine
+/// that remembers, the result in its memory.
+fn finish_up(paths: &Paths, run: &mut Run, before: &Run, remembers: bool) -> bool {
     if run == before {
         return false;
     }
     if !run.status.active() && before.status.active() {
-        save_log(paths, run);
+        if !run.tab_closed {
+            save_log(paths, run);
+        }
+        if run.result.is_empty() {
+            run.result = if run.agent == SHELL {
+                let out = std::fs::read_to_string(run.file(paths, "out")).unwrap_or_default();
+                last_line(&out)
+            } else {
+                let log = std::fs::read_to_string(run.log_path(paths)).unwrap_or_default();
+                extract_result(&log)
+            };
+        }
+        if remembers && run.status == Status::Finished {
+            remember(paths, run);
+        }
     }
     let _ = run.save(paths);
     true
+}
+
+/// Whether the saved log is older than [`LOG_EVERY_SECS`] (or missing).
+fn log_is_old(paths: &Paths, run: &Run) -> bool {
+    std::fs::metadata(run.log_path(paths))
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_none_or(|age| age.as_secs() >= LOG_EVERY_SECS)
 }
 
 /// Whether a run still holds its routine, so the next one must wait: an
@@ -443,6 +660,17 @@ pub fn occupied(paths: &Paths, run: &Run) -> bool {
 /// works in it or looks at the routines workspace. A conversation picked up
 /// after the run starts the wait again.
 pub fn tidy(paths: &Paths, settings: &Settings, run: &mut Run, workspace_in_view: bool) -> bool {
+    // A conversation can go on after the run: keep its log current while
+    // the tab is open.
+    if !run.tab_closed && run.agent != SHELL && !run.pane_id.is_empty() && log_is_old(paths, run) {
+        if herdr::pane_exists(&run.pane_id).unwrap_or(false) {
+            save_log(paths, run);
+        } else {
+            run.tab_closed = true;
+            let _ = run.save(paths);
+            return true;
+        }
+    }
     if run.status != Status::Finished
         || run.tab_closed
         || settings.close_finished_after_minutes == 0
@@ -510,16 +738,32 @@ mod tests {
     #[test]
     fn shell_wrapper_quotes_paths() {
         assert_eq!(quote("it's"), "'it'\\''s'");
-        let w = wrapper(
-            "/bin/zsh",
-            Path::new("/state/runs/a b/1.sh"),
-            Path::new("/state/runs/a b/1.exit"),
-        );
-        assert!(w.contains("'/bin/zsh' '/state/runs/a b/1.sh'\n"), "{w}");
-        assert!(
-            w.ends_with("printf '%s' \"$?\" > '/state/runs/a b/1.exit'\n"),
-            "{w}"
-        );
+        let dir = std::env::temp_dir().join(format!("rt-wrap {}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (script, out, exit) = (dir.join("1.sh"), dir.join("1.out"), dir.join("1.exit"));
+        std::fs::write(&script, "echo one\necho two >&2\nexit 4\n").unwrap();
+        let w = wrapper("/bin/sh", &script, &out, &exit);
+        assert!(w.contains(&quote(&script.to_string_lossy())), "{w}");
+        // It really runs: output and exit code land in their files.
+        let wrap = dir.join("1.run");
+        std::fs::write(&wrap, w).unwrap();
+        let status = std::process::Command::new("/bin/sh")
+            .arg(&wrap)
+            .output()
+            .unwrap();
+        assert!(status.status.success());
+        assert_eq!(std::fs::read_to_string(&exit).unwrap(), "4");
+        let text = std::fs::read_to_string(&out).unwrap();
+        assert!(text.contains("one") && text.contains("two"), "{text}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn results_and_memory() {
+        let log = "❯ do it. ... between a line RESULT START and a line RESULT END.\n⏺ Done.\n\n  RESULT START\n  Cleaned 3 files.\n  Nothing open.\n  RESULT END\n";
+        assert_eq!(extract_result(log), "Cleaned 3 files.\nNothing open.");
+        assert_eq!(extract_result("no markers"), "");
+        assert_eq!(last_line("a\nlast one\n\n"), "last one");
     }
 
     #[test]

@@ -15,6 +15,10 @@ pub enum Trigger {
     Missed,
     /// Started by hand.
     Manual,
+    /// Trying again after a failed run.
+    Retry,
+    /// Started because Herdr started (`@start`).
+    Start,
 }
 
 impl Trigger {
@@ -23,6 +27,8 @@ impl Trigger {
             Trigger::Scheduled => "Scheduled",
             Trigger::Missed => "Catch-up",
             Trigger::Manual => "By hand",
+            Trigger::Retry => "Retry",
+            Trigger::Start => "Herdr start",
         }
     }
 }
@@ -46,6 +52,8 @@ pub enum Status {
     Skipped,
     /// Someone closed the tab or the agent quit before it finished.
     Closed,
+    /// The check command found nothing to do, so the agent did not start.
+    NothingToDo,
 }
 
 impl Status {
@@ -59,6 +67,7 @@ impl Status {
             Status::Failed => "Failed",
             Status::Skipped => "Skipped",
             Status::Closed => "Closed early",
+            Status::NothingToDo => "Nothing to do",
         }
     }
 
@@ -116,6 +125,17 @@ pub struct Run {
     /// someone picked up the conversation.
     #[serde(default)]
     pub turns_at_end: Option<u64>,
+    /// What the run came to: the agent's summary (between the result
+    /// markers in its last answer) or a shell command's last output line.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub result: String,
+    /// 0 for the first try, 1 for the first retry and so on.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub attempt: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 impl Run {
@@ -153,6 +173,8 @@ impl Run {
             tab_closed: false,
             server: String::new(),
             turns_at_end: None,
+            result: String::new(),
+            attempt: 0,
         }
     }
 
@@ -219,7 +241,7 @@ pub fn all_runs(paths: &Paths) -> Vec<Run> {
 pub fn prune(paths: &Paths, routine_id: &str, keep: usize) {
     let runs = runs_of(paths, routine_id);
     for run in runs.iter().skip(keep).filter(|r| !r.status.active()) {
-        for ext in ["json", "log", "sh", "run", "exit"] {
+        for ext in ["json", "log", "sh", "run", "exit", "out"] {
             let _ = std::fs::remove_file(run.file(paths, ext));
         }
     }

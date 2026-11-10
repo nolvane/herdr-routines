@@ -14,6 +14,7 @@
 
 mod agent;
 mod app;
+mod autostart;
 mod clipboard;
 mod cron;
 mod editor;
@@ -24,7 +25,9 @@ mod pane;
 mod paths;
 mod routine;
 mod runner;
+mod schedule;
 mod scheduler;
+mod shell;
 mod store;
 mod theme;
 mod ui;
@@ -121,10 +124,11 @@ fn routines_json(paths: &Paths) -> String {
                 "effort": r.file.effort,
                 "folder": r.file.folder,
                 "problem": r.problem,
-                "next": r.cron().filter(|_| r.file.enabled).and_then(|c| c.next_after(&now)).map(|t| t.to_rfc3339()),
+                "next": r.schedule().filter(|_| r.file.enabled).and_then(|c| c.next_after(&now)).map(|t| t.to_rfc3339()),
                 "last_run": last.map(|l| serde_json::json!({
                     "id": l.id, "status": l.status, "started": l.started.to_rfc3339(),
                     "ended": l.ended.map(|t| t.to_rfc3339()), "message": l.message,
+                    "result": l.result,
                 })),
             })
         })

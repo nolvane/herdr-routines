@@ -1,8 +1,8 @@
 //! The form to create or change a routine.
 
 use crate::agent;
-use crate::cron::Cron;
 use crate::routine::{Missed, Routine, RoutineFile, AGENTS, SHELL};
+use crate::schedule::{Schedule, AT_START};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Repeat {
@@ -10,15 +10,19 @@ pub enum Repeat {
     Daily,
     Weekdays,
     Weekly,
+    Once,
+    AtStart,
     Custom,
 }
 
 impl Repeat {
-    const ALL: [Repeat; 5] = [
+    const ALL: [Repeat; 7] = [
         Repeat::Hourly,
         Repeat::Daily,
         Repeat::Weekdays,
         Repeat::Weekly,
+        Repeat::Once,
+        Repeat::AtStart,
         Repeat::Custom,
     ];
 
@@ -28,6 +32,8 @@ impl Repeat {
             Repeat::Daily => "Every day",
             Repeat::Weekdays => "Weekdays",
             Repeat::Weekly => "Once a week",
+            Repeat::Once => "Once",
+            Repeat::AtStart => "When Herdr starts",
             Repeat::Custom => "Custom (cron)",
         }
     }
@@ -38,8 +44,27 @@ impl Repeat {
             Repeat::Daily => "At a time every day",
             Repeat::Weekdays => "At a time Monday to Friday",
             Repeat::Weekly => "At a time on one day of the week",
+            Repeat::Once => "On one date at a time, then it switches itself off",
+            Repeat::AtStart => "Each time the Herdr server starts, such as after a restart",
             Repeat::Custom => "Any cron schedule, such as 15 8-18 * * 1-5",
         }
+    }
+}
+
+/// The retry choices: `(retries, minutes between)`.
+const RETRIES: [(u32, u32); 4] = [(0, 10), (1, 5), (2, 10), (3, 15)];
+
+fn retry_text(retries: u32, delay: u32) -> (String, String) {
+    match retries {
+        0 => ("Don't retry".into(), "A failed run stays failed".into()),
+        1 => (
+            "Try once more".into(),
+            format!("{delay} minutes after it failed"),
+        ),
+        n => (
+            format!("Try up to {n} more times"),
+            format!("{delay} minutes apart"),
+        ),
     }
 }
 
@@ -66,11 +91,16 @@ pub enum Field {
     Effort,
     Folder,
     Repeat,
+    Date,
     Weekday,
     Time,
     Cron,
     Missed,
     Limit,
+    AtLimit,
+    Retry,
+    Check,
+    Remember,
     Args,
     Enabled,
     Save,
@@ -91,8 +121,13 @@ impl Field {
             Field::Time => "Time",
             Field::Weekday => "Day",
             Field::Cron => "Cron schedule",
+            Field::Date => "Date",
             Field::Missed => "If missed",
             Field::Limit => "Time limit",
+            Field::AtLimit => "At the time limit",
+            Field::Retry => "If it fails",
+            Field::Check => "Check first",
+            Field::Remember => "Earlier results",
             Field::Args => "Extra options",
             Field::Enabled => "On",
             Field::Save => "Save",
@@ -103,7 +138,14 @@ impl Field {
     pub fn is_text(self) -> bool {
         matches!(
             self,
-            Field::Name | Field::Args | Field::Folder | Field::Time | Field::Cron | Field::Limit
+            Field::Name
+                | Field::Args
+                | Field::Folder
+                | Field::Time
+                | Field::Cron
+                | Field::Limit
+                | Field::Date
+                | Field::Check
         )
     }
 
@@ -119,6 +161,9 @@ impl Field {
                 | Field::Weekday
                 | Field::Missed
                 | Field::Enabled
+                | Field::AtLimit
+                | Field::Retry
+                | Field::Remember
         )
     }
 
@@ -144,7 +189,20 @@ impl Field {
                 "The folder the run works in, such as ~/projects/site. The agent reads and changes the files there."
             }
             Field::Repeat => {
-                "How often it runs: every hour, every day, on weekdays, once a week, or Custom for any other schedule."
+                "How often it runs: every hour, every day, on weekdays, once a week, once on a date, each time Herdr starts, or Custom for any other schedule."
+            }
+            Field::Date => "The day of the single run, as YYYY-MM-DD, such as 2026-12-24. The routine switches itself off after it ran.",
+            Field::AtLimit => {
+                "Keep running: the run is only marked and you get a notification. Stop the run: its tab is closed, which ends the agent or command; the output so far is kept."
+            }
+            Field::Retry => {
+                "When a run fails (a command ends with an error, an agent does not start), it can be tried again a little later."
+            }
+            Field::Check => {
+                "Optional: a shell command run first in the folder. If it ends without an error, the agent starts and gets its output; otherwise the run is recorded as \"Nothing to do\". Example: git fetch -q && git log --oneline HEAD..@{u}"
+            }
+            Field::Remember => {
+                "Given to the agent: each run starts with the results of the last ten runs, so it knows what earlier runs did and found. The plugin keeps them in one short file."
             }
             Field::Time => "24-hour time, such as 08:15. For every hour: the minute, such as 15.",
             Field::Weekday => "The day of the week it runs.",
@@ -155,7 +213,7 @@ impl Field {
                 "When Herdr or the computer was off or asleep at the time. Run once: it runs as soon as Herdr runs again. Skip: it waits for the next time."
             }
             Field::Limit => {
-                "After this many minutes the run is marked as timed out and you get a notification. The agent keeps going and its tab stays open."
+                "After this many minutes the run counts as timed out and you get a notification. What happens then is set right below."
             }
             Field::Args => {
                 "For experts, leave empty if unsure: options added to the agent's start command, such as --add-dir ~/other to let it work in a second folder too."
@@ -201,6 +259,13 @@ pub struct Form {
     pub cron: String,
     pub missed: Missed,
     pub limit: String,
+    /// The day of a single run, `YYYY-MM-DD`.
+    pub date: String,
+    pub stop_at_limit: bool,
+    pub retries: u32,
+    pub retry_delay: u32,
+    pub check: String,
+    pub remember: bool,
     pub enabled: bool,
     pub prompt: String,
     pub field: usize,
@@ -227,6 +292,14 @@ impl Form {
             cron: "0 9 * * 1-5".into(),
             missed: Missed::RunOnce,
             limit: "120".into(),
+            date: (chrono::Local::now() + chrono::Duration::days(1))
+                .format("%Y-%m-%d")
+                .to_string(),
+            stop_at_limit: false,
+            retries: 0,
+            retry_delay: 10,
+            check: String::new(),
+            remember: false,
             enabled: true,
             prompt: String::new(),
             field: 0,
@@ -245,12 +318,31 @@ impl Form {
         f.effort = r.file.effort.clone();
         f.args = join_args(&r.file.args);
         f.cron = r.file.schedule.clone();
-        let (repeat, time, weekday) = preset_of(&r.file.schedule);
-        f.repeat = repeat;
-        f.time = time;
-        f.weekday = weekday;
+        match Schedule::parse(&r.file.schedule) {
+            Ok(Schedule::Once(t)) => {
+                f.repeat = Repeat::Once;
+                f.date = t.format("%Y-%m-%d").to_string();
+                f.time = t.format("%H:%M").to_string();
+                f.cron = "0 9 * * 1-5".into();
+            }
+            Ok(Schedule::AtStart) => {
+                f.repeat = Repeat::AtStart;
+                f.cron = "0 9 * * 1-5".into();
+            }
+            _ => {
+                let (repeat, time, weekday) = preset_of(&r.file.schedule);
+                f.repeat = repeat;
+                f.time = time;
+                f.weekday = weekday;
+            }
+        }
         f.missed = r.file.missed;
         f.limit = r.file.time_limit_minutes.to_string();
+        f.stop_at_limit = r.file.stop_at_limit;
+        f.retries = r.file.retries;
+        f.retry_delay = r.file.retry_delay_minutes;
+        f.check = r.file.check_command.clone();
+        f.remember = r.file.remember;
         f.enabled = r.file.enabled;
         f.prompt = r.prompt.clone();
         f
@@ -304,11 +396,19 @@ impl Form {
                 v.push(Field::Weekday);
                 v.push(Field::Time);
             }
+            Repeat::Once => {
+                v.push(Field::Date);
+                v.push(Field::Time);
+            }
+            Repeat::AtStart => {}
             _ => v.push(Field::Time),
         }
-        v.extend([Field::Missed, Field::Limit]);
+        if self.repeat != Repeat::AtStart {
+            v.push(Field::Missed);
+        }
+        v.extend([Field::Limit, Field::AtLimit, Field::Retry]);
         if !self.is_shell() {
-            v.push(Field::Args);
+            v.extend([Field::Check, Field::Remember, Field::Args]);
         }
         // The prompt last, right above the save button: it is the longest
         // field and the one people write after choosing everything else.
@@ -340,6 +440,8 @@ impl Form {
             Field::Time => Some(&mut self.time),
             Field::Cron => Some(&mut self.cron),
             Field::Limit => Some(&mut self.limit),
+            Field::Date => Some(&mut self.date),
+            Field::Check => Some(&mut self.check),
             _ => None,
         }
     }
@@ -387,6 +489,9 @@ impl Form {
             Field::Weekday => WEEKDAYS[self.weekday].into(),
             Field::Missed => self.missed.label().into(),
             Field::Enabled => if self.enabled { "Yes" } else { "No" }.into(),
+            Field::AtLimit => if self.stop_at_limit { "stop" } else { "keep" }.into(),
+            Field::Retry => format!("{}:{}", self.retries, self.retry_delay),
+            Field::Remember => if self.remember { "Yes" } else { "No" }.into(),
             _ => String::new(),
         }
     }
@@ -399,6 +504,14 @@ impl Form {
             Field::Mode => agent::label(agent::modes(a), &self.mode),
             Field::Model => agent::label(agent::models(a), &self.model),
             Field::Effort => agent::label(agent::efforts(a), &self.effort),
+            Field::AtLimit | Field::Retry | Field::Remember => {
+                let v = self.value(f);
+                self.items(f)
+                    .into_iter()
+                    .find(|i| i.value == v)
+                    .map(|i| i.label)
+                    .unwrap_or(v)
+            }
             _ => self.value(f),
         }
     }
@@ -458,6 +571,34 @@ impl Form {
                 item("Yes", "Yes", "Runs on its schedule"),
                 item("No", "No", "Kept, but never runs"),
             ],
+            Field::AtLimit => vec![
+                item("keep", "Keep running", "Only marked; the tab stays open"),
+                item("stop", "Stop the run", "Its tab is closed, which ends it"),
+            ],
+            Field::Retry => {
+                let mut v: Vec<Item> = RETRIES
+                    .iter()
+                    .map(|(r, d)| {
+                        let (label, detail) = retry_text(*r, *d);
+                        item(&format!("{r}:{d}"), &label, &detail)
+                    })
+                    .collect();
+                // A value set by hand in routine.toml stays choosable.
+                let now = self.value(Field::Retry);
+                if !v.iter().any(|i| i.value == now) {
+                    let (label, detail) = retry_text(self.retries, self.retry_delay);
+                    v.push(item(&now, &label, &detail));
+                }
+                v
+            }
+            Field::Remember => vec![
+                item("No", "Not used", "Each run starts fresh"),
+                item(
+                    "Yes",
+                    "Given to the agent",
+                    "Each run gets the results of the last ten runs",
+                ),
+            ],
             _ => Vec::new(),
         }
     }
@@ -498,7 +639,9 @@ impl Form {
             Field::Repeat => {
                 // Switching to custom starts from the schedule so far.
                 if let Ok(c) = self.schedule() {
-                    self.cron = c;
+                    if !c.starts_with('@') {
+                        self.cron = c;
+                    }
                 }
                 if let Some(r) = Repeat::ALL.iter().find(|r| r.label() == value) {
                     self.repeat = *r;
@@ -518,6 +661,14 @@ impl Form {
                 }
             }
             Field::Enabled => self.enabled = value == "Yes",
+            Field::AtLimit => self.stop_at_limit = value == "stop",
+            Field::Retry => {
+                if let Some((r, d)) = value.split_once(':') {
+                    self.retries = r.parse().unwrap_or(0);
+                    self.retry_delay = d.parse().unwrap_or(10);
+                }
+            }
+            Field::Remember => self.remember = value == "Yes",
             _ => return,
         }
         self.dirty = true;
@@ -544,6 +695,13 @@ impl Form {
     /// The cron text the choices stand for.
     pub fn schedule(&self) -> Result<String, String> {
         let text = match self.repeat {
+            Repeat::AtStart => AT_START.to_string(),
+            Repeat::Once => {
+                let (h, m) = parse_time(&self.time)?;
+                let text = Schedule::once_text(&self.date, &format!("{h:02}:{m:02}"));
+                Schedule::parse(&text).map_err(|_| "the date is YYYY-MM-DD, such as 2026-12-24")?;
+                return Ok(text);
+            }
             Repeat::Custom => self.cron.trim().to_string(),
             Repeat::Hourly => {
                 let m = self.time.trim().trim_start_matches(':');
@@ -564,7 +722,7 @@ impl Form {
                 format!("{m} {h} * * {day}")
             }
         };
-        Cron::parse(&text)?;
+        Schedule::parse(&text)?;
         Ok(text)
     }
 
@@ -588,6 +746,15 @@ impl Form {
             folder: self.folder.trim().to_string(),
             missed: self.missed,
             time_limit_minutes,
+            stop_at_limit: self.stop_at_limit,
+            retries: self.retries,
+            retry_delay_minutes: self.retry_delay,
+            check_command: if self.is_shell() {
+                String::new()
+            } else {
+                self.check.trim().to_string()
+            },
+            remember: self.remember && !self.is_shell(),
         };
         if let Some(problem) = Routine::check(&file, &self.prompt) {
             return Err(problem);
@@ -706,6 +873,7 @@ pub fn join_args(args: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cron::Cron;
 
     #[test]
     fn presets_round_trip() {
@@ -834,5 +1002,50 @@ mod tests {
         .collect();
         assert_eq!(split_args(&join_args(&a)).unwrap(), a);
         assert_eq!(split_args("it\\'s").unwrap(), vec!["it's"]);
+    }
+
+    #[test]
+    fn single_runs_retries_checks_and_memory_round_trip() {
+        let mut f = Form::new("/tmp");
+        f.name = "Year end".into();
+        f.prompt = "Sum up the year.".into();
+        f.choose(Field::Repeat, Repeat::Once.label());
+        assert!(f.fields().contains(&Field::Date));
+        f.date = "2026-12-24".into();
+        f.time = "08:15".into();
+        f.choose(Field::Retry, "2:10");
+        f.choose(Field::AtLimit, "stop");
+        f.choose(Field::Remember, "Yes");
+        f.check = "test -f new.txt".into();
+        let (file, _) = f.build().unwrap();
+        assert_eq!(file.schedule, "@once 2026-12-24 08:15");
+        assert_eq!((file.retries, file.retry_delay_minutes), (2, 10));
+        assert!(file.stop_at_limit && file.remember);
+        assert_eq!(file.check_command, "test -f new.txt");
+        let r = Routine {
+            id: "year-end".into(),
+            file,
+            prompt: "Sum up the year.".into(),
+            problem: None,
+            unreadable: false,
+        };
+        let back = Form::edit(&r);
+        assert_eq!(back.repeat, Repeat::Once);
+        assert_eq!(
+            (back.date.as_str(), back.time.as_str()),
+            ("2026-12-24", "08:15")
+        );
+        assert_eq!(back.shown(Field::Retry), "Try up to 2 more times");
+        assert_eq!(back.shown(Field::AtLimit), "Stop the run");
+        // "When Herdr starts" needs no time and no missed setting.
+        f.choose(Field::Repeat, Repeat::AtStart.label());
+        assert!(!f.fields().contains(&Field::Time));
+        assert!(!f.fields().contains(&Field::Missed));
+        assert_eq!(f.build().unwrap().0.schedule, "@start");
+        // Shell commands have no check and no memory.
+        f.choose(Field::Agent, SHELL);
+        assert!(!f.fields().contains(&Field::Check));
+        assert!(!f.build().unwrap().0.remember);
+        assert!(f.build().unwrap().0.check_command.is_empty());
     }
 }

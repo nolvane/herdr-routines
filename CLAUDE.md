@@ -19,11 +19,13 @@ each run in its own tab. What it does and how users install it:
 
 - `scheduler.rs`: the background loop, when a routine is due, the pid file.
 - `runner.rs`: starting a run and following it (states, notifications,
-  closing finished tabs).
+  closing finished tabs), the check command, results and memory.
 - `herdr.rs`: the Herdr calls. `routine.rs`: routines and settings.
   `agent.rs`: permission modes, models and effort per agent and their
-  flags. `store.rs`: run records. `cron.rs`: schedules. `paths.rs`: where
-  files go.
+  flags. `models.rs`: model lists the agents print. `store.rs`: run
+  records. `schedule.rs`: cron, `@once` and `@start`; `cron.rs`: cron
+  itself. `shell.rs`: commands in the login shell with a time limit.
+  `autostart.rs`: Herdr at login. `paths.rs`: where files go.
 - `app.rs`: the list's state, keys and mouse. `ui.rs`: drawing, in the look
   of the Git Panel and Multiaccount plugins (keep them alike).
   `form.rs`: the edit form. `editor.rs`: the prompt editor. `pane.rs`: the
@@ -77,7 +79,9 @@ everything afterwards with `herdr-routines stop`,
 ## Non-goals
 
 - No headless runs: every run is an interactive agent in a tab.
-- No runs while the Herdr server is down (no launchd or systemd service).
+- No scheduler of its own outside Herdr: routines run while the Herdr
+  server runs. The optional "start at login" entry (`autostart.rs`) starts
+  `herdr server`, not the plugin.
 
 ## Releasing
 

@@ -6,11 +6,9 @@
 use crate::agent;
 use crate::paths::{self, Paths};
 use std::collections::HashSet;
-use std::io::Read;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
 use std::sync::Mutex;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 /// How long a list command may take.
 const LIMIT: Duration = Duration::from_secs(30);
@@ -81,35 +79,10 @@ pub fn refresh(paths: &Paths, agent: &str) {
 /// on the PATH) and returns what it printed, or None on failure or when it
 /// took too long.
 fn run(cmd: &str) -> Option<String> {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-    let mut child = Command::new(shell)
-        .args(["-lc", cmd])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    // Read in a thread, so a long list cannot fill the pipe and stall.
-    let mut out = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
-        let mut s = String::new();
-        let _ = out.read_to_string(&mut s);
-        s
-    });
-    let start = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let text = reader.join().unwrap_or_default();
-                return status.success().then_some(text);
-            }
-            Ok(None) if start.elapsed() < LIMIT => std::thread::sleep(Duration::from_millis(100)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-        }
+    // Errors (not logged in and so on) are not model names.
+    match crate::shell::run(&format!("{cmd} 2>/dev/null"), None, LIMIT)? {
+        (0, out) => Some(out),
+        _ => None,
     }
 }
 

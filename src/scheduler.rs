@@ -10,6 +10,7 @@ use crate::herdr;
 use crate::paths::{self, Paths};
 use crate::routine::{self, Missed, Routine, Settings};
 use crate::runner;
+use crate::schedule::Schedule;
 use crate::store::{self, Checked, Status, Trigger};
 use chrono::{DateTime, Duration, Local};
 use std::os::unix::fs::MetadataExt;
@@ -37,11 +38,11 @@ pub enum Due {
 
 /// Whether a routine is due in `(last_checked, now]`.
 pub fn due(routine: &Routine, last_checked: DateTime<Local>, now: DateTime<Local>) -> Due {
-    let Some(cron) = routine.cron() else {
+    let Some(schedule) = routine.schedule() else {
         return Due::Not;
     };
     let from = last_checked.max(now - Duration::days(LOOKBACK_DAYS));
-    match cron.latest_in(&from, &now) {
+    match schedule.latest_in(&from, &now) {
         None => Due::Not,
         Some(slot) if now - slot <= Duration::minutes(ON_TIME) => Due::Now(slot),
         Some(slot) => match routine.file.missed {
@@ -68,6 +69,18 @@ pub fn fire(
     trigger: Trigger,
     slot: Option<DateTime<Local>>,
 ) -> Option<JoinHandle<()>> {
+    fire_attempt(paths, settings, routine, trigger, slot, 0)
+}
+
+/// [`fire`] for a given try: 0 first, 1 for the first retry.
+fn fire_attempt(
+    paths: &Paths,
+    settings: &Settings,
+    routine: &Routine,
+    trigger: Trigger,
+    slot: Option<DateTime<Local>>,
+    attempt: u32,
+) -> Option<JoinHandle<()>> {
     if busy(paths, &routine.id) {
         paths::log(
             paths,
@@ -78,7 +91,11 @@ pub fn fire(
         }
         return None;
     }
-    let run = runner::prepare(paths, routine, trigger, slot);
+    let mut run = runner::prepare(paths, routine, trigger, slot);
+    if attempt > 0 {
+        run.attempt = attempt;
+        let _ = run.save(paths);
+    }
     paths::log(
         paths,
         &format!("{}: start run {} ({:?})", routine.id, run.id, trigger),
@@ -106,15 +123,36 @@ fn tick(
     let routines = routine::load_all(paths);
     let now = Local::now();
 
+    let server = paths.server_id();
+    let mut started = Started::load(paths);
     for r in &routines {
         let last = checked.0.get(&r.id).copied();
         checked.0.insert(r.id.clone(), now);
+        let at_start = matches!(r.schedule(), Some(Schedule::AtStart));
         let Some(last) = last else {
-            continue; // New: counts from now.
+            // New: counts from now, also for "when Herdr starts".
+            if at_start {
+                started.0.insert(r.id.clone(), server.clone());
+            }
+            continue;
         };
         if !r.file.enabled || r.problem.is_some() {
             continue;
         }
+        if at_start {
+            // Once per Herdr server, not per scheduler (it restarts on
+            // updates).
+            if started.0.get(&r.id) != Some(&server) {
+                started.0.insert(r.id.clone(), server.clone());
+                launches.extend(fire(paths, &settings, r, Trigger::Start, None));
+            }
+            continue;
+        }
+        if let Some(launch) = retry(paths, &settings, r, now) {
+            launches.push(launch);
+            continue;
+        }
+        let once = matches!(r.schedule(), Some(Schedule::Once(_)));
         let launch = match due(r, last, now) {
             Due::Not => None,
             Due::Now(slot) => fire(paths, &settings, r, Trigger::Scheduled, Some(slot)),
@@ -131,6 +169,12 @@ fn tick(
                 None
             }
         };
+        if once && launch.is_some() {
+            // A single run switches its routine off once it started.
+            let mut done = r.clone();
+            done.file.enabled = false;
+            let _ = done.save(paths);
+        }
         launches.extend(launch);
     }
     launches.retain(|h| !h.is_finished());
@@ -138,6 +182,10 @@ fn tick(
         .0
         .retain(|id, _| routines.iter().any(|r| &r.id == id));
     checked.save(paths);
+    started
+        .0
+        .retain(|id, _| routines.iter().any(|r| &r.id == id));
+    started.save(paths);
 
     // Reachability check, so a gone server ends the loop.
     let in_view = workspace_in_view(&settings.workspace)?;
@@ -171,6 +219,65 @@ fn tick(
         store::prune(paths, &r.id, settings.history);
     }
     Ok(())
+}
+
+/// Tries a failed run again when the routine allows it and the wait is
+/// over. Only the newest run counts: a later success ends the retries.
+fn retry(
+    paths: &Paths,
+    settings: &Settings,
+    routine: &Routine,
+    now: DateTime<Local>,
+) -> Option<JoinHandle<()>> {
+    if routine.file.retries == 0 {
+        return None;
+    }
+    let last = store::runs_of(paths, &routine.id).into_iter().next()?;
+    let wait = Duration::minutes(i64::from(routine.file.retry_delay_minutes));
+    let ended = last.ended?;
+    if last.status != Status::Failed || last.attempt >= routine.file.retries || now - ended < wait {
+        return None;
+    }
+    paths::log(
+        paths,
+        &format!(
+            "{}: retry {} of {}",
+            routine.id,
+            last.attempt + 1,
+            routine.file.retries
+        ),
+    );
+    fire_attempt(
+        paths,
+        settings,
+        routine,
+        Trigger::Retry,
+        last.slot,
+        last.attempt + 1,
+    )
+}
+
+/// The Herdr server each "when Herdr starts" routine last ran for.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct Started(std::collections::BTreeMap<String, String>);
+
+impl Started {
+    fn file(paths: &Paths) -> std::path::PathBuf {
+        paths.state.join("started.json")
+    }
+
+    fn load(paths: &Paths) -> Started {
+        std::fs::read(Started::file(paths))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default()
+    }
+
+    fn save(&self, paths: &Paths) {
+        if let Ok(text) = serde_json::to_vec_pretty(self) {
+            let _ = paths::write_atomic(&Started::file(paths), &text);
+        }
+    }
 }
 
 /// Whether the routines workspace is the one on screen.
@@ -318,6 +425,11 @@ mod tests {
                 folder: "~".into(),
                 missed,
                 time_limit_minutes: 60,
+                stop_at_limit: false,
+                retries: 0,
+                retry_delay_minutes: 10,
+                check_command: String::new(),
+                remember: false,
             },
             prompt: "go".into(),
             problem: None,

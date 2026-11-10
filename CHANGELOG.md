@@ -27,4 +27,13 @@ All notable changes to this plugin. The format follows
 - Shell commands as routines, like cron jobs without AI: exit code 0
   finishes the run, anything else marks it failed and notifies.
 - On and off at a glance: a green dot for on, a red one for off.
+- A model choice for every agent that takes one, from the agent's own list
+  where it prints one; long lists filter by typing.
+- Create a routine by describing it to Claude.
+- Retries for failed runs, stopping a run at its time limit, single runs on
+  a date, runs when Herdr starts, and starting Herdr at login.
+- Check command before an agent run; the agent's summary saved with each
+  run, and optionally given to the next runs.
+- Whole output of shell commands in a file; agent tabs saved every minute;
+  `f` opens a run's output file; the runs of one routine with "n runs".
 - `routines` (JSON) and `fire <id>` commands for scripts and other agents.

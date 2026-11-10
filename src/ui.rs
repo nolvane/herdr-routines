@@ -4,9 +4,10 @@
 
 use crate::agent;
 use crate::app::{App, Hit, LogView, Mode, View, INTRO};
-use crate::cron::{short_time, Cron};
+use crate::cron::short_time;
 use crate::form::{Field, Form};
 use crate::routine::Routine;
+use crate::schedule::Schedule;
 use crate::store::Run;
 use crate::theme::{
     self, Icons, ACCENT, BAR_BG, BORDER, FAINT, GREEN, MARK_BG, MUTED, RED, SELECTED_BG, TEXT,
@@ -88,7 +89,13 @@ fn draw_header(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
                 View::Routines => app.routines.len(),
                 View::Runs => app.runs.len(),
             };
-            let label = format!(" {} ({count}) ", view.name());
+            let label = match (view, app.filter_name()) {
+                (View::Runs, Some(name)) => {
+                    let name: String = name.chars().take(24).collect();
+                    format!(" Runs of {name} ({count}) ")
+                }
+                _ => format!(" {} ({count}) ", view.name()),
+            };
             let style = if app.view == view {
                 Style::new()
                     .fg(TEXT)
@@ -118,15 +125,41 @@ fn draw_header(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
             Style::new().fg(RED),
         ),
     };
+    // Left of it, whether Herdr starts at login (A switches it).
+    let login = if !in_list || !crate::autostart::supported() {
+        None
+    } else if crate::autostart::is_on() {
+        Some((
+            format!("{} starts at login", icons.running()),
+            Style::new().fg(GREEN),
+        ))
+    } else {
+        Some((
+            format!("{} not at login · A", icons.running()),
+            Style::new().fg(RED),
+        ))
+    };
     let w = chip.width();
+    let login_w = login.as_ref().map_or(0, |(t, _)| t.width() + 3);
+    let right = line.x + line.width;
     if used + w + 3 <= line.width as usize {
         if app.scheduler.is_none() && in_list {
-            let x = line.x + line.width - w as u16;
+            let x = right - w as u16;
             app.hits
                 .push((Rect::new(x, line.y, w as u16, 1), Hit::Key('S')));
         }
+        let mut spans = Vec::new();
+        if let Some((text, style)) = login.filter(|_| used + w + login_w + 3 <= line.width as usize)
+        {
+            let lw = text.width() as u16;
+            let x = right - w as u16 - 3 - lw;
+            app.hits.push((Rect::new(x, line.y, lw, 1), Hit::Key('A')));
+            spans.push(Span::styled(text, style));
+            spans.push(Span::raw("   "));
+        }
+        spans.push(Span::styled(chip, style));
         frame.render_widget(
-            Paragraph::new(Span::styled(chip, style)).alignment(Alignment::Right),
+            Paragraph::new(Line::from(spans)).alignment(Alignment::Right),
             line,
         );
     }
@@ -311,7 +344,7 @@ fn draw_routines(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
             (RCol::Mark, "", Constraint::Length(2)),
             (RCol::Routine, "Routine", Constraint::Fill(1)),
             (RCol::Schedule, "Schedule", Constraint::Length(26)),
-            (RCol::Last, "Last run", Constraint::Length(24)),
+            (RCol::Last, "Last run", Constraint::Length(LAST_W)),
         ],
         &[RCol::Last, RCol::Schedule],
         area.width.saturating_sub(2),
@@ -342,9 +375,16 @@ fn draw_routines(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
                         } else if !r.file.enabled {
                             Line::from(Span::styled("off", Style::new().fg(RED)))
                         } else {
-                            match r.cron().and_then(|c| c.next_after(&now)) {
-                                Some(t) => faint(format!("next {}", crate::app::until(&t, &now))),
-                                None => faint("never"),
+                            match r.schedule() {
+                                Some(crate::schedule::Schedule::AtStart) => {
+                                    faint("next Herdr start")
+                                }
+                                s => match s.and_then(|c| c.next_after(&now)) {
+                                    Some(t) => {
+                                        faint(format!("next {}", crate::app::until(&t, &now)))
+                                    }
+                                    None => faint("done"),
+                                },
                             }
                         };
                         Text::from(vec![
@@ -356,7 +396,7 @@ fn draw_routines(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
                         ])
                     }
                     RCol::Last => match app.latest_run(&r.id) {
-                        Some(run) => last_run(icons, run, &now),
+                        Some(run) => last_run(icons, run, &now, app.run_count(&r.id)),
                         None => Text::from(vec![faint("–"), faint("no run yet")]),
                     },
                 })
@@ -366,23 +406,56 @@ fn draw_routines(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
     let head = cols.iter().map(|(_, h, _)| *h).collect();
     let widths = cols.iter().map(|(_, _, w)| *w).collect();
     let sel = app.sel_routine;
+    let n = rows.len();
     draw_table(frame, app, area, head, widths, rows, sel);
+    // The last-run cell links to the routine's runs: the column is the
+    // table's last one, LAST_W wide, flush right inside the side margins.
+    if cols.last().is_some_and(|(c, _, _)| *c == RCol::Last) {
+        let x = area.x + area.width.saturating_sub(1 + LAST_W);
+        let visible = (area.height.saturating_sub(1) / 3).max(1) as usize;
+        let first = offset(sel, n, visible);
+        for (i, r) in routines.iter().enumerate().skip(first).take(visible) {
+            let y = area.y + 1 + ((i - first) as u16) * 3;
+            if app.latest_run(&r.id).is_some() && y < area.y + area.height {
+                app.hits.push((Rect::new(x, y, LAST_W, 1), Hit::RunsOf(i)));
+            }
+        }
+    }
 }
 
-fn last_run(icons: &Icons, run: &Run, now: &chrono::DateTime<Local>) -> Text<'static> {
+/// Width of the last-run column.
+const LAST_W: u16 = 28;
+
+/// The last run of a routine and how many runs it has (a link to them).
+fn last_run(
+    icons: &Icons,
+    run: &Run,
+    now: &chrono::DateTime<Local>,
+    count: usize,
+) -> Text<'static> {
     let (icon, color) = icons.status(run.status);
     let when = crate::app::ago(&run.started, now);
-    let second = if run.status.active() {
-        format!("{when} · for {}", crate::app::took(run))
+    let runs = if count == 1 {
+        "1 run".to_string()
     } else {
-        format!("{when} · took {}", crate::app::took(run))
+        format!("{count} runs")
     };
     Text::from(vec![
-        Line::from(Span::styled(
-            format!("{icon} {}", run.status.label()),
-            Style::new().fg(color),
-        )),
-        faint(second),
+        Line::from(vec![
+            Span::styled(
+                format!("{icon} {}", run.status.label()),
+                Style::new().fg(color),
+            ),
+            Span::styled(
+                format!("  {runs} ›"),
+                Style::new().fg(ACCENT).add_modifier(Modifier::UNDERLINED),
+            ),
+        ]),
+        faint(if run.status.active() {
+            format!("{when} · for {}", crate::app::took(run))
+        } else {
+            format!("{when} · took {}", crate::app::took(run))
+        }),
     ])
 }
 
@@ -441,10 +514,15 @@ fn draw_runs(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
                                 Style::new().fg(ACCENT),
                             ));
                         }
-                        let second = if run.message.is_empty() {
-                            format!("{} · {}", run.agent, run.trigger.label().to_lowercase())
-                        } else {
-                            run.message.clone()
+                        // What it came to, else what went wrong, else how
+                        // it started.
+                        let result = run.result.lines().find(|l| !l.trim().is_empty());
+                        let second = match result {
+                            Some(r) => r.trim().to_string(),
+                            None if !run.message.is_empty() => run.message.clone(),
+                            None => {
+                                format!("{} · {}", run.agent, run.trigger.label().to_lowercase())
+                            }
                         };
                         Text::from(vec![Line::from(first), faint(second)])
                     }
@@ -453,7 +531,11 @@ fn draw_runs(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
                             short_time(&run.started, &now),
                             Style::new().fg(TEXT),
                         )),
-                        faint(run.trigger.label()),
+                        faint(if run.attempt > 0 {
+                            format!("{} {}", run.trigger.label(), run.attempt)
+                        } else {
+                            run.trigger.label().to_string()
+                        }),
                     ]),
                     NCol::Status => Text::from(vec![
                         Line::from(Span::styled(run.status.label(), Style::new().fg(color))),
@@ -549,13 +631,21 @@ fn field_value(form: &Form, f: Field, selected: bool, room: usize) -> Vec<Span<'
                 Field::Time => form.time.clone(),
                 Field::Cron => form.cron.clone(),
                 Field::Limit => form.limit.clone(),
+                Field::Date => form.date.clone(),
+                Field::Check => form.check.clone(),
                 _ => String::new(),
+            };
+            let value = if f == Field::Check {
+                clip(&value, room.saturating_sub(1).max(10))
+            } else {
+                value
             };
             let mut v = Vec::new();
             if value.is_empty() && !selected {
                 let empty = match f {
                     Field::Name => "required",
                     Field::Args => "none",
+                    Field::Check => "none, always runs",
                     _ => "",
                 };
                 v.push(Span::styled(empty, Style::new().fg(FAINT)));
@@ -667,13 +757,20 @@ fn draw_form(frame: &mut Frame, app: &mut App, area: Rect) {
     let now = Local::now();
     let mut summary = match form.schedule() {
         Ok(c) => {
-            let cron = Cron::parse(&c).expect("checked");
-            let next = cron
+            let schedule = Schedule::parse(&c).expect("checked");
+            let next = schedule
                 .next_after(&now)
                 .map(|t| format!(" · next {}", short_time(&t, &now)))
                 .unwrap_or_default();
+            // "Weekdays at 09:00" reads "Runs weekdays at 09:00".
+            let words = schedule.describe();
+            let mut chars = words.chars();
+            let words = match chars.next() {
+                Some(first) => first.to_lowercase().chain(chars).collect::<String>(),
+                None => words,
+            };
             vec![Span::styled(
-                format!("Runs {}{next}", cron.describe().to_lowercase()),
+                format!("Runs {words}{next}"),
                 Style::new().fg(GREEN),
             )]
         }
@@ -893,12 +990,22 @@ fn draw_footer(frame: &mut Frame, app: &mut App, area: Rect) {
                 ("?", "all keys", Some(Hit::Key('?'))),
                 ("q", "close", Some(Hit::Key('q'))),
             ],
-            View::Runs => vec![
-                ("⏎", "go to its tab", Some(Hit::Key('\n'))),
-                ("l", "output", Some(Hit::Key('l'))),
-                ("?", "all keys", Some(Hit::Key('?'))),
-                ("q", "close", Some(Hit::Key('q'))),
-            ],
+            View::Runs => {
+                let mut v = vec![
+                    ("⏎", "go to its tab", Some(Hit::Key('\n'))),
+                    ("l", "output", Some(Hit::Key('l'))),
+                ];
+                if app.run_filter.is_some() {
+                    v.push(("Esc", "all runs", Some(Hit::Key('\u{1b}'))));
+                } else {
+                    v.push(("h", "only this routine", Some(Hit::Key('h'))));
+                }
+                v.extend([
+                    ("?", "all keys", Some(Hit::Key('?'))),
+                    ("q", "close", Some(Hit::Key('q'))),
+                ]);
+                v
+            }
         }
     };
     let mut spans = vec![Span::raw(" ")];
@@ -1203,6 +1310,13 @@ fn draw_log(frame: &mut Frame, app: &mut App, mut log: LogView) {
         Span::styled("Esc", bold(MUTED)),
         Span::styled(" close  ", Style::new().fg(FAINT)),
     ];
+    if log.file.is_some() {
+        let y = inner.y + inner.height.saturating_sub(1);
+        app.hits
+            .push((Rect::new(inner.x + 9, y, 13, 1), Hit::Key('f')));
+        foot.push(Span::styled("f", bold(MUTED)));
+        foot.push(Span::styled(" open file  ", Style::new().fg(FAINT)));
+    }
     if log.max > 0 {
         foot.push(Span::styled("↑ ↓", bold(MUTED)));
         foot.push(Span::styled(
@@ -1262,15 +1376,18 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
                 ("r", "run now (asks first)"),
                 ("Space", "on / off"),
                 ("o", "go to the tab of its last run"),
-                ("l", "what its last run wrote"),
+                ("l", "result and output of its last run"),
+                ("h", "its runs (or click \"n runs\")"),
                 ("d", "delete (asks first)"),
             ],
         ),
         (
             "Runs",
             &[
-                ("⏎", "go to the run's tab, or what it wrote once closed"),
-                ("l", "what the run wrote"),
+                ("⏎", "go to the run's tab, or its output once closed"),
+                ("l", "result and output of the run"),
+                ("f", "open the output file"),
+                ("h", "only this routine's runs; Esc shows all"),
             ],
         ),
         (
@@ -1304,6 +1421,10 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
                 ("← →  Tab  1 2", "routines / runs"),
                 ("Mouse", "click to choose, double click to open"),
                 ("S", "start the scheduler"),
+                (
+                    "A",
+                    "start Herdr at login, or not (routines run after a restart)",
+                ),
                 ("i", "Nerd Font icons / plain symbols"),
                 ("Esc", "close a dialog (never the list)"),
                 ("q", "close the list (asks first)"),
