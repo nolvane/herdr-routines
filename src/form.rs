@@ -135,7 +135,7 @@ impl Field {
                 "What the agent may do without asking you. Auto: it works on its own and a safety check stops risky steps. When it still asks something, the run waits in its tab for your answer."
             }
             Field::Model => {
-                "The AI model that does the work. Bigger models are smarter but slower and use more of your plan. Agent default: what the agent itself is set to. Other…: type any model name."
+                "The AI model that does the work. Bigger models are smarter but slower and use more of your plan. Agent default: what the agent itself is set to. Agents that can list their models show them here (type to narrow a long list); Other…: type any model name."
             }
             Field::Effort => {
                 "How long the agent thinks before it acts. More effort gives better results on hard tasks, but takes longer and uses more of your plan."
@@ -205,6 +205,9 @@ pub struct Form {
     pub prompt: String,
     pub field: usize,
     pub dirty: bool,
+    /// Models offered besides the agent's own suggestions: `(name, where
+    /// it comes from)`, set by the list before the model list opens.
+    pub more_models: Vec<(String, String)>,
 }
 
 impl Form {
@@ -228,6 +231,7 @@ impl Form {
             prompt: String::new(),
             field: 0,
             dirty: false,
+            more_models: Vec::new(),
         }
     }
 
@@ -429,6 +433,11 @@ impl Form {
             Field::Mode => from(agent::modes(a)),
             Field::Model => {
                 let mut v = from(agent::models(a));
+                for (name, source) in &self.more_models {
+                    if !v.iter().any(|i| i.value == *name) {
+                        v.push(item(name, name, source));
+                    }
+                }
                 if !self.model.is_empty() && !v.iter().any(|i| i.value == self.model) {
                     v.push(item(&self.model, &self.model, "Typed in"));
                 }

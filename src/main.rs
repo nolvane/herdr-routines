@@ -19,6 +19,7 @@ mod cron;
 mod editor;
 mod form;
 mod herdr;
+mod models;
 mod pane;
 mod paths;
 mod routine;

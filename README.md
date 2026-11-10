@@ -40,8 +40,12 @@ off; a yellow warning sign marks a routine with a problem.
 - **Permission mode, model and effort** per routine, picked from a list:
   for Claude Code the permission modes (Auto, Accept edits, Plan only and
   more), the models (Fable, Opus, Sonnet, Haiku or any typed name) and the
-  effort; for Codex and Gemini their modes and any model name. New routines
-  start in Auto, since nobody watches a scheduled run.
+  effort; for Codex and Gemini their modes. Every agent that takes a model
+  on its command line gets a model choice: the agent's own list where it
+  can print one (Codex, Cursor, OpenCode, Kilo, Kiro, Devin, Pi, Grok,
+  Antigravity; refreshed daily in the background), its documented aliases,
+  models other routines use, or any typed name. New routines start in
+  Auto, since nobody watches a scheduled run.
 - **Shell commands:** choose "Shell command" as the agent and write the
   command or script instead of a prompt. It runs in its own tab in the
   folder, with your shell and its environment. Exit code 0 counts as
@@ -173,7 +177,7 @@ every day, weekdays and once a week, and any cron expression under "Custom".
 | Agent | `permission_mode` | Flag |
 | --- | --- | --- |
 | claude | `auto`, `acceptEdits`, `plan`, `dontAsk`, `bypassPermissions`, `manual` | `--permission-mode <mode>` |
-| codex | `auto`, `read-only`, `full-access` | `--full-auto`, `--sandbox read-only`, `--dangerously-bypass-approvals-and-sandbox` |
+| codex | `auto`, `read-only`, `full-access` | `--sandbox workspace-write --ask-for-approval never`, `--sandbox read-only`, `--dangerously-bypass-approvals-and-sandbox` |
 | gemini | `auto_edit`, `yolo` | `--approval-mode <mode>` |
 
 Left out, the agent runs with the settings and permissions it has in that

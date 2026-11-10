@@ -1,9 +1,11 @@
 //! The list's state and what the keys and the mouse do. Drawing is in
 //! `ui.rs`.
 
+use crate::agent;
 use crate::clipboard;
 use crate::editor::TextArea;
 use crate::form::{Field, Form, OTHER_MODEL};
+use crate::models;
 use crate::paths::{self, Paths};
 use crate::routine::{self, Routine, Settings};
 use crate::runner;
@@ -83,6 +85,44 @@ pub struct Picker {
     pub sel: usize,
     /// The form field it fills; None for "how to create a routine".
     pub field: Option<Field>,
+    /// Typed to narrow a long list (such as the models an agent lists).
+    pub filter: String,
+    /// Every entry; `items` is what the filter leaves.
+    pub all: Vec<crate::form::Item>,
+}
+
+impl Picker {
+    pub fn new(
+        title: String,
+        items: Vec<crate::form::Item>,
+        sel: usize,
+        field: Option<Field>,
+    ) -> Picker {
+        Picker {
+            title,
+            all: items.clone(),
+            items,
+            sel,
+            field,
+            filter: String::new(),
+        }
+    }
+
+    /// Long lists are narrowed by typing instead of picked by number.
+    pub fn filters(&self) -> bool {
+        self.all.len() > 12
+    }
+
+    fn refilter(&mut self) {
+        let f = self.filter.to_lowercase();
+        let keep = |i: &crate::form::Item| {
+            i.value == OTHER_MODEL
+                || i.value.to_lowercase().contains(&f)
+                || i.label.to_lowercase().contains(&f)
+        };
+        self.items = self.all.iter().filter(|i| keep(i)).cloned().collect();
+        self.sel = 0;
+    }
 }
 
 /// The choices behind `n`.
@@ -260,6 +300,33 @@ impl App {
         self.sel_routine = self.sel_routine.min(self.routines.len().saturating_sub(1));
         self.sel_run = self.sel_run.min(self.runs.len().saturating_sub(1));
         self.last_load = Instant::now();
+        self.fill_models();
+    }
+
+    /// The models the form offers besides the agent's suggestions: what
+    /// the agent lists itself (refreshed in the background) and what other
+    /// routines of the same agent use.
+    fn fill_models(&mut self) {
+        let Some(form) = self.form.as_mut() else {
+            return;
+        };
+        let agent = form.agent();
+        if agent::models(agent).is_empty() {
+            form.more_models.clear();
+            return;
+        }
+        models::refresh(&self.paths, agent);
+        let mut more: Vec<(String, String)> = models::cached(&self.paths, agent)
+            .into_iter()
+            .map(|m| (m, format!("Listed by {agent}")))
+            .collect();
+        for r in &self.routines {
+            let m = &r.file.model;
+            if r.file.agent == agent && !m.is_empty() && !more.iter().any(|(x, _)| x == m) {
+                more.push((m.clone(), format!("Used in {}", r.file.name)));
+            }
+        }
+        form.more_models = more;
     }
 
     pub fn flash(&mut self, text: impl Into<String>, color: Color) {
@@ -369,9 +436,9 @@ impl App {
             label: label.into(),
             detail: detail.into(),
         };
-        self.mode = Mode::Pick(Picker {
-            title: "New routine".into(),
-            items: vec![
+        self.mode = Mode::Pick(Picker::new(
+            "New routine".into(),
+            vec![
                 item(BY_FORM, "Fill in the form", "Choose every setting yourself"),
                 item(
                     BY_AGENT,
@@ -379,9 +446,9 @@ impl App {
                     "Claude asks what you need in a new tab and creates the routine",
                 ),
             ],
-            sel: 0,
-            field: None,
-        });
+            0,
+            None,
+        ));
     }
 
     /// Opens a tab next to the list with Claude, briefed to create a
@@ -662,6 +729,7 @@ impl App {
     }
 
     fn open_picker(&mut self) {
+        self.fill_models();
         let Some(form) = self.form.as_ref() else {
             return;
         };
@@ -672,12 +740,12 @@ impl App {
         }
         let now = form.value(field);
         let sel = items.iter().position(|i| i.value == now).unwrap_or(0);
-        self.mode = Mode::Pick(Picker {
-            title: form.label(field).into(),
+        self.mode = Mode::Pick(Picker::new(
+            form.label(field).into(),
             items,
             sel,
-            field: Some(field),
-        });
+            Some(field),
+        ));
     }
 
     fn picked(&mut self, p: Picker) {
@@ -802,6 +870,21 @@ impl App {
                 KeyCode::Char('y') => self.confirmed(c),
                 _ => self.mode = Mode::Normal,
             },
+            // A long list: typing narrows it, Backspace widens it again.
+            Mode::Pick(mut p)
+                if p.filters()
+                    && !ctrl
+                    && matches!(k.code, KeyCode::Char(_) | KeyCode::Backspace) =>
+            {
+                match k.code {
+                    KeyCode::Char(c) => p.filter.push(c),
+                    _ => {
+                        p.filter.pop();
+                    }
+                }
+                p.refilter();
+                self.mode = Mode::Pick(p);
+            }
             Mode::Pick(mut p) => match k.code {
                 KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::Normal,
                 KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
@@ -1588,6 +1671,49 @@ mod tests {
         assert_eq!(r.file.permission_mode, "auto");
         assert_eq!(r.file.model, "opus");
         assert_eq!(r.prompt, "Find broken links.");
+    }
+
+    #[test]
+    fn models_listed_by_an_agent_can_be_narrowed() {
+        let mut a = app("models");
+        let dir = a.paths.state.join("models");
+        std::fs::create_dir_all(&dir).unwrap();
+        let names: Vec<String> = (0..20)
+            .map(|i| format!("vendor{}/model-{i}", i % 3))
+            .collect();
+        std::fs::write(dir.join("opencode.txt"), names.join("\n")).unwrap();
+        press(&mut a, KeyCode::Char('n'));
+        press(&mut a, KeyCode::Enter);
+        let form = a.form.as_mut().unwrap();
+        form.choose(Field::Agent, "opencode");
+        form.select(Field::Model);
+        press(&mut a, KeyCode::Enter);
+        let Mode::Pick(p) = a.mode.clone() else {
+            panic!("no picker");
+        };
+        assert!(p.filters());
+        assert!(p.items.iter().any(|i| i.value == "vendor1/model-4"));
+        let s = screen(&mut a, 90, 30);
+        assert!(s.iter().any(|l| l.contains("Filter")));
+        for c in "vendor2/model-1".chars() {
+            press(&mut a, KeyCode::Char(c));
+        }
+        let Mode::Pick(p) = a.mode.clone() else {
+            panic!("no picker");
+        };
+        // "Other…" always stays.
+        let shown: Vec<&str> = p.items.iter().map(|i| i.value.as_str()).collect();
+        assert_eq!(
+            shown,
+            vec![
+                "vendor2/model-11",
+                "vendor2/model-14",
+                "vendor2/model-17",
+                OTHER_MODEL
+            ]
+        );
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(a.form.as_ref().unwrap().model, "vendor2/model-11");
     }
 
     #[test]

@@ -230,8 +230,32 @@ Why: the owner wants to edit prompts faster. The list captures the mouse,
 so the terminal's own selection does not reach the text; the editor has to
 mark itself.
 
-## 2026-11-10: No cost limit per run (yet)
+## 2026-11-10: No cost limit per run
 
-A USD limit next to the time limit was asked for. Claude Code only enforces
-`--max-budget-usd` in headless `--print` runs, and runs here are interactive
-tabs on purpose. Not built; open for the owner's decision.
+A USD limit next to the time limit was asked for and then dropped (owner's
+call). Claude Code only enforces `--max-budget-usd` in headless `--print`
+runs, and runs here are interactive tabs on purpose; an estimate from the
+transcript would be unreliable, and on a subscription a run spends quota,
+not dollars. The time limit and a cheaper model are the levers.
+
+## 2026-11-10: A model choice for every agent
+
+Every agent that takes a model on its command line gets the Model field
+(`--model`; all known agents but amp, mastracode, maki and muse, which take
+none there). The list offers, in this order: the agent's documented aliases
+(Claude, Gemini, Kilo, Qoder), the models the agent prints itself, models
+other routines of that agent use, and "Other…" for any name. Agents with a
+documented list command (`agent::list_command`: Codex, Cursor, OpenCode,
+Kilo, Kiro, Devin, Pi, Grok, Antigravity) are asked in the background in
+the person's login shell, at most daily (hourly while they print nothing,
+for example before a login), with a 30-second limit; the names go to
+`models/<agent>.txt` in the state folder, so the form never waits. The
+parser takes JSON objects (`slug`, `id`, `model`, `name`) or the first word
+of each line and skips headers. Lists longer than 12 entries are narrowed
+by typing.
+
+Why: the plugin is meant for any agent, not only Claude. Model names change
+too often to ship as a list; the agents know their own. Sources (checked
+2026-11-10): each CLI's official reference, see the research notes in the
+pull request. Codex's `--full-auto` is gone from its current reference, so
+Auto is now `--sandbox workspace-write --ask-for-approval never`.

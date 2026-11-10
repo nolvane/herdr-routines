@@ -968,12 +968,45 @@ fn draw_picker(frame: &mut Frame, app: &mut App, p: &crate::app::Picker) {
     let any = p.items.iter().any(|i| !i.detail.is_empty());
     let two = any && p.items.len() <= 8;
     let per = if two { 2u16 } else { 1 };
-    let want_h = p.items.len() as u16 * per + 4;
+    // Long lists get a filter line on top instead of number keys.
+    let filter_h = u16::from(p.filters()) * 2;
+    let want_h = p.all.len() as u16 * per + 4 + filter_h;
     let area = centered(frame.area(), 72, want_h);
-    let inner = dialog(frame, area, &p.title);
+    let mut inner = dialog(frame, area, &p.title);
+    if p.filters() {
+        let line = Line::from(vec![
+            Span::styled("Filter ", Style::new().fg(MUTED)),
+            Span::styled(p.filter.clone(), bold(TEXT)),
+            Span::styled("▏", Style::new().fg(ACCENT)),
+            Span::styled(
+                if p.filter.is_empty() {
+                    "type to narrow the list"
+                } else {
+                    ""
+                },
+                Style::new().fg(FAINT),
+            ),
+        ]);
+        frame.render_widget(
+            Paragraph::new(line),
+            Rect::new(inner.x, inner.y, inner.width, 1),
+        );
+        inner = Rect::new(
+            inner.x,
+            inner.y + 2,
+            inner.width,
+            inner.height.saturating_sub(2),
+        );
+    }
     let list_h = inner.height.saturating_sub(2);
     let visible = (list_h / per).max(1) as usize;
     let first = offset(p.sel, p.items.len(), visible);
+    if p.items.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Span::styled("Nothing matches", Style::new().fg(FAINT))),
+            Rect::new(inner.x, inner.y, inner.width, 1),
+        );
+    }
     for (i, item) in p.items.iter().enumerate().skip(first).take(visible) {
         let y = inner.y + ((i - first) as u16) * per;
         let r = Rect::new(inner.x, y, inner.width, per.min(inner.y + list_h - y));
@@ -982,7 +1015,7 @@ fn draw_picker(frame: &mut Frame, app: &mut App, p: &crate::app::Picker) {
         } else {
             Style::new()
         };
-        let number = if i < 9 {
+        let number = if i < 9 && !p.filters() {
             format!("{} ", i + 1)
         } else {
             "  ".into()

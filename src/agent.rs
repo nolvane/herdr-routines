@@ -60,7 +60,7 @@ const CODEX_MODES: &[Choice] = &[
     c(
         "auto",
         "Auto",
-        "Works in the folder without asking (--full-auto)",
+        "Works in the folder without asking (--sandbox workspace-write -a never)",
     ),
     c(
         "read-only",
@@ -96,9 +96,122 @@ const CLAUDE_MODELS: &[Choice] = &[
     c("haiku", "Haiku", "The latest Haiku model, fast and light"),
 ];
 
-/// Agents that take `--model` but whose model names change too often to
-/// list: the name is typed.
+/// Gemini CLI's documented aliases.
+const GEMINI_MODELS: &[Choice] = &[
+    DEFAULT,
+    c("auto", "Auto", "Gemini picks the model per task"),
+    c("pro", "Pro", "The current Pro model"),
+    c("flash", "Flash", "The current Flash model, faster"),
+    c("flash-lite", "Flash Lite", "The lightest, fastest model"),
+];
+
+/// Kilo's own routing choices.
+const KILO_MODELS: &[Choice] = &[
+    DEFAULT,
+    c(
+        "kilo-auto/frontier",
+        "Auto: frontier",
+        "Kilo picks a top model",
+    ),
+    c(
+        "kilo-auto/balanced",
+        "Auto: balanced",
+        "Kilo balances quality and cost",
+    ),
+    c("kilo-auto/free", "Auto: free", "Kilo picks a free model"),
+];
+
+/// Qoder's model tiers.
+const QODER_MODELS: &[Choice] = &[
+    DEFAULT,
+    c("auto", "Auto", "Qoder picks the tier"),
+    c("lite", "Lite", ""),
+    c("efficient", "Efficient", ""),
+    c("performance", "Performance", ""),
+    c("ultimate", "Ultimate", ""),
+];
+
+/// Agents that take `--model` without stable names to suggest: the list
+/// comes from the agent itself where it can print one, from other
+/// routines, or is typed.
 const TYPED_MODELS: &[Choice] = &[DEFAULT];
+
+/// Agents that take no model on their command line (or none is known):
+/// amp chooses through its modes, the others only inside a session.
+const NO_MODEL_FLAG: &[&str] = &["amp", "mastracode", "maki", "muse"];
+
+/// The command that prints an agent's models, for agents that have one.
+/// Run in the person's login shell with a time limit; the output is read
+/// by `parse_models`.
+pub fn list_command(agent: &str) -> Option<&'static str> {
+    Some(match agent {
+        "codex" => "codex debug models",
+        "cursor" => "cursor-agent models",
+        "opencode" => "opencode models",
+        "kilo" => "kilo models",
+        "kiro" => "kiro-cli chat --list-models",
+        "devin" => "devin models list",
+        "pi" => "pi --list-models",
+        "grok" => "grok models",
+        "agy" => "agy models",
+        _ => return None,
+    })
+}
+
+/// Model names from a list command's output: JSON (objects with an `id`,
+/// `slug`, `model` or `name`) or text with the name first on each line.
+/// Headers, bullets and markers such as "(current)" are skipped.
+pub fn parse_models(out: &str) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    let mut add = |s: &str| {
+        let s = s.trim();
+        let ok = (2..=100).contains(&s.len())
+            && s.chars().any(|c| c.is_ascii_alphabetic())
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "._:/@#+-".contains(c));
+        if ok && !found.iter().any(|f| f == s) {
+            found.push(s.to_string());
+        }
+    };
+    let trimmed = out.trim_start();
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            fn walk(v: &serde_json::Value, add: &mut dyn FnMut(&str)) {
+                match v {
+                    serde_json::Value::Array(a) => a.iter().for_each(|x| walk(x, add)),
+                    serde_json::Value::Object(o) => {
+                        let key = ["slug", "id", "model_id", "model", "name"]
+                            .iter()
+                            .find_map(|k| o.get(*k).and_then(|x| x.as_str()));
+                        if let Some(k) = key {
+                            add(k);
+                        } else {
+                            o.values().for_each(|x| walk(x, add));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            walk(&v, &mut add);
+            return found;
+        }
+    }
+    for line in out.lines() {
+        let line = line.trim().trim_start_matches(['*', '-', '•', '>', ' ']);
+        let Some(first) = line.split_whitespace().next() else {
+            continue;
+        };
+        // Headers end in a colon or are plain words like "Available".
+        let plain_words = !first.contains(['-', '/', '.', ':', '_'])
+            && !line.contains(" - ")
+            && line.split_whitespace().count() > 1;
+        if first.ends_with(':') || plain_words {
+            continue;
+        }
+        add(first);
+    }
+    found
+}
 
 const CLAUDE_EFFORTS: &[Choice] = &[
     DEFAULT,
@@ -120,13 +233,18 @@ pub fn modes(agent: &str) -> &'static [Choice] {
     }
 }
 
-/// Suggested models; empty when the agent has no model choice here. A model
-/// not in the list can be typed for every agent that has one.
+/// Suggested models; empty when the agent takes no model here. Any name
+/// can be typed for every agent that takes one, and agents that print
+/// their models add them (see `list_command`).
 pub fn models(agent: &str) -> &'static [Choice] {
     match agent {
+        crate::routine::SHELL => &[],
+        a if NO_MODEL_FLAG.contains(&a) => &[],
         "claude" => CLAUDE_MODELS,
-        "codex" | "gemini" => TYPED_MODELS,
-        _ => &[],
+        "gemini" => GEMINI_MODELS,
+        "kilo" => KILO_MODELS,
+        "qodercli" => QODER_MODELS,
+        _ => TYPED_MODELS,
     }
 }
 
@@ -168,7 +286,14 @@ pub fn flags(file: &RoutineFile) -> Vec<String> {
     match (file.agent.as_str(), mode) {
         (_, "") => {}
         ("claude", m) => add(&["--permission-mode", m]),
-        ("codex", "auto") => add(&["--full-auto"]),
+        // --full-auto is gone from current Codex; this is what it meant
+        // for a run nobody watches.
+        ("codex", "auto") => add(&[
+            "--sandbox",
+            "workspace-write",
+            "--ask-for-approval",
+            "never",
+        ]),
         ("codex", "read-only") => add(&["--sandbox", "read-only"]),
         ("codex", "full-access") => add(&["--dangerously-bypass-approvals-and-sandbox"]),
         ("gemini", m) => add(&["--approval-mode", m]),
@@ -240,7 +365,19 @@ mod tests {
 
     #[test]
     fn other_agents() {
-        assert_eq!(flags(&file("codex", "auto", "", "")), vec!["--full-auto"]);
+        assert_eq!(
+            flags(&file("codex", "auto", "", "")),
+            vec![
+                "--sandbox",
+                "workspace-write",
+                "--ask-for-approval",
+                "never"
+            ]
+        );
+        assert_eq!(
+            flags(&file("opencode", "", "anthropic/some-model", "")),
+            vec!["--model", "anthropic/some-model"]
+        );
         assert_eq!(
             flags(&file("codex", "read-only", "o-model", "")),
             vec!["--sandbox", "read-only", "--model", "o-model"]
@@ -254,6 +391,23 @@ mod tests {
         assert!(check(&file("codex", "plan", "", "")).is_some());
         assert!(check(&file("claude", "", "", "huge")).is_some());
         assert!(check(&file("claude", "", "my model", "")).is_some());
+    }
+
+    #[test]
+    fn model_lists_from_agents() {
+        let text = "Available models\nauto - Auto\ncomposer-2 - Composer 2 (current)\n* gpt-x.1 \n\nNAME  PROVIDER\n";
+        assert_eq!(parse_models(text), vec!["auto", "composer-2", "gpt-x.1"]);
+        let lines = "anthropic/model-a\nopenai/model-b\nanthropic/model-a\n";
+        assert_eq!(
+            parse_models(lines),
+            vec!["anthropic/model-a", "openai/model-b"]
+        );
+        let json = r#"{"models":[{"slug":"m-one","display":"One"},{"id":"m-two"}]}"#;
+        assert_eq!(parse_models(json), vec!["m-one", "m-two"]);
+        assert!(parse_models("error: not logged in. Run login first").is_empty());
+        assert!(models("amp").is_empty());
+        assert!(models("shell").is_empty());
+        assert_eq!(models("cursor").len(), 1);
     }
 
     #[test]
