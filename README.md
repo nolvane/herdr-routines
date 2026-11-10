@@ -194,7 +194,9 @@ Update with `herdr plugin update`.
 | `q` | Close the list (asks first); routines keep running |
 
 The mouse works too: click a tab or a row, double click to open, scroll with
-the wheel, click the keys in the footer.
+the wheel, click the keys in the footer. A right click on a routine, cron
+job or run opens a menu of what can be done with it, each entry with its
+key.
 
 In the form, `↑` `↓` move between fields, `⏎` opens the list of a choice
 (or the prompt editor), `←` `→` step through a choice, typing edits a text

@@ -76,6 +76,8 @@ pub enum Hit {
     Text,
     /// The repository link in the keys overlay's bottom border.
     Link,
+    /// An entry of the right-click menu.
+    MenuRow(usize),
 }
 
 /// Runs the system's opener (first argument) on a web link, true when it
@@ -197,7 +199,38 @@ pub enum Mode {
     Log(LogView),
     /// The jobs in the person's crontab, to move or copy here.
     Cron(Vec<crate::crontab::CronJob>),
+    /// The right-click menu of a row.
+    Menu(Menu),
     AskQuit,
+}
+
+/// A right-click menu: what can be done with the row it was opened on,
+/// with the key that does the same.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Menu {
+    /// Where it was opened (its top left corner, moved to fit).
+    pub x: u16,
+    pub y: u16,
+    pub items: Vec<MenuItem>,
+    pub sel: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MenuItem {
+    pub label: String,
+    /// The key shown beside it, such as "⏎" or "space".
+    pub key: &'static str,
+    pub action: MenuAction,
+    /// Shown in red: deletes something (it still asks first).
+    pub danger: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MenuAction {
+    /// The same as pressing this key in the list.
+    Key(char),
+    /// Takes over the person's own cron job under the cursor.
+    Take(crate::crontab::Take),
 }
 
 /// What the prompt editor writes to when saved.
@@ -1393,6 +1426,26 @@ impl App {
                 KeyCode::End | KeyCode::Char('G') => self.help_scroll = self.help_max,
                 _ => {}
             },
+            Mode::Menu(mut m) => match k.code {
+                KeyCode::Up | KeyCode::BackTab if !m.items.is_empty() => {
+                    m.sel = (m.sel + m.items.len() - 1) % m.items.len();
+                    self.mode = Mode::Menu(m);
+                }
+                KeyCode::Down | KeyCode::Tab if !m.items.is_empty() => {
+                    m.sel = (m.sel + 1) % m.items.len();
+                    self.mode = Mode::Menu(m);
+                }
+                KeyCode::Enter | KeyCode::Char(' ') => match m.items.get(m.sel) {
+                    Some(item) => self.menu_pick(item.action),
+                    None => self.mode = Mode::Normal,
+                },
+                // An entry's own key picks it.
+                KeyCode::Char(c) if m.items.iter().any(|i| i.key == c.to_string()) => {
+                    let item = m.items.iter().find(|i| i.key == c.to_string()).unwrap();
+                    self.menu_pick(item.action);
+                }
+                _ => self.mode = Mode::Normal,
+            },
             Mode::Confirm(c) => match (k.code, &c.purpose) {
                 (KeyCode::Char('y'), _) => self.confirmed(c),
                 // Deleting a routine with runs: `r` takes its runs along.
@@ -1713,7 +1766,162 @@ impl App {
         }
     }
 
+    /// A right click on a row of a list selects it and opens its menu; a
+    /// right click while a menu is open closes it.
+    pub fn right_click(&mut self, x: u16, y: u16) {
+        if matches!(self.mode, Mode::Menu(_)) {
+            self.mode = Mode::Normal;
+            return;
+        }
+        if !matches!(self.mode, Mode::Normal) || self.form.is_some() || self.editor.is_some() {
+            return;
+        }
+        let row = self.hits.iter().rev().find_map(|(r, h)| match h {
+            Hit::Row(i) if x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height => {
+                Some(*i)
+            }
+            _ => None,
+        });
+        let Some(i) = row else { return };
+        *self.cursor() = i;
+        let items = self.menu_items();
+        if !items.is_empty() {
+            self.mode = Mode::Menu(Menu {
+                x,
+                y,
+                items,
+                sel: 0,
+            });
+        }
+    }
+
+    /// What the menu offers for the row under the cursor.
+    fn menu_items(&self) -> Vec<MenuItem> {
+        let item = |label: &str, key: &'static str, action: MenuAction| MenuItem {
+            label: label.into(),
+            key,
+            action,
+            danger: false,
+        };
+        let mut v = Vec::new();
+        if let Some(r) = self.selected_routine() {
+            v.push(item("Edit", "⏎", MenuAction::Key('\n')));
+            v.push(item(
+                if r.is_shell() {
+                    "Write the command"
+                } else {
+                    "Write the prompt"
+                },
+                "p",
+                MenuAction::Key('p'),
+            ));
+            if !r.approved && !r.unreadable {
+                v.push(item("Approve…", "a", MenuAction::Key('a')));
+            } else {
+                v.push(item("Run now…", "r", MenuAction::Key('r')));
+            }
+            v.push(item(
+                if r.file.enabled {
+                    "Switch off"
+                } else {
+                    "Switch on"
+                },
+                "space",
+                MenuAction::Key(' '),
+            ));
+            v.push(item("Copy", "c", MenuAction::Key('c')));
+            if let Some(run) = self.latest_run(&r.id) {
+                if !run.tab_closed && run.cron_pid == 0 {
+                    v.push(item("Go to the last run's tab", "o", MenuAction::Key('o')));
+                }
+                v.push(item("Output of the last run", "l", MenuAction::Key('l')));
+                v.push(item("Its runs", "h", MenuAction::Key('h')));
+            }
+            v.push(MenuItem {
+                danger: true,
+                ..item("Delete…", "d", MenuAction::Key('d'))
+            });
+        } else if self.selected_cron_job().is_some() {
+            use crate::crontab::Take;
+            v.push(item(
+                "Keep as cron job, manage it here",
+                "k",
+                MenuAction::Take(Take::KeepCron),
+            ));
+            v.push(item("Move to Herdr", "m", MenuAction::Take(Take::ToHerdr)));
+            v.push(item(
+                "Copy to Herdr, switched off",
+                "c",
+                MenuAction::Take(Take::Copy),
+            ));
+        } else if let (View::Runs, Some(run)) = (self.view, self.runs.get(self.sel_run)) {
+            let open = !run.tab_closed && run.cron_pid == 0 && !run.pane_id.is_empty();
+            v.push(item(
+                if open {
+                    "Go to its tab"
+                } else {
+                    "Show its output"
+                },
+                "⏎",
+                MenuAction::Key('\n'),
+            ));
+            if open {
+                v.push(item("Show its output", "l", MenuAction::Key('l')));
+            }
+            v.push(item("Open the output file", "f", MenuAction::Key('f')));
+            v.push(item(
+                if self.run_filter.is_some() {
+                    "All runs"
+                } else {
+                    "Only this routine's runs"
+                },
+                "h",
+                MenuAction::Key('h'),
+            ));
+            if !run.status.active() {
+                v.push(MenuItem {
+                    danger: true,
+                    ..item("Delete this run…", "d", MenuAction::Key('d'))
+                });
+            }
+        }
+        v
+    }
+
+    /// Does what a menu entry says.
+    fn menu_pick(&mut self, action: MenuAction) {
+        self.mode = Mode::Normal;
+        match action {
+            MenuAction::Key(c) => {
+                let code = match c {
+                    '\n' => KeyCode::Enter,
+                    c => KeyCode::Char(c),
+                };
+                self.key(KeyEvent::new(code, KeyModifiers::NONE));
+            }
+            MenuAction::Take(how) => {
+                if let Some(job) = self.selected_cron_job().cloned() {
+                    self.import_cron(vec![job], how);
+                }
+            }
+        }
+    }
+
     fn click(&mut self, x: u16, y: u16) {
+        // Outside an open menu, a click only closes it.
+        if matches!(self.mode, Mode::Menu(_)) {
+            let on_menu = self.hits.iter().any(|(r, h)| {
+                matches!(h, Hit::MenuRow(_))
+                    && x >= r.x
+                    && x < r.x + r.width
+                    && y >= r.y
+                    && y < r.y + r.height
+            });
+            if !on_menu {
+                self.mode = Mode::Normal;
+                return;
+            }
+        }
         let Some((rect, hit)) = self
             .hits
             .iter()
@@ -1799,6 +2007,13 @@ impl App {
                     }
                 }
             }
+            Hit::MenuRow(i) => {
+                if let Mode::Menu(m) = self.mode.clone() {
+                    if let Some(item) = m.items.get(i) {
+                        self.menu_pick(item.action);
+                    }
+                }
+            }
             Hit::Link => {
                 self.mode = Mode::Normal;
                 if (self.opener)(OPENER, env!("CARGO_PKG_REPOSITORY")) {
@@ -1842,6 +2057,7 @@ impl App {
             Event::Paste(text) => self.paste(&text),
             Event::Mouse(m) => match m.kind {
                 MouseEventKind::Down(MouseButton::Left) => self.click(m.column, m.row),
+                MouseEventKind::Down(MouseButton::Right) => self.right_click(m.column, m.row),
                 MouseEventKind::Drag(MouseButton::Left) => self.drag(m.column, m.row),
                 MouseEventKind::ScrollDown => self.wheel(1),
                 MouseEventKind::ScrollUp => self.wheel(-1),
@@ -2498,6 +2714,60 @@ mod tests {
         assert!(lines
             .iter()
             .any(|l| l.contains("Runs in") && l.contains("‹ Cron ›")));
+    }
+
+    #[test]
+    fn a_right_click_opens_the_rows_menu() {
+        let mut a = app("menu");
+        screen(&mut a, 110, 34);
+        let row = |a: &App, i: usize| {
+            a.hits
+                .iter()
+                .find_map(|(r, h)| (*h == Hit::Row(i)).then_some(*r))
+                .unwrap()
+        };
+        let second = row(&a, 1);
+        a.right_click(second.x + 4, second.y);
+        assert_eq!(a.sel_routine, 1, "the row is selected");
+        let Mode::Menu(m) = a.mode.clone() else {
+            panic!("no menu");
+        };
+        let labels: Vec<&str> = m.items.iter().map(|i| i.label.as_str()).collect();
+        assert!(labels.contains(&"Edit") && labels.contains(&"Copy"));
+        assert!(m.items.last().unwrap().danger, "delete comes last, in red");
+        let lines = screen(&mut a, 110, 34);
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("Switch off") && l.contains("space")));
+        // Clicking an entry does what its key does.
+        let copy = m.items.iter().position(|i| i.label == "Copy").unwrap();
+        let at = a
+            .hits
+            .iter()
+            .find_map(|(r, h)| (*h == Hit::MenuRow(copy)).then_some(*r))
+            .unwrap();
+        let before = a.routines.len();
+        a.click(at.x + 1, at.y);
+        assert_eq!(a.routines.len(), before + 1, "{:?}", a.flash);
+        assert!(matches!(a.mode, Mode::Normal));
+        // A click elsewhere only closes it; so does Esc.
+        screen(&mut a, 110, 34);
+        let first = row(&a, 0);
+        a.right_click(first.x + 4, first.y);
+        a.click(0, 0);
+        assert!(matches!(a.mode, Mode::Normal));
+        a.right_click(first.x + 4, first.y);
+        press(&mut a, KeyCode::Esc);
+        assert!(matches!(a.mode, Mode::Normal));
+        // Runs have their own entries.
+        press(&mut a, KeyCode::Char('3'));
+        screen(&mut a, 110, 34);
+        let run = row(&a, 0);
+        a.right_click(run.x + 4, run.y);
+        let Mode::Menu(m) = a.mode.clone() else {
+            panic!("no menu on a run");
+        };
+        assert!(m.items.iter().any(|i| i.label == "Open the output file"));
     }
 
     #[test]

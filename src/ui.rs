@@ -55,6 +55,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Mode::Message { title, lines } => draw_message(frame, app, &title, &lines),
         Mode::Log(l) => draw_log(frame, app, l),
         Mode::Cron(jobs) => draw_cron(frame, app, &jobs),
+        Mode::Menu(m) => draw_menu(frame, app, &m),
         Mode::Normal | Mode::AskQuit => {}
     }
 }
@@ -1543,6 +1544,55 @@ fn hints(spans: &[(&'static str, &'static str)]) -> Line<'static> {
     Line::from(out)
 }
 
+/// The right-click menu, at the mouse and moved inside the screen: each
+/// entry with the key that does the same on the right.
+fn draw_menu(frame: &mut Frame, app: &mut App, m: &crate::app::Menu) {
+    let screen = frame.area();
+    let label_w = m.items.iter().map(|i| i.label.width()).max().unwrap_or(0);
+    let key_w = m.items.iter().map(|i| i.key.width()).max().unwrap_or(0);
+    let width = ((label_w + key_w + 7) as u16).min(screen.width);
+    let height = (m.items.len() as u16 + 2).min(screen.height);
+    let x = m.x.min(screen.x + screen.width.saturating_sub(width));
+    let y = m.y.min(screen.y + screen.height.saturating_sub(height));
+    let area = Rect::new(x, y, width, height);
+    frame.render_widget(Clear, area);
+    let block = Block::new()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(ACCENT));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    for (i, item) in m.items.iter().enumerate().take(inner.height as usize) {
+        let row = Rect::new(inner.x, inner.y + i as u16, inner.width, 1);
+        let selected = i == m.sel;
+        if selected {
+            frame.render_widget(Block::new().style(Style::new().bg(SELECTED_BG)), row);
+        }
+        let color = if item.danger {
+            RED
+        } else if selected {
+            TEXT
+        } else {
+            MUTED
+        };
+        let gap = (inner.width as usize).saturating_sub(item.label.width() + item.key.width() + 2);
+        let line = Line::from(vec![
+            Span::styled(
+                format!(" {}", item.label),
+                if selected {
+                    bold(color)
+                } else {
+                    Style::new().fg(color)
+                },
+            ),
+            Span::raw(" ".repeat(gap)),
+            Span::styled(format!("{} ", item.key), Style::new().fg(FAINT)),
+        ]);
+        frame.render_widget(Paragraph::new(line), row);
+        app.hits.push((row, Hit::MenuRow(i)));
+    }
+}
+
 fn draw_picker(frame: &mut Frame, app: &mut App, p: &crate::app::Picker) {
     // Details on a line of their own, except in long lists (the agents),
     // where they follow the name.
@@ -2069,7 +2119,10 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
             &[
                 ("↑ ↓  j k", "move"),
                 ("← →  Tab  1 2 3", "routines / cron jobs / runs"),
-                ("Mouse", "click to choose, double click to open"),
+                (
+                    "Mouse",
+                    "click to choose, double click to open, right click for a menu",
+                ),
                 (
                     "S",
                     "all routines and cron jobs on or off (or click \"routines\" at the top)",
