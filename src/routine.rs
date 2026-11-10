@@ -471,7 +471,10 @@ impl Routine {
     /// Deletes a routine folder. A folder with an invalid name (shown in the
     /// list with its problem) can be deleted too, as long as the name is one
     /// plain folder inside the routines folder.
-    pub fn delete(paths: &Paths, id: &str) -> Result<(), String> {
+    /// `with_runs`: its run history goes too; otherwise the runs stay in
+    /// Runs (marked as of a deleted routine) until deleted with another
+    /// routine's history or by hand.
+    pub fn delete(paths: &Paths, id: &str, with_runs: bool) -> Result<(), String> {
         use std::path::Component;
         let mut parts = std::path::Path::new(id).components();
         if !matches!(
@@ -482,7 +485,9 @@ impl Routine {
         }
         std::fs::remove_dir_all(paths.routine_dir(id)).map_err(|e| e.to_string())?;
         if valid_id(id) {
-            let _ = std::fs::remove_dir_all(paths.runs_dir(id));
+            if with_runs {
+                let _ = std::fs::remove_dir_all(paths.runs_dir(id));
+            }
             let _ = std::fs::remove_file(crate::runner::memory_file(paths, id));
         }
         approval::forget(paths, id);
@@ -560,7 +565,9 @@ pub fn new_id(paths: &Paths, name: &str) -> String {
     };
     let mut id = base.clone();
     let mut n = 2;
-    while paths.routine_dir(&id).exists() {
+    // Kept runs of a deleted routine keep its id: a new routine never
+    // takes it over.
+    while paths.routine_dir(&id).exists() || paths.runs_dir(&id).exists() {
         id = format!("{base}-{n}");
         n += 1;
     }
@@ -674,7 +681,7 @@ mod tests {
         assert_eq!(back.prompt, r.prompt);
         assert_eq!(back.problem, None);
         assert_eq!(load_all(&p).len(), 1);
-        Routine::delete(&p, "morning-report").unwrap();
+        Routine::delete(&p, "morning-report", true).unwrap();
         assert!(load_all(&p).is_empty());
     }
 
@@ -727,7 +734,7 @@ mod tests {
         raised.save(&p).unwrap();
         assert!(!load_all(&p)[0].approved);
         // Deleting forgets the approval.
-        Routine::delete(&p, "morning-report").unwrap();
+        Routine::delete(&p, "morning-report", true).unwrap();
         assert!(Approvals::load(&p).0.is_empty());
     }
 
@@ -762,9 +769,9 @@ mod tests {
         let all = load_all(&p);
         assert!(all[0].unreadable && all[0].problem.is_some());
         assert!(Routine::load(&p, "../../etc").is_err());
-        assert!(Routine::delete(&p, "..").is_err());
-        assert!(Routine::delete(&p, "/tmp").is_err());
-        Routine::delete(&p, "My_Routine").unwrap();
+        assert!(Routine::delete(&p, "..", true).is_err());
+        assert!(Routine::delete(&p, "/tmp", true).is_err());
+        Routine::delete(&p, "My_Routine", true).unwrap();
     }
 
     #[test]

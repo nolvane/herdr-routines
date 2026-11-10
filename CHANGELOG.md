@@ -50,6 +50,8 @@ All notable changes to this plugin. The format follows
 - The lists have no empty row between routines or runs any more; the form
   has one after each part and above the footer.
 - "scheduler on/off" at the top is now "routines on/off".
+- Deleting a routine asks whether its runs stay (they show in Runs as of a
+  deleted routine) or go too; `d` in Runs deletes a single run.
 - Extra arguments may no longer set permissions for Claude Code, Codex or
   Gemini; use the permission mode.
 - Routine folder names must be lower case letters, digits and dashes.

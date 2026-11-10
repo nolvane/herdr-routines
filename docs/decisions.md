@@ -426,6 +426,19 @@ user's machine at install time. `rust-version = "1.89"` in `Cargo.toml`
 names the oldest Rust that builds it (`File::lock` came in 1.89), so an
 older toolchain fails with a clear message.
 
+## 2026-11-10: Runs can outlive their routine
+
+Deleting a routine with runs offers two buttons: "delete, keep runs" (`y`,
+the first one) and "delete with runs" (`r`). Kept runs stay in their
+folder, show in Runs as "deleted routine", can still be filtered with `h`,
+and are deleted one by one with `d` in Runs; they are no longer pruned.
+`new_id` skips ids that still have runs, so a new routine of the same name
+never takes them over. The routine's memory file goes either way.
+
+Why: the runs are the record of what happened (outputs, results), which
+can matter after the routine itself is gone; deleting them stays one key
+away.
+
 ## 2026-11-10: Classic cron jobs through the crontab
 
 A shell routine can run from the system's crontab (`runs_in = "cron"`)

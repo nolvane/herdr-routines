@@ -150,7 +150,10 @@ pub struct Input {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConfirmFor {
     Run(String),
-    Delete(String),
+    /// A routine; true when it has runs (then `r` deletes them too).
+    Delete(String, bool),
+    /// One run: routine id and run id.
+    DeleteRun(String, String),
     DiscardForm,
     Autostart,
     AutostartOff,
@@ -342,8 +345,12 @@ impl App {
     pub fn reload(&mut self) {
         self.routines = routine::load_all(&self.paths);
         self.all_runs = store::all_runs(&self.paths);
+        // A filter stays while its routine or any of its runs is there
+        // (runs can outlive a deleted routine).
         if let Some(id) = &self.run_filter {
-            if !self.routines.iter().any(|r| &r.id == id) {
+            if !self.routines.iter().any(|r| &r.id == id)
+                && !self.all_runs.iter().any(|r| &r.routine_id == id)
+            {
                 self.run_filter = None;
             }
         }
@@ -488,6 +495,12 @@ impl App {
             .iter()
             .find(|r| &r.id == id)
             .map(|r| r.file.name.as_str())
+            .or_else(|| {
+                self.all_runs
+                    .iter()
+                    .find(|r| &r.routine_id == id)
+                    .map(|r| r.routine_name.as_str())
+            })
     }
 
     // ---- actions ----------------------------------------------------------
@@ -1022,17 +1035,40 @@ impl App {
         self.reload();
     }
 
+    fn delete_routine(&mut self, id: &str, with_runs: bool) {
+        let had_runs = self.run_count(id) > 0;
+        match Routine::delete(&self.paths, id, with_runs) {
+            Ok(()) if had_runs && !with_runs => {
+                self.flash("Deleted; its runs stay in Runs", ACCENT)
+            }
+            Ok(()) => self.flash("Deleted", ACCENT),
+            Err(e) => self.flash(e, RED),
+        }
+        self.sync_cron();
+        self.reload();
+    }
+
     fn ask_delete(&mut self) {
         let Some(r) = self.selected_routine().cloned() else {
             return;
         };
+        let runs = self.run_count(&r.id);
+        let mut lines =
+            vec!["The routine and its prompt go. Tabs of runs still open stay.".to_string()];
+        if runs > 0 {
+            lines.push(format!(
+                "Its {} stay in Runs (y), or go too (r).",
+                if runs == 1 {
+                    "run".to_string()
+                } else {
+                    format!("{runs} runs")
+                }
+            ));
+        }
         self.mode = Mode::Confirm(Confirm {
             question: format!("Delete {}?", r.file.name),
-            lines: vec![
-                "The routine, its prompt and its run history go. Tabs of runs still open stay."
-                    .into(),
-            ],
-            purpose: ConfirmFor::Delete(r.id),
+            lines,
+            purpose: ConfirmFor::Delete(r.id, runs > 0),
         });
     }
 
@@ -1129,12 +1165,17 @@ impl App {
                 }
             }
             ConfirmFor::Run(id) => self.fire(&id),
-            ConfirmFor::Delete(id) => {
-                match Routine::delete(&self.paths, &id) {
-                    Ok(()) => self.flash("Deleted", ACCENT),
-                    Err(e) => self.flash(e, RED),
+            ConfirmFor::Delete(id, _) => self.delete_routine(&id, false),
+            ConfirmFor::DeleteRun(routine_id, run_id) => {
+                if let Some(run) = self
+                    .all_runs
+                    .iter()
+                    .find(|r| r.routine_id == routine_id && r.id == run_id)
+                    .cloned()
+                {
+                    store::remove(&self.paths, &run);
+                    self.flash("Run deleted", ACCENT);
                 }
-                self.sync_cron();
                 self.reload();
             }
             ConfirmFor::DiscardForm => self.form = None,
@@ -1352,8 +1393,14 @@ impl App {
                 KeyCode::End | KeyCode::Char('G') => self.help_scroll = self.help_max,
                 _ => {}
             },
-            Mode::Confirm(c) => match k.code {
-                KeyCode::Char('y') => self.confirmed(c),
+            Mode::Confirm(c) => match (k.code, &c.purpose) {
+                (KeyCode::Char('y'), _) => self.confirmed(c),
+                // Deleting a routine with runs: `r` takes its runs along.
+                (KeyCode::Char('r'), ConfirmFor::Delete(id, true)) => {
+                    let id = id.clone();
+                    self.mode = Mode::Normal;
+                    self.delete_routine(&id, true);
+                }
                 _ => self.mode = Mode::Normal,
             },
             // A long list: typing narrows it, Backspace widens it again.
@@ -1568,6 +1615,21 @@ impl App {
             KeyCode::Char('f') if self.view == View::Runs => {
                 if let Some(run) = self.runs.get(self.sel_run).cloned() {
                     self.open_output_file(&run);
+                }
+            }
+            KeyCode::Char('d') | KeyCode::Delete if self.view == View::Runs => {
+                if let Some(run) = self.runs.get(self.sel_run).cloned() {
+                    if run.status.active() {
+                        self.flash("It is still running", MUTED);
+                    } else {
+                        self.mode = Mode::Confirm(Confirm {
+                            question: format!("Delete this run of {}?", run.routine_name),
+                            lines: vec![
+                                "Its record, output and result go. An open tab stays.".into()
+                            ],
+                            purpose: ConfirmFor::DeleteRun(run.routine_id, run.id),
+                        });
+                    }
                 }
             }
             KeyCode::Char('?') => {
@@ -2436,6 +2498,61 @@ mod tests {
         assert!(lines
             .iter()
             .any(|l| l.contains("Runs in") && l.contains("‹ Cron ›")));
+    }
+
+    #[test]
+    fn deleting_a_routine_keeps_its_runs_unless_asked() {
+        let mut a = app("delete");
+        let name = |a: &App| a.selected_routine().unwrap().file.name.clone();
+        a.sel_routine = a
+            .routines
+            .iter()
+            .position(|r| r.file.name == "Morning report")
+            .unwrap();
+        let id = a.selected_routine().unwrap().id.clone();
+        assert_eq!(name(&a), "Morning report");
+        assert!(a.run_count(&id) > 0, "the fixture has a run");
+        // The fixture's run is still starting; an ended one can be deleted.
+        for mut run in store::runs_of(&a.paths, &id) {
+            run.finish(store::Status::Finished, "");
+            run.save(&a.paths).unwrap();
+        }
+        a.reload();
+        press(&mut a, KeyCode::Char('d'));
+        let lines = screen(&mut a, 100, 30);
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("y delete, keep runs") && l.contains("r delete with runs")));
+        press(&mut a, KeyCode::Char('y'));
+        assert!(!a.routines.iter().any(|r| r.id == id));
+        assert!(a.run_count(&id) > 0, "its runs stay");
+        // They show as runs of a deleted routine, and `h` still filters.
+        press(&mut a, KeyCode::Char('3'));
+        let lines = screen(&mut a, 120, 30);
+        assert!(lines.iter().any(|l| l.contains("deleted routine")));
+        a.sel_run = a.runs.iter().position(|r| r.routine_id == id).unwrap();
+        press(&mut a, KeyCode::Char('h'));
+        assert_eq!(a.run_filter.as_deref(), Some(id.as_str()));
+        assert_eq!(a.filter_name(), Some("Morning report"));
+        // A new routine of the same name does not take the old runs over.
+        assert_ne!(routine::new_id(&a.paths, "Morning report"), id);
+        // A kept run can be deleted on its own.
+        press(&mut a, KeyCode::Char('d'));
+        press(&mut a, KeyCode::Char('y'));
+        assert_eq!(a.run_count(&id), 0);
+
+        // With `r`, the runs go too.
+        let mut b = app("delete-runs");
+        b.sel_routine = b
+            .routines
+            .iter()
+            .position(|r| r.file.name == "Morning report")
+            .unwrap();
+        let id = b.selected_routine().unwrap().id.clone();
+        press(&mut b, KeyCode::Char('d'));
+        press(&mut b, KeyCode::Char('r'));
+        assert!(!b.routines.iter().any(|r| r.id == id));
+        assert_eq!(b.run_count(&id), 0);
     }
 
     #[test]

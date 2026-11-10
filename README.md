@@ -186,7 +186,7 @@ Update with `herdr plugin update`.
 | `o` | Go to the tab of the last run |
 | `l` | Result and output of the last run |
 | `h` | Only this routine's runs (`Esc` shows all again) |
-| `d` | Delete with its run history (asks first) |
+| `d` | Delete; asks whether its runs stay in Runs or go too (in Runs: delete the run) |
 | `←` `→` `1` `2` `3` | Switch between routines, cron jobs and runs |
 | `S` | All routines and cron jobs on or off (asks first) |
 | `A` | Start Herdr at login, or not any more (asks first) |

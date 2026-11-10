@@ -277,10 +277,17 @@ pub fn all_runs(paths: &Paths) -> Vec<Run> {
 pub fn prune(paths: &Paths, routine_id: &str, keep: usize) {
     let runs = runs_of(paths, routine_id);
     for run in runs.iter().skip(keep).filter(|r| !r.status.active()) {
-        for ext in ["json", "log", "sh", "run", "exit", "out", "prompt"] {
-            let _ = std::fs::remove_file(run.file(paths, ext));
-        }
+        remove(paths, run);
     }
+}
+
+/// Deletes a run's record and files; the folder goes with its last run.
+pub fn remove(paths: &Paths, run: &Run) {
+    for ext in ["json", "log", "sh", "run", "exit", "out", "prompt"] {
+        let _ = std::fs::remove_file(run.file(paths, ext));
+    }
+    // Only empties: `remove_dir` refuses a folder with files left.
+    let _ = std::fs::remove_dir(paths.runs_dir(&run.routine_id));
 }
 
 /// When each routine was last checked for due times.

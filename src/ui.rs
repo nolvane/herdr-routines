@@ -850,6 +850,10 @@ fn draw_runs(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
                     NCol::Mark => Text::from(Span::styled(icon, Style::new().fg(color))),
                     NCol::Run => {
                         let mut first = vec![Span::styled(run.routine_name.clone(), bold(TEXT))];
+                        // Runs kept when their routine was deleted.
+                        if !app.routines.iter().any(|r| r.id == run.routine_id) {
+                            first.push(Span::styled("  deleted routine", Style::new().fg(FAINT)));
+                        }
                         let open = !run.tab_closed
                             && !run.pane_id.is_empty()
                             && run.status != crate::store::Status::Closed;
@@ -1705,23 +1709,41 @@ fn draw_confirm(frame: &mut Frame, app: &mut App, c: &crate::app::Confirm) {
         ),
     );
     let y = inner.y + inner.height.saturating_sub(1);
+    // Deleting a routine with runs: keep them (y) or delete them too (r).
+    let with_runs = matches!(c.purpose, crate::app::ConfirmFor::Delete(_, true));
+    let mut buttons: Vec<(String, char, Style)> = vec![(
+        if with_runs {
+            " y delete, keep runs ".into()
+        } else {
+            " y yes ".into()
+        },
+        'y',
+        Style::new()
+            .fg(theme::on(GREEN))
+            .bg(GREEN)
+            .add_modifier(Modifier::BOLD),
+    )];
+    if with_runs {
+        buttons.push((
+            " r delete with runs ".into(),
+            'r',
+            Style::new().fg(TEXT).bg(BORDER),
+        ));
+    }
+    buttons.push((" n no ".into(), 'n', Style::new().fg(TEXT).bg(BORDER)));
+    let mut spans = Vec::new();
+    let mut x = inner.x;
+    for (text, key, style) in buttons {
+        let w = text.width() as u16;
+        app.hits.push((Rect::new(x, y, w, 1), Hit::Key(key)));
+        x += w + 1;
+        spans.push(Span::styled(text, style));
+        spans.push(Span::raw(" "));
+    }
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                " y yes ",
-                Style::new()
-                    .fg(theme::on(GREEN))
-                    .bg(GREEN)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" "),
-            Span::styled(" n no ", Style::new().fg(TEXT).bg(BORDER)),
-        ])),
+        Paragraph::new(Line::from(spans)),
         Rect::new(inner.x, y, inner.width, 1),
     );
-    app.hits.push((Rect::new(inner.x, y, 7, 1), Hit::Key('y')));
-    app.hits
-        .push((Rect::new(inner.x + 8, y, 6, 1), Hit::Key('n')));
 }
 
 fn draw_message(frame: &mut Frame, app: &mut App, title: &str, text: &[String]) {
@@ -2005,7 +2027,7 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
                 ("o", "go to the tab of its last run"),
                 ("l", "result and output of its last run"),
                 ("h", "its runs (or click \"n runs\")"),
-                ("d", "delete (asks first)"),
+("d", "delete (asks: keep its runs, or delete them too)"),
             ],
         ),
         (
@@ -2015,6 +2037,7 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
                 ("l", "result and output of the run"),
                 ("f", "open the output file"),
                 ("h", "only this routine's runs; Esc shows all"),
+                ("d", "delete the run (asks first)"),
             ],
         ),
         (
