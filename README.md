@@ -114,6 +114,10 @@ window, the selected routine's details show under the list.
   run carries on. This also covers questions before the agent is ready, such
   as Claude asking whether to trust a new folder: the prompt goes in once
   you answered.
+- **Notification or popup** per routine ("Tell me by"): Herdr's usual
+  notification, a popup in Herdr that stays in front until you press OK
+  when a run fails, runs too long or needs you, or such a popup also when
+  a run finishes. The popup can take you to the run's tab.
 - **Missed times:** when Herdr or the computer was off or asleep at the
   time, each routine either runs once afterwards or skips to its next time,
   as you set it per routine.

@@ -184,6 +184,7 @@ pub fn routine_for(job: &CronJob, enabled: bool) -> (RoutineFile, String) {
         retry_delay_minutes: 10,
         check_command: String::new(),
         remember: false,
+        alert: Default::default(),
     };
     (file, script)
 }

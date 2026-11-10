@@ -500,6 +500,7 @@ mod tests {
                 retry_delay_minutes: 10,
                 check_command: String::new(),
                 remember: false,
+                alert: Default::default(),
             },
             prompt: "go".into(),
             problem: None,

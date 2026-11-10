@@ -1,7 +1,7 @@
 //! The form to create or change a routine.
 
 use crate::agent;
-use crate::routine::{Missed, Routine, RoutineFile, AGENTS, SHELL};
+use crate::routine::{Alert, Missed, Routine, RoutineFile, AGENTS, SHELL};
 use crate::schedule::{Schedule, AT_START};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,6 +99,7 @@ pub enum Field {
     Limit,
     AtLimit,
     Retry,
+    Alert,
     Check,
     Remember,
     Args,
@@ -126,6 +127,7 @@ impl Field {
             Field::Limit => "Time limit",
             Field::AtLimit => "At the time limit",
             Field::Retry => "If it fails",
+            Field::Alert => "Tell me by",
             Field::Check => "Check first",
             Field::Remember => "Earlier results",
             Field::Args => "Extra options",
@@ -163,6 +165,7 @@ impl Field {
                 | Field::Enabled
                 | Field::AtLimit
                 | Field::Retry
+                | Field::Alert
                 | Field::Remember
         )
     }
@@ -197,6 +200,9 @@ impl Field {
             }
             Field::Retry => {
                 "When a run fails (a command ends with an error, an agent does not start), it can be tried again a little later."
+            }
+            Field::Alert => {
+                "How you hear about a run. Notification: Herdr's usual notification when it fails, runs too long or needs you. Popup on problems: a window in Herdr that stays in front until you press OK. Popup always: also when a run finishes."
             }
             Field::Check => {
                 "Optional: a shell command run first in the folder. If it ends without an error, the agent starts and gets its output; otherwise the run is recorded as \"Nothing to do\". Example: git fetch -q && git log --oneline HEAD..@{u}"
@@ -264,6 +270,7 @@ pub struct Form {
     pub stop_at_limit: bool,
     pub retries: u32,
     pub retry_delay: u32,
+    pub alert: Alert,
     pub check: String,
     pub remember: bool,
     pub enabled: bool,
@@ -298,6 +305,7 @@ impl Form {
             stop_at_limit: false,
             retries: 0,
             retry_delay: 10,
+            alert: Alert::default(),
             check: String::new(),
             remember: false,
             enabled: true,
@@ -341,6 +349,7 @@ impl Form {
         f.stop_at_limit = r.file.stop_at_limit;
         f.retries = r.file.retries;
         f.retry_delay = r.file.retry_delay_minutes;
+        f.alert = r.file.alert;
         f.check = r.file.check_command.clone();
         f.remember = r.file.remember;
         f.enabled = r.file.enabled;
@@ -406,7 +415,13 @@ impl Form {
         if self.repeat != Repeat::AtStart {
             v.push(Field::Missed);
         }
-        v.extend([Field::Enabled, Field::Limit, Field::AtLimit, Field::Retry]);
+        v.extend([
+            Field::Enabled,
+            Field::Limit,
+            Field::AtLimit,
+            Field::Retry,
+            Field::Alert,
+        ]);
         if !self.is_shell() {
             v.extend([Field::Check, Field::Remember, Field::Args]);
         }
@@ -432,7 +447,9 @@ impl Form {
             | Field::Cron
             | Field::Missed
             | Field::Enabled => "Schedule",
-            Field::Limit | Field::AtLimit | Field::Retry => "If it runs long or fails",
+            Field::Limit | Field::AtLimit | Field::Retry | Field::Alert => {
+                "Time limit, retries and alerts"
+            }
             Field::Check | Field::Remember | Field::Args => "Agent extras",
             Field::Prompt => "What to do",
             Field::Save => "",
@@ -515,6 +532,7 @@ impl Form {
             Field::AtLimit => if self.stop_at_limit { "stop" } else { "keep" }.into(),
             Field::Retry => format!("{}:{}", self.retries, self.retry_delay),
             Field::Remember => if self.remember { "Yes" } else { "No" }.into(),
+            Field::Alert => self.alert.label().into(),
             _ => String::new(),
         }
     }
@@ -589,6 +607,10 @@ impl Form {
             Field::Missed => [Missed::RunOnce, Missed::Skip]
                 .iter()
                 .map(|m| item(m.label(), m.label(), m.detail()))
+                .collect(),
+            Field::Alert => Alert::ALL
+                .iter()
+                .map(|a| item(a.label(), a.label(), a.detail()))
                 .collect(),
             Field::Enabled => vec![
                 item("Yes", "Yes", "Runs on its schedule"),
@@ -692,6 +714,11 @@ impl Form {
                 }
             }
             Field::Remember => self.remember = value == "Yes",
+            Field::Alert => {
+                if let Some(a) = Alert::ALL.iter().find(|a| a.label() == value) {
+                    self.alert = *a;
+                }
+            }
             _ => return,
         }
         self.dirty = true;
@@ -778,6 +805,7 @@ impl Form {
                 self.check.trim().to_string()
             },
             remember: self.remember && !self.is_shell(),
+            alert: self.alert,
         };
         if let Some(problem) = Routine::check(&file, &self.prompt) {
             return Err(problem);
@@ -1040,7 +1068,12 @@ mod tests {
         f.choose(Field::AtLimit, "stop");
         f.choose(Field::Remember, "Yes");
         f.check = "test -f new.txt".into();
+        f.choose(Field::Alert, Alert::PopupOnProblems.label());
         let (file, _) = f.build().unwrap();
+        assert_eq!(file.alert, Alert::PopupOnProblems);
+        let text = toml::to_string(&file).unwrap();
+        assert!(text.contains("alert = \"popup-on-problems\""));
+        assert!(file.alert.popup(true) && !file.alert.popup(false));
         assert_eq!(file.schedule, "@once 2026-12-24 08:15");
         assert_eq!((file.retries, file.retry_delay_minutes), (2, 10));
         assert!(file.stop_at_limit && file.remember);
@@ -1061,6 +1094,7 @@ mod tests {
         );
         assert_eq!(back.shown(Field::Retry), "Try up to 2 more times");
         assert_eq!(back.shown(Field::AtLimit), "Stop the run");
+        assert_eq!(back.shown(Field::Alert), "Popup on problems");
         // "When Herdr starts" needs no time and no missed setting.
         f.choose(Field::Repeat, Repeat::AtStart.label());
         assert!(!f.fields().contains(&Field::Time));

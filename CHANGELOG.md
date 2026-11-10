@@ -10,6 +10,9 @@ All notable changes to this plugin. The format follows
 - `C` lists the jobs in your crontab and moves them here as shell routines
   (their lines are commented out after a backup) or copies them switched
   off.
+- "Tell me by" per routine: a notification (as before), a popup that
+  stays in front until OK when a run fails, runs too long or needs you, or
+  a popup for every run. The popup can go to the run's tab.
 - `c` copies a routine; the copy starts switched off, without runs or
   memory, and waits for approval when the original does.
 - In a tall enough window the selected routine's details show under the

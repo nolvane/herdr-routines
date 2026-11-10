@@ -258,6 +258,37 @@ pub fn focus(place: &Place) -> Result<(), Error> {
 }
 
 /// A Herdr notification. `sound` is `none`, `done` or `request`.
+/// Opens one of the plugin's panes as a popup over whatever is in front,
+/// with the focus. False when Herdr cannot.
+pub fn open_popup(entrypoint: &str, width: u16, height: u16, env: &[(&str, &str)]) -> bool {
+    let (w, h) = (width.to_string(), height.to_string());
+    let mut args: Vec<String> = [
+        "plugin",
+        "pane",
+        "open",
+        "--plugin",
+        "herdr-routines",
+        "--entrypoint",
+        entrypoint,
+        "--placement",
+        "popup",
+        "--width",
+        &w,
+        "--height",
+        &h,
+        "--focus",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    for (k, v) in env {
+        args.push("--env".into());
+        args.push(format!("{k}={v}"));
+    }
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    run(&refs).is_ok()
+}
+
 pub fn notify(title: &str, body: &str, sound: &str) {
     let _ = call(&[
         "notification",

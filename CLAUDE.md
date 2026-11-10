@@ -27,7 +27,8 @@ each run in its own tab. What it does and how users install it:
   itself. `shell.rs`: commands in the login shell with a time limit.
   `autostart.rs`: Herdr at login. `paths.rs`: where files go.
   `approval.rs`: the owner's approval of routines changed outside the
-  list.
+  list. `alert.rs`: notifications and the popup pane about a run.
+  `crontab.rs`: reading and moving the user's cron jobs.
 - `app.rs`: the list's state, keys and mouse. `ui.rs`: drawing, in the look
   of the Git Panel and Multiaccount plugins (keep them alike).
   `form.rs`: the edit form. `editor.rs`: the prompt editor. `pane.rs`: the

@@ -65,6 +65,53 @@ impl Missed {
     }
 }
 
+/// How a routine tells its owner about a run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum Alert {
+    /// A Herdr notification when a run fails, runs too long or needs you
+    /// (and when it finishes, if the settings say so).
+    #[default]
+    Notification,
+    /// A popup in Herdr that stays until it is answered, for a run that
+    /// fails, runs too long or needs you; a notification otherwise.
+    PopupOnProblems,
+    /// A popup for every ending run, also one that finished.
+    Popup,
+}
+
+impl Alert {
+    pub const ALL: [Alert; 3] = [Alert::Notification, Alert::PopupOnProblems, Alert::Popup];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Alert::Notification => "Notification",
+            Alert::PopupOnProblems => "Popup on problems",
+            Alert::Popup => "Popup always",
+        }
+    }
+
+    pub fn detail(self) -> &'static str {
+        match self {
+            Alert::Notification => "A Herdr notification when it fails or needs you",
+            Alert::PopupOnProblems => "A popup that stays until OK when it fails or needs you",
+            Alert::Popup => "A popup that stays until OK, also when it finishes",
+        }
+    }
+
+    pub fn popup(self, problem: bool) -> bool {
+        match self {
+            Alert::Notification => false,
+            Alert::PopupOnProblems => problem,
+            Alert::Popup => true,
+        }
+    }
+}
+
+fn is_notification(a: &Alert) -> bool {
+    *a == Alert::Notification
+}
+
 fn yes() -> bool {
     true
 }
@@ -128,6 +175,9 @@ pub struct RoutineFile {
     /// the state folder, updated after each run).
     #[serde(default, skip_serializing_if = "is_false")]
     pub remember: bool,
+    /// A notification, or a popup that stays until it is answered.
+    #[serde(default, skip_serializing_if = "is_notification")]
+    pub alert: Alert,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -432,6 +482,7 @@ pub fn load_all(paths: &Paths) -> Vec<Routine> {
                     retry_delay_minutes: default_retry_delay(),
                     check_command: String::new(),
                     remember: false,
+                    alert: Alert::default(),
                 },
                 prompt: String::new(),
                 problem: Some(e),
@@ -546,6 +597,7 @@ mod tests {
             retry_delay_minutes: 10,
             check_command: String::new(),
             remember: false,
+            alert: Alert::Notification,
         }
     }
 

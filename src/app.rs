@@ -1828,6 +1828,9 @@ fn approval_lines(r: &Routine) -> Vec<String> {
             if f.stop_at_limit { ", then it is stopped" } else { "" }
         ),
     ];
+    if f.alert != crate::routine::Alert::Notification {
+        lines.push(format!("Tells you by: {}", f.alert.detail()));
+    }
     if f.retries > 0 {
         lines.push(format!(
             "Retries: {} after a failure, {} minutes apart",
@@ -1900,6 +1903,7 @@ retries = 0                       # try a failed run again this many times (0-3)
 retry_delay_minutes = 10          # ...this many minutes apart
 check_command = ""                # agents only: a shell command run first; the agent starts only if it exits 0, and gets its output
 remember = false                  # agents only: each run gets the results of the last ten runs
+alert = "notification"            # "notification", "popup-on-problems" (a popup that stays until OK when a run fails, runs too long or needs me) or "popup" (also when it finishes)
 
 Instead of cron, schedule can be "@once YYYY-MM-DD HH:MM" (runs once, then the routine switches off) or "@start" (each time Herdr starts).
 
@@ -2325,7 +2329,7 @@ mod tests {
         let mut a = app("layout");
         press(&mut a, KeyCode::Char('n'));
         press(&mut a, KeyCode::Enter);
-        let lines = screen(&mut a, 90, 30);
+        let lines = screen(&mut a, 90, 34);
         let at = |s: &str| lines.iter().position(|l| l.contains(s)).unwrap();
         let prompt = at(" Prompt ");
         let save = at("⏎ save");

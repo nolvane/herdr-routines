@@ -564,6 +564,9 @@ fn draw_details(frame: &mut Frame, app: &App, icons: &Icons, r: &Routine, area: 
         1 => format!(" · retries once after {} min", f.retry_delay_minutes),
         n => format!(" · retries {n}× after {} min", f.retry_delay_minutes),
     });
+    if f.alert != crate::routine::Alert::Notification {
+        limits.push_str(&format!(" · {}", f.alert.label().to_lowercase()));
+    }
     lines.push(row("Time limit", text(clip(&limits, room))));
     if !r.is_shell() {
         let mut extras = Vec::new();

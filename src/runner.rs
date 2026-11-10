@@ -7,6 +7,7 @@
 //! `done` after having worked means finished. A shell routine runs its
 //! command in the tab instead and is done when the command ends.
 
+use crate::alert;
 use crate::herdr::{self, Place};
 use crate::paths::{self, Paths};
 use crate::routine::{Routine, Settings, SHELL};
@@ -329,7 +330,7 @@ pub fn launch(paths: &Paths, settings: &Settings, routine: &Routine, mut run: Ru
         ),
     }
     if run.status == Status::NeedsYou {
-        notify_needs_you(&mut run);
+        notify_needs_you(paths, &mut run);
     }
     let _ = run.save(paths);
     run
@@ -459,19 +460,23 @@ fn watch_shell(paths: &Paths, settings: &Settings, run: &mut Run) {
         let code = code.trim();
         if code == "0" {
             run.finish(Status::Finished, "");
-            if settings.notify_finished {
-                herdr::notify(
-                    &format!("{} finished", run.routine_name),
-                    "Open herdr-routines to see the run.",
-                    "done",
-                );
-            }
+            alert::tell(
+                paths,
+                run,
+                false,
+                &format!("{} finished", run.routine_name),
+                "Open herdr-routines to see the run.",
+                settings.notify_finished,
+            );
         } else {
             run.finish(Status::Failed, format!("Ended with exit code {code}"));
-            herdr::notify(
+            alert::tell(
+                paths,
+                run,
+                true,
                 &format!("{} failed", run.routine_name),
                 &format!("The command ended with exit code {code}. Its tab stays open."),
-                "request",
+                true,
             );
         }
     } else if !own_pane(run).unwrap_or(true) {
@@ -496,12 +501,15 @@ fn hand_over(run: &mut Run, prompt: &str) -> Result<(), herdr::Error> {
     Ok(())
 }
 
-fn notify_needs_you(run: &mut Run) {
+fn notify_needs_you(paths: &Paths, run: &mut Run) {
     if !run.notified {
-        herdr::notify(
+        alert::tell(
+            paths,
+            run,
+            true,
             &format!("{} needs you", run.routine_name),
             "The routine's agent is waiting for an answer. Open herdr-routines to jump to it.",
-            "request",
+            true,
         );
         run.notified = true;
     }
@@ -604,7 +612,7 @@ pub fn watch(paths: &Paths, settings: &Settings, run: &mut Run, routine: Option<
                 if run.message.is_empty() {
                     run.message = "The agent asks a question or waits for an approval".into();
                 }
-                notify_needs_you(run);
+                notify_needs_you(paths, run);
             }
             Some("idle") | Some("done") => {
                 if run.prompted.is_none() {
@@ -618,20 +626,21 @@ pub fn watch(paths: &Paths, settings: &Settings, run: &mut Run, routine: Option<
                 } else if run.seen_working {
                     run.finish(Status::Finished, "");
                     run.turns_at_end = Some(turns);
-                    if settings.notify_finished {
-                        herdr::notify(
-                            &format!("{} finished", run.routine_name),
-                            "Open herdr-routines to see the run.",
-                            "done",
-                        );
-                    }
+                    alert::tell(
+                        paths,
+                        run,
+                        false,
+                        &format!("{} finished", run.routine_name),
+                        "Open herdr-routines to see the run, or go to its tab to keep talking to the agent.",
+                        settings.notify_finished,
+                    );
                 } else if run
                     .prompted
                     .is_some_and(|p| now - p > Duration::minutes(PROMPT_GRACE_MINUTES))
                 {
                     run.status = Status::NeedsYou;
                     run.message = "The agent did not start on the prompt".into();
-                    notify_needs_you(run);
+                    notify_needs_you(paths, run);
                 }
             }
             // `unknown`: an agent is there but Herdr cannot tell its state.
@@ -655,20 +664,26 @@ pub fn watch(paths: &Paths, settings: &Settings, run: &mut Run, routine: Option<
             if own_pane(run).unwrap_or(false) && herdr::close_tab(&run.tab_id).is_ok() {
                 run.tab_closed = true;
             }
-            herdr::notify(
+            alert::tell(
+                paths,
+                run,
+                true,
                 &format!("{} stopped", run.routine_name),
                 &format!("The run reached its time limit of {minutes} and was stopped."),
-                "request",
+                true,
             );
         } else {
             run.finish(
                 Status::TimedOut,
                 format!("Not finished after {minutes}; the tab stays open"),
             );
-            herdr::notify(
+            alert::tell(
+                paths,
+                run,
+                true,
                 &format!("{} timed out", run.routine_name),
                 "The run is past its time limit. Its tab stays open.",
-                "request",
+                true,
             );
         }
     }

@@ -11,8 +11,10 @@
 //! - `open [overlay|split|tab]` (action) opens or closes the list as a pane
 //! - `fire <id>` starts a routine now
 //! - `routines` prints the routines and their latest run as JSON
+//! - `alert-pane` (pane) the popup about a run, for routines that ask for it
 
 mod agent;
+mod alert;
 mod app;
 mod approval;
 mod autostart;
@@ -199,6 +201,7 @@ fn main() {
             0
         }
         "run" => scheduler::run(&paths),
+        "alert-pane" => alert::pane(&paths),
         "list" => match list(paths) {
             Ok(()) => 0,
             Err(e) => {

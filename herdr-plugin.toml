@@ -22,6 +22,14 @@ title = "herdr-routines"
 placement = "overlay"
 command = ["./herdr-routines", "list"]
 
+# The popup about a run (failed, too long, needs you, finished) for routines
+# set to tell by popup. It stays until it is answered.
+[[panes]]
+id = "alert"
+title = "herdr-routines"
+placement = "overlay"
+command = ["./herdr-routines", "alert-pane"]
+
 [[actions]]
 id = "open"
 title = "herdr-routines: open or close"

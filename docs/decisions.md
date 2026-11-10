@@ -440,6 +440,23 @@ easy to undo, and a job must not run twice. The owner chose the jobs in the
 list after seeing their lines, so they need no second approval; the
 crontab is the owner's own file.
 
+## 2026-11-10: Alerts as a popup that stays
+
+A routine can tell its owner by a popup instead of a notification
+(`alert` in `routine.toml`: `notification`, `popup-on-problems` or
+`popup`). The popup is the plugin pane `alert`, opened with Herdr's
+`popup` placement over whatever is in front (`herdr plugin pane open
+--placement popup`, sized to its text, as the Multiaccount plugin does for
+its reminder). It stays until OK; "Go to its tab" loads the run record and
+uses `runner::show`, which checks the tab is still the run's own. When the
+popup cannot open (no workspace, older Herdr), the notification goes out
+instead. The texts reach the pane in one environment variable, with
+control and hidden characters removed.
+
+Why: a notification disappears after a few seconds, and a failed backup or
+a question from an agent can wait unseen for hours. A popup in Herdr, not a
+system dialog, keeps it inside the tool and needs nothing outside it.
+
 ## 2026-11-10: A copy starts off and keeps the approval state
 
 `c` copies a routine's files as they are on disk (not the list's copy) into
