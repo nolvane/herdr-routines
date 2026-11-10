@@ -442,25 +442,75 @@ away.
 ## 2026-11-10: Classic cron jobs through the crontab
 
 A shell routine can run from the system's crontab (`runs_in = "cron"`)
-instead of Herdr's scheduler. The plugin keeps one marked block in the
-crontab (`# BEGIN herdr-routines` … `# END herdr-routines`), one line per
-cron job that is on, and rewrites only that block, after a backup in
-`crontab-backups/` (last five kept), whenever such a routine is saved,
-switched, deleted or approved, and when the list opens. Each line calls
-`herdr-routines cron-run <id>` from a copy of the binary in the state
-folder (the plugin's own folder changes with every update) with the
-plugin's folders, socket and Herdr binary as variables. `cron-run` runs
-the command in the login shell, records the run like any other (a run
-record with `cron_pid` instead of a tab, which Herdr's scheduler leaves
-alone), retries, alerts, and refuses a routine that waits for approval.
-`@reboot` stands for "when the computer starts"; a single run on a date
-uses its five cron fields and switches itself off. Agents stay Herdr-only:
-an agent run needs a tab.
+instead of Herdr's scheduler. Agents stay Herdr-only: an agent run needs a
+tab.
+
+*Replaced the same day* (see "Managed cron jobs stay real crontab lines"):
+the first version kept these jobs in one marked block of the crontab that
+called `herdr-routines cron-run <id>`.
 
 Why: the owner wants to choose between a Herdr routine and a traditional
-cron job. A marked block keeps the person's own lines untouched; going
-through the plugin binary gives cron jobs the same runs, results and
-approval check as routines, which a bare crontab line could not.
+cron job.
+
+## 2026-11-10: Managed cron jobs stay real crontab lines
+
+A managed cron job is a group of lines in the crontab, at the place where
+the job was:
+
+```
+# herdr-routines: <id> (its name and runs are in the herdr-routines list)
+SHELL=<state>/bin/cron/<id>
+<when> <command>                 (or "#off <when> <command>" when off)
+SHELL=<the shell before the group, /bin/sh when none>
+```
+
+The crontab holds what cron knows (schedule, command, on or off); the
+plugin's `routine.toml` holds the rest (name, time limit, retries, alerts,
+runs kept). The list writes the group in place when a cron job is saved,
+switched, copied, approved or deleted (after a backup in
+`crontab-backups/`, last five kept), and reads the crontab back every 15
+seconds and when it opens (`crontab::pull`): a line edited by hand wins
+over the routine, a group whose routine is gone brings the routine back,
+and an approved cron job whose group is gone is switched off. A routine
+that waits for approval is not pulled; approving it writes its own
+version. Taking over a job of the crontab ("keep as cron job") leaves its
+line exactly as written and only adds the marker and the `SHELL` lines.
+A cron job's command is one line, run in the home folder (where cron runs
+it); a `%` is written as `\%`.
+
+Cron runs a job as `$SHELL -c <command>`. `SHELL` points at a link to a
+copy of the plugin binary in the state folder (the plugin's own folder
+changes with every update), named after the job. The binary sees that it
+was started from a `cron` folder with `-c` and acts as the job's wrapper:
+it reads the plugin's folders, socket and Herdr binary from `env.json`
+next to the links, runs the command with the group's previous shell,
+records the run like any other (a run record with `cron_pid` instead of a
+tab, which Herdr's scheduler leaves alone), prints the output for cron and
+returns the command's exit code (124 at the time limit), retries and
+alerts as the routine says, and skips while routines are switched off.
+When its routine is missing it still runs the command, as cron would. `r`
+in the list starts the same wrapper with the crontab's command in the
+background (`HERDR_ROUTINES_TRIGGER=manual`), in its own process group so
+closing the list does not stop it.
+
+Why: the owner wants the cron job to stay where it is and be edited in the
+list, with the extra information kept in the plugin, and its runs and
+output recorded. `SHELL` is the one place cron offers to put something
+between itself and a line without changing the line; a separate marked
+block would have moved the job and hidden it behind a plugin command.
+
+## 2026-11-10: Runs kept per routine
+
+Each routine keeps its newest `keep_runs` runs (default 30) and none older
+than `keep_days` days (default 90); 0 means no limit for either. Pruning
+happens after each run, by the scheduler for Herdr runs and by the wrapper
+for cron jobs; a run that is still going is never deleted. The form offers
+a few presets ("Keep"), and a value set by hand stays choosable. The
+global `history` setting is gone.
+
+Why: the owner wants to set per routine how long results stay; a backup
+job that runs every five minutes and a weekly review need different
+histories.
 
 ## 2026-11-10: Separate tabs for routines and cron jobs
 
@@ -477,7 +527,7 @@ them in one list made it unclear what runs where.
 The "routines on/off" chip (or `S`) switches all of them, after asking.
 Off writes `paused` in the state folder and stops the scheduler; `start`
 and `restart` then do not start one (also not when Herdr starts), and
-`cron-run` skips its times. On removes the marker and starts the
+the cron wrapper skips its times. On removes the marker and starts the
 scheduler. Each routine keeps its own on or off.
 
 Why: one place to stop everything, for example before travelling, that

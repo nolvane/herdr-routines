@@ -12,7 +12,9 @@
 //! - `fire <id>` starts a routine now
 //! - `routines` prints the routines and their latest run as JSON
 //! - `alert-pane` (pane) the popup about a run, for routines that ask for it
-//! - `cron-run <id>` (from the crontab) runs a routine set to run in cron
+//!
+//! Started as `<state>/bin/cron/<id> -c <command>` (the `SHELL` of a
+//! managed cron job in the crontab), it is that job's wrapper instead.
 
 mod agent;
 mod alert;
@@ -152,6 +154,12 @@ fn routines_json(paths: &Paths) -> String {
 }
 
 fn main() {
+    // Cron starting a managed job: run it before anything else, with no
+    // other setup, so the command runs whatever else is wrong.
+    let args: Vec<String> = std::env::args().collect();
+    if let Some((me, cmd)) = crontab::wrapper_call(&args) {
+        std::process::exit(crontab::wrapper_main(&me, &cmd));
+    }
     let command = std::env::args().nth(1).unwrap_or_else(|| "list".into());
     let paths = Paths::from_env();
     paths::secure_roots(&paths);
@@ -208,10 +216,6 @@ fn main() {
         }
         "run" => scheduler::run(&paths),
         "alert-pane" => alert::pane(&paths),
-        "cron-run" => match std::env::args().nth(2) {
-            Some(id) => crontab::run_job(&paths, &id),
-            None => 2,
-        },
         "list" => match list(paths) {
             Ok(()) => 0,
             Err(e) => {

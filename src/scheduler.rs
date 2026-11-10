@@ -172,7 +172,7 @@ fn tick(
     let server = paths.server_id();
     let mut started = Started::load(paths);
     for r in &routines {
-        // Cron jobs: the crontab starts them (`crontab::run_job`).
+        // Cron jobs: the crontab starts them (`crontab::wrapper_main`).
         if r.is_cron() {
             continue;
         }
@@ -299,7 +299,7 @@ fn tick(
         }
     }
     for r in &routines {
-        store::prune(paths, &r.id, settings.history);
+        store::prune(paths, &r.id, r.file.keep_runs, r.file.keep_days);
     }
     Ok(())
 }
@@ -538,6 +538,8 @@ mod tests {
                 remember: false,
                 alert: Default::default(),
                 runs_in: Default::default(),
+                keep_runs: crate::routine::KEEP_RUNS,
+                keep_days: crate::routine::KEEP_DAYS,
             },
             prompt: "go".into(),
             problem: None,

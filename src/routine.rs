@@ -115,8 +115,9 @@ pub enum RunsIn {
     /// Herdr's scheduler starts it in a tab, while Herdr runs.
     #[default]
     Herdr,
-    /// A line in the user's crontab starts it (`herdr-routines cron-run`),
-    /// also when Herdr does not run. Shell commands only.
+    /// A line in the user's crontab starts it, through the plugin's
+    /// wrapper (`crontab.rs`), also when Herdr does not run. Shell commands
+    /// only, one line.
     Cron,
 }
 
@@ -215,6 +216,22 @@ pub struct RoutineFile {
     /// Herdr's scheduler, or a classic cron job (shell commands only).
     #[serde(default, skip_serializing_if = "is_herdr")]
     pub runs_in: RunsIn,
+    /// Runs kept: at most this many (0: no limit)...
+    #[serde(default = "default_keep_runs")]
+    pub keep_runs: u32,
+    /// ...and none older than this many days (0: no limit).
+    #[serde(default = "default_keep_days")]
+    pub keep_days: u32,
+}
+
+pub const KEEP_RUNS: u32 = 30;
+pub const KEEP_DAYS: u32 = 90;
+
+fn default_keep_runs() -> u32 {
+    KEEP_RUNS
+}
+fn default_keep_days() -> u32 {
+    KEEP_DAYS
 }
 
 fn is_false(b: &bool) -> bool {
@@ -353,6 +370,9 @@ impl Routine {
         }
         if file.runs_in == RunsIn::Cron && file.agent != SHELL {
             return Some("only a shell command can run as a cron job".into());
+        }
+        if file.runs_in == RunsIn::Cron && prompt.trim().contains('\n') {
+            return Some("a cron job's command is one line (for more, call a script)".into());
         }
         if file.agent == SHELL && !file.args.is_empty() {
             return Some("a shell command takes no extra arguments".into());
@@ -534,6 +554,8 @@ pub fn load_all(paths: &Paths) -> Vec<Routine> {
                     remember: false,
                     alert: Alert::default(),
                     runs_in: RunsIn::default(),
+                    keep_runs: KEEP_RUNS,
+                    keep_days: KEEP_DAYS,
                 },
                 prompt: String::new(),
                 problem: Some(e),
@@ -584,8 +606,6 @@ pub struct Settings {
     pub close_finished_after_minutes: u32,
     /// Also notify when a run finishes, not only when it needs you.
     pub notify_finished: bool,
-    /// Runs kept per routine.
-    pub history: usize,
     /// `nerd` for Nerd Font icons, `plain` for plain symbols.
     pub icons: String,
     /// Where `open` shows the list: `overlay`, `split` or `tab`.
@@ -600,7 +620,6 @@ impl Default for Settings {
             workspace: "Routines".into(),
             close_finished_after_minutes: 60,
             notify_finished: false,
-            history: 50,
             icons: "nerd".into(),
             placement: "overlay".into(),
             split_direction: "down".into(),
@@ -652,6 +671,8 @@ mod tests {
             remember: false,
             alert: Alert::Notification,
             runs_in: RunsIn::Herdr,
+            keep_runs: KEEP_RUNS,
+            keep_days: KEEP_DAYS,
         }
     }
 

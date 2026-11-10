@@ -1,7 +1,9 @@
 //! The form to create or change a routine.
 
 use crate::agent;
-use crate::routine::{Alert, Missed, Routine, RoutineFile, RunsIn, AGENTS, SHELL};
+use crate::routine::{
+    Alert, Missed, Routine, RoutineFile, RunsIn, AGENTS, KEEP_DAYS, KEEP_RUNS, SHELL,
+};
 use crate::schedule::{Schedule, AT_START};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +70,53 @@ fn retry_text(retries: u32, delay: u32) -> (String, String) {
     }
 }
 
+/// The choices for how many runs are kept: `(runs, days)`, 0 is no limit.
+const KEEPS: [(u32, u32); 6] = [
+    (KEEP_RUNS, KEEP_DAYS),
+    (10, 30),
+    (100, 365),
+    (KEEP_RUNS, 0),
+    (0, KEEP_DAYS),
+    (0, 0),
+];
+
+/// How a choice of kept runs reads: short, and in words.
+pub fn keep_text(runs: u32, days: u32) -> (String, String) {
+    let runs_text = |n: u32| {
+        if n == 1 {
+            "1 run".into()
+        } else {
+            format!("{n} runs")
+        }
+    };
+    let days_text = |n: u32| {
+        if n == 1 {
+            "1 day".into()
+        } else {
+            format!("{n} days")
+        }
+    };
+    match (runs, days) {
+        (0, 0) => ("All runs".into(), "Nothing is deleted by itself".into()),
+        (r, 0) => (
+            runs_text(r),
+            format!("The last {}, however old", runs_text(r)),
+        ),
+        (0, d) => (
+            days_text(d),
+            format!("All runs of the last {}", days_text(d)),
+        ),
+        (r, d) => (
+            format!("{}, {}", runs_text(r), days_text(d)),
+            format!(
+                "The last {}, none older than {}",
+                runs_text(r),
+                days_text(d)
+            ),
+        ),
+    }
+}
+
 pub const WEEKDAYS: [&str; 7] = [
     "Monday",
     "Tuesday",
@@ -101,6 +150,7 @@ pub enum Field {
     Retry,
     Alert,
     RunsIn,
+    Keep,
     Check,
     Remember,
     Args,
@@ -130,6 +180,7 @@ impl Field {
             Field::Retry => "If it fails",
             Field::Alert => "Tell me by",
             Field::RunsIn => "Runs in",
+            Field::Keep => "Keep",
             Field::Check => "Check first",
             Field::Remember => "Earlier results",
             Field::Args => "Extra options",
@@ -169,6 +220,7 @@ impl Field {
                 | Field::Retry
                 | Field::Alert
                 | Field::RunsIn
+                | Field::Keep
                 | Field::Remember
         )
     }
@@ -209,6 +261,9 @@ impl Field {
             }
             Field::Alert => {
                 "How you hear about a run. Notification: Herdr's usual notification when it fails, runs too long or needs you. Popup on problems: a window in Herdr that stays in front until you press OK. Popup always: also when a run finishes."
+            }
+            Field::Keep => {
+                "How long its runs and their output stay in Runs. When a run ends, older ones are deleted; whichever limit comes first counts. A run that is still going is never deleted."
             }
             Field::Check => {
                 "Optional: a shell command run first in the folder. If it ends without an error, the agent starts and gets its output; otherwise the run is recorded as \"Nothing to do\". Example: git fetch -q && git log --oneline HEAD..@{u}"
@@ -278,6 +333,8 @@ pub struct Form {
     pub retry_delay: u32,
     pub alert: Alert,
     pub runs_in: RunsIn,
+    pub keep_runs: u32,
+    pub keep_days: u32,
     pub check: String,
     pub remember: bool,
     pub enabled: bool,
@@ -314,6 +371,8 @@ impl Form {
             retry_delay: 10,
             alert: Alert::default(),
             runs_in: RunsIn::default(),
+            keep_runs: KEEP_RUNS,
+            keep_days: KEEP_DAYS,
             check: String::new(),
             remember: false,
             enabled: true,
@@ -359,6 +418,8 @@ impl Form {
         f.retry_delay = r.file.retry_delay_minutes;
         f.alert = r.file.alert;
         f.runs_in = r.file.runs_in;
+        f.keep_runs = r.file.keep_runs;
+        f.keep_days = r.file.keep_days;
         f.check = r.file.check_command.clone();
         f.remember = r.file.remember;
         f.enabled = r.file.enabled;
@@ -389,6 +450,9 @@ impl Form {
 
     pub fn hint(&self, f: Field) -> &'static str {
         match f {
+            Field::Prompt if self.is_cron() => {
+                "The crontab line's command, one line, such as ~/bin/backup.sh >> ~/backup.log. It starts in your home folder; for more steps, call a script. ⏎ opens the editor."
+            }
             Field::Prompt if self.is_shell() => {
                 "The command or script to run in the folder, such as ./backup.sh. Several lines run one after the other. ⏎ opens the editor."
             }
@@ -422,7 +486,11 @@ impl Form {
         if !agent::efforts(a).is_empty() {
             v.push(Field::Effort);
         }
-        v.extend([Field::Folder, Field::Repeat]);
+        // Cron starts its jobs in the home folder.
+        if !cron {
+            v.push(Field::Folder);
+        }
+        v.push(Field::Repeat);
         match self.repeat {
             Repeat::Custom => v.push(Field::Cron),
             Repeat::Weekly => {
@@ -444,7 +512,7 @@ impl Form {
         if !cron {
             v.push(Field::AtLimit);
         }
-        v.extend([Field::Retry, Field::Alert]);
+        v.extend([Field::Retry, Field::Alert, Field::Keep]);
         if !self.is_shell() {
             v.extend([Field::Check, Field::Remember, Field::Args]);
         }
@@ -471,8 +539,8 @@ impl Form {
             | Field::Cron
             | Field::Missed
             | Field::Enabled => "Schedule",
-            Field::Limit | Field::AtLimit | Field::Retry | Field::Alert => {
-                "Time limit, retries and alerts"
+            Field::Limit | Field::AtLimit | Field::Retry | Field::Alert | Field::Keep => {
+                "Time limit, retries, alerts and history"
             }
             Field::Check | Field::Remember | Field::Args => "Agent extras",
             Field::Prompt => "What to do",
@@ -555,6 +623,7 @@ impl Form {
             Field::Enabled => if self.enabled { "Yes" } else { "No" }.into(),
             Field::AtLimit => if self.stop_at_limit { "stop" } else { "keep" }.into(),
             Field::Retry => format!("{}:{}", self.retries, self.retry_delay),
+            Field::Keep => format!("{}:{}", self.keep_runs, self.keep_days),
             Field::Remember => if self.remember { "Yes" } else { "No" }.into(),
             Field::Alert => self.alert.label().into(),
             Field::RunsIn => self.runs_in.label().into(),
@@ -570,7 +639,7 @@ impl Form {
             Field::Mode => agent::label(agent::modes(a), &self.mode),
             Field::Model => agent::label(agent::models(a), &self.model),
             Field::Effort => agent::label(agent::efforts(a), &self.effort),
-            Field::AtLimit | Field::Retry | Field::Remember => {
+            Field::AtLimit | Field::Retry | Field::Keep | Field::Remember => {
                 let v = self.value(f);
                 self.items(f)
                     .into_iter()
@@ -665,6 +734,22 @@ impl Form {
                 }
                 v
             }
+            Field::Keep => {
+                let mut v: Vec<Item> = KEEPS
+                    .iter()
+                    .map(|(r, d)| {
+                        let (label, detail) = keep_text(*r, *d);
+                        item(&format!("{r}:{d}"), &label, &detail)
+                    })
+                    .collect();
+                // A value set by hand in routine.toml stays choosable.
+                let now = self.value(Field::Keep);
+                if !v.iter().any(|i| i.value == now) {
+                    let (label, detail) = keep_text(self.keep_runs, self.keep_days);
+                    v.push(item(&now, &label, &detail));
+                }
+                v
+            }
             Field::Remember => vec![
                 item("No", "Not used", "Each run starts fresh"),
                 item(
@@ -740,6 +825,12 @@ impl Form {
                 if let Some((r, d)) = value.split_once(':') {
                     self.retries = r.parse().unwrap_or(0);
                     self.retry_delay = d.parse().unwrap_or(10);
+                }
+            }
+            Field::Keep => {
+                if let Some((r, d)) = value.split_once(':') {
+                    self.keep_runs = r.parse().unwrap_or(KEEP_RUNS);
+                    self.keep_days = d.parse().unwrap_or(KEEP_DAYS);
                 }
             }
             Field::Remember => self.remember = value == "Yes",
@@ -827,7 +918,12 @@ impl Form {
             model: self.model.clone(),
             effort: self.effort.clone(),
             args: split_args(&self.args)?,
-            folder: self.folder.trim().to_string(),
+            // Cron starts its jobs in the home folder.
+            folder: if self.is_cron() {
+                "~".to_string()
+            } else {
+                self.folder.trim().to_string()
+            },
             missed: self.missed,
             time_limit_minutes,
             stop_at_limit: self.stop_at_limit,
@@ -845,6 +941,8 @@ impl Form {
             } else {
                 RunsIn::Herdr
             },
+            keep_runs: self.keep_runs,
+            keep_days: self.keep_days,
         };
         if let Some(problem) = Routine::check(&file, &self.prompt) {
             return Err(problem);

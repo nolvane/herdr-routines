@@ -68,19 +68,33 @@ window, the selected routine's details show under the list.
   finished; any other code marks the run as failed and Herdr shows a
   notification.
 - **Classic cron jobs** have their own tab. `n`, then "Classic cron job",
-  creates one: a shell command that the system's cron runs from your
-  crontab, also when Herdr is closed. It is edited, switched and copied like
-  a routine, and its runs (output, result, failures, retries, alerts) show
-  in Runs like any other. The plugin keeps these jobs in a marked block of
-  your crontab and rewrites only that block (after a backup in the state
-  folder). On macOS, a cron job that works in Documents, Desktop or
-  Downloads needs Full Disk Access for `/usr/sbin/cron` (System Settings,
-  Privacy & Security, Full Disk Access).
+  creates one: a one-line shell command that the system's cron runs from
+  your crontab, also when Herdr is closed. It stays an ordinary line in
+  your crontab: the list edits that line (schedule, command, on or off),
+  and keeps what cron has no place for (its name, retries, alerts, how
+  many runs to keep) in the plugin. Edits you make to the line by hand win
+  and show in the list. Its runs (output, result, exit code, failures,
+  retries, alerts) show in Runs like any other, and `r` runs it now, in
+  the background, as cron would. Every change to the crontab keeps a
+  backup of it in the state folder first. On macOS, a cron job that works
+  in Documents, Desktop or Downloads needs Full Disk Access for
+  `/usr/sbin/cron` (System Settings, Privacy & Security, Full Disk Access).
 - **Your other cron jobs** show in the Cron jobs tab too (◇). `⏎` on one (or
-  `C` for all) offers: keep it as a cron job but manage it here, move it to
-  Herdr (it runs in a tab instead), or copy it to Herdr switched off. Moving
-  comments the old crontab line out after a backup, so nothing runs twice.
-  Variables set in the crontab (such as `PATH`) come along.
+  `C` for all) offers: keep it as a cron job but manage it here (its line
+  stays where it is, as you wrote it), move it to Herdr (it runs in a tab
+  instead), or copy it to Herdr switched off. Moving comments the old
+  crontab line out, so nothing runs twice. Variables set in the crontab
+  (such as `PATH`) come along.
+- **How cron jobs are followed:** the plugin puts a comment above a managed
+  job's line and sets `SHELL` around it to a small wrapper (a link to the
+  plugin in its state folder, named after the job). Cron starts the
+  command through that wrapper, which records the run, runs the command
+  with the shell your crontab had, hands its output on to cron and returns
+  its exit code. While routines are switched off in the list, the wrapper
+  skips the job's times.
+- **Run history:** each routine and cron job keeps its last 30 runs, none
+  older than 90 days, by default. "Keep" in the form changes that (such as
+  10 runs, 100 runs and a year, or all runs).
 - **Create with Claude:** `n`, then "Describe it to Claude", opens a tab
   where Claude asks what the routine should do, writes it and checks that
   it loads. You then approve it in the list with `a`.
@@ -238,11 +252,17 @@ time_limit_minutes = 120
 # check_command = "git fetch -q && git log --oneline HEAD..@{u}"
 # Optional, agents only: start each run with the last ten results
 # remember = true
+# Optional: runs kept in the history (default 30) and none older than this
+# many days (default 90); 0 means no limit
+# keep_runs = 30
+# keep_days = 90
 ```
 
 `prompt.md` holds the prompt, as you would type it to the agent. A shell
 routine has `agent = "shell"` and its command in `command.sh` instead; it
-runs in your `$SHELL`, line by line like a script.
+runs in your `$SHELL`, line by line like a script. With `runs_in = "cron"`
+it is a classic cron job: `command.sh` is then one line, which the list
+writes into your crontab once the routine is approved.
 
 You, the list or another agent can create and change these files; the
 scheduler reads them every few seconds. A routine with a mistake shows up in
@@ -297,8 +317,8 @@ and leaves a running server alone.
 
 Optional, in `config.toml` in the plugin's config directory. See
 [config.toml.example](config.toml.example): the workspace name, when
-finished tabs close, notifications on finish, history length, icons and
-where the list opens.
+finished tabs close, notifications on finish, icons and where the list
+opens. How many runs are kept is set per routine (see "Run history").
 
 ## Command line
 

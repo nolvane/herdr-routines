@@ -137,8 +137,8 @@ pub struct Run {
     /// 0 for the first try, 1 for the first retry and so on.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub attempt: u32,
-    /// A run of a cron job: the pid of the `cron-run` process, which owns
-    /// the record (it has no tab, and Herdr's scheduler leaves it alone).
+    /// A run of a cron job: the pid of its wrapper process, which owns the
+    /// record (it has no tab, and Herdr's scheduler leaves it alone).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub cron_pid: u32,
 }
@@ -274,10 +274,18 @@ pub fn all_runs(paths: &Paths) -> Vec<Run> {
 }
 
 /// Deletes the oldest finished runs beyond `keep`.
-pub fn prune(paths: &Paths, routine_id: &str, keep: usize) {
+/// Keeps a routine's newest `keep_runs` runs, none older than `keep_days`
+/// days (0: no limit for either). Runs still going always stay.
+pub fn prune(paths: &Paths, routine_id: &str, keep_runs: u32, keep_days: u32) {
     let runs = runs_of(paths, routine_id);
-    for run in runs.iter().skip(keep).filter(|r| !r.status.active()) {
-        remove(paths, run);
+    let oldest = (keep_days > 0)
+        .then(|| chrono::Local::now() - chrono::Duration::days(i64::from(keep_days)));
+    for (i, run) in runs.iter().enumerate() {
+        let too_many = keep_runs > 0 && i >= keep_runs as usize;
+        let too_old = oldest.is_some_and(|t| run.started < t);
+        if (too_many || too_old) && !run.status.active() {
+            remove(paths, run);
+        }
     }
 }
 
@@ -339,12 +347,26 @@ mod tests {
         active.save(&p).unwrap();
         assert_eq!(runs_of(&p, "a").len(), 6);
         assert_eq!(runs_of(&p, "a")[0].id, "20261114-080000-000");
-        prune(&p, "a", 2);
+        prune(&p, "a", 2, 0);
         let left = runs_of(&p, "a");
         // Two newest plus the active one, which is never pruned.
         assert_eq!(left.len(), 3);
         assert!(left.iter().any(|r| r.status == Status::Running));
         assert_eq!(all_runs(&p).len(), 3);
+        // By age: a run older than the days kept goes, whatever the count.
+        let mut old = Run::new("b", "B", "shell", Trigger::Scheduled, None);
+        old.id = "20200101-080000-000".into();
+        old.started = chrono::Local::now() - chrono::Duration::days(100);
+        old.finish(Status::Finished, "");
+        old.save(&p).unwrap();
+        let mut new = Run::new("b", "B", "shell", Trigger::Scheduled, None);
+        new.id = "20261101-090000-000".into();
+        new.finish(Status::Finished, "");
+        new.save(&p).unwrap();
+        prune(&p, "b", 0, 90);
+        let left = runs_of(&p, "b");
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].id, "20261101-090000-000");
     }
 
     #[test]

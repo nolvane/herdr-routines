@@ -33,9 +33,19 @@ pub fn run_full(cmd: &str, cwd: Option<&Path>, limit: Duration) -> Option<Ended>
         .ok()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "/bin/sh".into());
-    let mut command = Command::new(shell);
+    run_program(&shell, &["-lc", &format!("exec 2>&1\n{cmd}")], cwd, limit)
+}
+
+/// A cron job's command as cron runs it: `shell -c`, in the current
+/// folder, with the environment cron gave.
+pub fn run_as_cron(shell: &str, cmd: &str, limit: Duration) -> Option<Ended> {
+    run_program(shell, &["-c", &format!("exec 2>&1\n{cmd}")], None, limit)
+}
+
+fn run_program(program: &str, args: &[&str], cwd: Option<&Path>, limit: Duration) -> Option<Ended> {
+    let mut command = Command::new(program);
     command
-        .args(["-lc", &format!("exec 2>&1\n{cmd}")])
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());

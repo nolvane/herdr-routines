@@ -366,16 +366,20 @@ impl App {
             clip: String::new(),
             autostart_after_intro: false,
         };
-        // Cron jobs changed outside the list (and approved) reach the
-        // crontab when the list opens.
-        if !cfg!(test) {
-            app.sync_cron();
-        }
         app.reload();
         app
     }
 
     pub fn reload(&mut self) {
+        // The crontab changes rarely: read every 15 seconds, or after a
+        // change made here (which clears `crontab_read`). Its managed jobs
+        // come first, as hand edits there win.
+        let crontab_due = self
+            .crontab_read
+            .is_none_or(|t| t.elapsed() >= Duration::from_secs(15));
+        if crontab_due {
+            self.cron_pull();
+        }
         self.routines = routine::load_all(&self.paths);
         self.all_runs = store::all_runs(&self.paths);
         // A filter stays while its routine or any of its runs is there
@@ -397,12 +401,7 @@ impl App {
             None => self.all_runs.clone(),
         };
         self.scheduler = scheduler::running(&self.paths);
-        // The crontab changes rarely: read every 15 seconds, or after a
-        // change made here (which clears `crontab_read`).
-        if self
-            .crontab_read
-            .is_none_or(|t| t.elapsed() >= Duration::from_secs(15))
-        {
+        if crontab_due {
             self.crontab_jobs = crate::crontab::read()
                 .map(|t| crate::crontab::parse(&t))
                 .unwrap_or_default();
@@ -539,6 +538,14 @@ impl App {
     // ---- actions ----------------------------------------------------------
 
     fn fire(&mut self, id: &str) {
+        if let Some(r) = self.routines.iter().find(|r| r.id == id && r.is_cron()) {
+            let started = crate::crontab::run_now(&self.paths, r);
+            match started {
+                Ok(()) => self.flash("Started in the background; its run shows in Runs", GREEN),
+                Err(e) => self.flash(format!("Cannot start: {e}"), RED),
+            }
+            return self.reload();
+        }
         let exe = match std::env::current_exe() {
             Ok(e) => e,
             Err(e) => return self.flash(format!("Cannot start: {e}"), RED),
@@ -588,14 +595,30 @@ impl App {
             }
             Err(e) => self.flash(e, RED),
         }
-        self.sync_cron();
+        self.cron_write(&id);
         self.reload();
     }
 
-    /// Brings the crontab in line with the cron jobs; says so when it fails.
-    fn sync_cron(&mut self) {
-        if let Err(e) = crate::crontab::sync(&self.paths) {
+    /// Writes a cron job's schedule, command and on or off into the
+    /// crontab (nothing for a routine Herdr runs); says so when it fails.
+    fn cron_write(&mut self, id: &str) {
+        let Ok(r) = Routine::load(&self.paths, id) else {
+            return;
+        };
+        if !r.is_cron() {
+            return;
+        }
+        if let Err(e) = crate::crontab::write_job(&self.paths, &r) {
             self.flash(format!("Crontab not updated: {e}"), RED);
+        }
+        self.crontab_read = None;
+    }
+
+    /// Reads the crontab back into the managed cron jobs (edits made by
+    /// hand win).
+    fn cron_pull(&mut self) {
+        if let Err(e) = crate::crontab::pull(&self.paths) {
+            self.flash(format!("Crontab not read: {e}"), RED);
         }
     }
 
@@ -628,6 +651,8 @@ impl App {
         match saved {
             Ok(()) => {
                 self.flash(format!("Copied as {}, switched off", copy.file.name), GREEN);
+                // A copied cron job gets its own (switched off) crontab line.
+                self.cron_write(&copy.id);
                 self.reload();
                 self.select_id(&copy.id);
             }
@@ -893,16 +918,27 @@ impl App {
             unreadable: false,
             approved: !waiting,
         };
+        let was_cron = Routine::load(&self.paths, &id).is_ok_and(|old| old.is_cron());
         if waiting {
             r.save(&self.paths)?;
         } else {
             // The owner wrote it in the form: what it saves is approved.
             r.save_approved(&self.paths)?;
         }
-        let cron = crate::crontab::sync(&self.paths)
+        // A cron job's schedule, command and on or off live in the crontab.
+        let crontab = if r.is_cron() {
+            crate::crontab::write_job(&self.paths, &r)
+        } else if was_cron {
+            // Now run by Herdr: its crontab line goes.
+            crate::crontab::remove_job(&self.paths, &id, false)
+        } else {
+            Ok(())
+        };
+        let cron = crontab
             .err()
             .map(|e| format!("; but {e}"))
             .unwrap_or_default();
+        self.crontab_read = None;
         self.reload();
         self.select_id(&id);
         Ok(if waiting {
@@ -946,7 +982,12 @@ impl App {
                 .map(|_| "routine.toml saved"),
         };
         match result {
-            Ok(msg) => self.flash(msg, GREEN),
+            Ok(msg) => {
+                self.flash(msg, GREEN);
+                if let EditTarget::Prompt(id, _) | EditTarget::File(id) = &ed.target {
+                    self.cron_write(id);
+                }
+            }
             Err(e) => {
                 self.flash(format!("Not saved: {e}"), RED);
                 self.editor = Some(ed);
@@ -990,7 +1031,10 @@ impl App {
                 YELLOW,
             );
         }
-        let mut lines = vec![if r.is_shell() {
+        let mut lines = vec![if r.is_cron() {
+            "The command runs now in the background, as cron would run it; its run shows in Runs."
+                .to_string()
+        } else if r.is_shell() {
             format!(
                 "The command runs in a new tab in the workspace {}.",
                 Settings::load(&self.paths).workspace
@@ -1064,12 +1108,21 @@ impl App {
             Ok(()) => self.flash("Approved: it runs as shown", GREEN),
             Err(e) => self.flash(e, RED),
         }
-        self.sync_cron();
+        self.cron_write(&id);
         self.reload();
     }
 
     fn delete_routine(&mut self, id: &str, with_runs: bool) {
         let had_runs = self.run_count(id) > 0;
+        let was_cron = Routine::load(&self.paths, id).is_ok_and(|r| r.is_cron());
+        if was_cron {
+            // Its crontab line goes first, so cron never starts a job whose
+            // routine is gone.
+            if let Err(e) = crate::crontab::remove_job(&self.paths, id, false) {
+                return self.flash(format!("Not deleted: the crontab {e}"), RED);
+            }
+            self.crontab_read = None;
+        }
         match Routine::delete(&self.paths, id, with_runs) {
             Ok(()) if had_runs && !with_runs => {
                 self.flash("Deleted; its runs stay in Runs", ACCENT)
@@ -1077,7 +1130,6 @@ impl App {
             Ok(()) => self.flash("Deleted", ACCENT),
             Err(e) => self.flash(e, RED),
         }
-        self.sync_cron();
         self.reload();
     }
 
@@ -1086,8 +1138,11 @@ impl App {
             return;
         };
         let runs = self.run_count(&r.id);
-        let mut lines =
-            vec!["The routine and its prompt go. Tabs of runs still open stay.".to_string()];
+        let mut lines = vec![if r.is_cron() {
+            "The cron job goes, also its line in your crontab.".to_string()
+        } else {
+            "The routine and its prompt go. Tabs of runs still open stay.".to_string()
+        }];
         if runs > 0 {
             lines.push(format!(
                 "Its {} stay in Runs (y), or go too (r).",
@@ -2357,7 +2412,9 @@ retries = 0                       # try a failed run again this many times (0-3)
 retry_delay_minutes = 10          # ...this many minutes apart
 check_command = ""                # agents only: a shell command run first; the agent starts only if it exits 0, and gets its output
 remember = false                  # agents only: each run gets the results of the last ten runs
-runs_in = "herdr"                 # shell only: "herdr" (a tab, while Herdr runs) or "cron" (a classic cron job, also when Herdr is closed)
+runs_in = "herdr"                 # shell only: "herdr" (a tab, while Herdr runs) or "cron" (a classic cron job in my crontab, also when Herdr is closed; command.sh is then one line, run in my home folder; the list writes the crontab line once I approve it)
+keep_runs = 30                    # runs kept in the history (0: no limit)...
+keep_days = 90                    # ...and none older than this many days (0: no limit)
 alert = "notification"            # "notification", "popup-on-problems" (a popup that stays until OK when a run fails, runs too long or needs me) or "popup" (also when it finishes)
 
 Instead of cron, schedule can be "@once YYYY-MM-DD HH:MM" (runs once, then the routine switches off) or "@start" (each time Herdr starts).
@@ -2609,32 +2666,131 @@ mod tests {
             .unwrap_or_else(|| panic!("{:?}", a.flash));
         assert!(job.file.enabled && job.approved && job.problem.is_none());
         let now = std::fs::read_to_string(&tab).unwrap();
-        // The old line is commented out, the plugin's block calls cron-run.
-        assert!(now.contains("# moved to herdr-routines (routine "), "{now}");
-        assert!(now.contains("# BEGIN herdr-routines"), "{now}");
-        assert!(
-            now.contains("*/5 * * * * HERDR_PLUGIN_CONFIG_DIR="),
-            "{now}"
+        // The line stays where it was, as written; the marker and SHELL go
+        // around it, so cron starts it through the wrapper.
+        let wrapper = crate::crontab::wrapper(&a.paths, &job.id);
+        assert_eq!(
+            now,
+            format!(
+                "MAILTO=\"\"\n# herdr-routines: {} (its name and runs are in the herdr-routines list)\nSHELL={}\n*/5 * * * * echo hi >> /tmp/x.log\nSHELL=/bin/sh\n",
+                job.id,
+                wrapper.display()
+            )
         );
-        assert!(now.contains(&format!("cron-run {}\n", job.id)), "{now}");
-        assert!(crate::crontab::parse(&now).is_empty(), "the block is ours");
+        assert!(crate::crontab::parse(&now).is_empty(), "the job is managed");
+        assert_eq!(
+            std::fs::read_link(&wrapper).unwrap(),
+            crate::crontab::binary(&a.paths)
+        );
         assert!(crate::crontab::binary(&a.paths).exists());
-        // Off: its line goes; on again: it comes back.
+        // Off: the line is commented out with #off; on again: it is back.
         a.select_id(&job.id);
         press(&mut a, KeyCode::Char(' '));
         let now = std::fs::read_to_string(&tab).unwrap();
-        assert!(!now.contains("cron-run"), "{now}");
-        assert!(!now.contains("# BEGIN herdr-routines"), "{now}");
+        assert!(
+            now.contains("\n#off */5 * * * * echo hi >> /tmp/x.log\n"),
+            "{now}"
+        );
         press(&mut a, KeyCode::Char(' '));
         let now = std::fs::read_to_string(&tab).unwrap();
-        assert!(now.contains(&format!("cron-run {}\n", job.id)), "{now}");
-        // Deleting it removes the block again.
+        assert!(
+            now.contains("\n*/5 * * * * echo hi >> /tmp/x.log\n"),
+            "{now}"
+        );
+        // A name given in the list stays in the plugin, not the crontab.
+        let mut named = Routine::load(&a.paths, &job.id).unwrap();
+        named.file.name = "Say hi".into();
+        named.save_approved(&a.paths).unwrap();
+        a.crontab_read = None;
+        a.reload();
+        assert!(!std::fs::read_to_string(&tab).unwrap().contains("Say hi"));
+        // Edited by hand in the crontab: the crontab wins.
+        let edited = std::fs::read_to_string(&tab)
+            .unwrap()
+            .replace("*/5 * * * * echo hi", "0 7 * * * echo hello");
+        std::fs::write(&tab, edited).unwrap();
+        a.crontab_read = None;
+        a.reload();
+        let now = Routine::load(&a.paths, &job.id).unwrap();
+        assert_eq!(now.file.schedule, "0 7 * * *");
+        assert_eq!(now.prompt, "echo hello >> /tmp/x.log");
+        assert_eq!(now.file.name, "Say hi");
+        assert!(now.approved && now.file.enabled);
+        // Deleting it removes the whole group, line included.
         press(&mut a, KeyCode::Char('d'));
         press(&mut a, KeyCode::Char('y'));
         let now = std::fs::read_to_string(&tab).unwrap();
+        assert_eq!(now, "MAILTO=\"\"\n");
+        assert!(!wrapper.exists());
+        crate::crontab::use_fake(None);
+    }
+
+    #[test]
+    fn a_new_cron_job_goes_into_the_crontab_and_runs_now_through_the_wrapper() {
+        let mut a = app("newcron");
+        let tab = fake_crontab(&a, "SHELL=/bin/bash\n0 1 * * * other\n");
+        let mut f = Form::new("/tmp");
+        f.name = "Stamp".into();
+        f.choose(Field::Agent, routine::SHELL);
+        f.choose(Field::RunsIn, crate::routine::RunsIn::Cron.label());
+        assert!(!f.fields().contains(&Field::Folder), "cron runs in home");
+        f.prompt = "date +%H%M >> /tmp/stamp.log".into();
+        a.save_form(&f).unwrap();
+        let r = a
+            .routines
+            .iter()
+            .find(|r| r.is_cron())
+            .cloned()
+            .unwrap_or_else(|| panic!("{:?}", a.flash));
+        let now = std::fs::read_to_string(&tab).unwrap();
+        // Appended, with % escaped for cron and the shell set back after.
         assert!(
-            !now.contains("herdr-routines\n") && !now.contains("cron-run"),
+            now.ends_with(&format!(
+                "SHELL={}\n0 9 * * 1-5 date +\\%H\\%M >> /tmp/stamp.log\nSHELL=/bin/bash\n",
+                crate::crontab::wrapper(&a.paths, &r.id).display()
+            )),
             "{now}"
+        );
+        // Several lines cannot be one crontab line.
+        let mut f = Form::edit(&r);
+        f.prompt = "echo a\necho b".into();
+        assert!(f.build().unwrap_err().contains("one line"));
+        // Its details show the crontab line and how many runs it keeps.
+        a.view = View::Cron;
+        a.select_id(&r.id);
+        let lines = screen(&mut a, 100, 40);
+        let all = lines.join("\n");
+        assert!(
+            all.contains("Crontab        0 9 * * 1-5 and the command below"),
+            "{all}"
+        );
+        assert!(
+            all.contains("Command        date +%H%M >> /tmp/stamp.log"),
+            "{all}"
+        );
+        assert!(
+            all.contains("Keeps          The last 30 runs, none older than 90 days"),
+            "{all}"
+        );
+        // Run now asks, then starts it through its wrapper, not in a tab.
+        press(&mut a, KeyCode::Char('r'));
+        let Mode::Confirm(c) = a.mode.clone() else {
+            panic!("no question");
+        };
+        assert!(c.lines[0].contains("in the background"), "{:?}", c.lines);
+        a.mode = Mode::Normal;
+        // The form: no folder, the history choice in its part.
+        a.form = Some(Box::new(Form::edit(&r)));
+        a.form.as_mut().unwrap().select(Field::Keep);
+        let all = screen(&mut a, 100, 40).join("\n");
+        assert!(!all.contains("Folder"), "{all}");
+        assert!(
+            all.contains("Keep              ‹ 30 runs, 90 days ›"),
+            "{all}"
+        );
+        assert!(
+            all.contains("Time limit, retries, alerts and history"),
+            "{all}"
         );
         crate::crontab::use_fake(None);
     }
@@ -2646,7 +2802,8 @@ mod tests {
         f.name = "Say hi".into();
         f.choose(Field::Agent, routine::SHELL);
         f.choose(Field::RunsIn, crate::routine::RunsIn::Cron.label());
-        f.prompt = "echo first\necho hi from cron".into();
+        f.prompt = "echo first; echo hi from cron".into();
+        f.choose(Field::Keep, "2:90");
         let (file, prompt) = f.build().unwrap();
         let r = Routine {
             id: "say-hi".into(),
@@ -2657,7 +2814,16 @@ mod tests {
             approved: true,
         };
         r.save_approved(&a.paths).unwrap();
-        assert_eq!(crate::crontab::run_job(&a.paths, "say-hi"), 0);
+        // What cron starts: the wrapper link with -c and the command.
+        crate::crontab::prepare_wrapper(&a.paths, "say-hi").unwrap();
+        let wrapper = crate::crontab::wrapper(&a.paths, "say-hi");
+        let args: Vec<String> = vec![
+            wrapper.to_string_lossy().into(),
+            "-c".into(),
+            r.prompt.clone(),
+        ];
+        let (me, cmd) = crate::crontab::wrapper_call(&args).expect("seen as the wrapper");
+        assert_eq!(crate::crontab::wrapper_main(&me, &cmd), 0);
         let runs = store::runs_of(&a.paths, "say-hi");
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].status, store::Status::Finished);
@@ -2665,10 +2831,18 @@ mod tests {
         assert!(runs[0].cron_pid != 0 && runs[0].tab_closed);
         let out = std::fs::read_to_string(runs[0].file(&a.paths, "out")).unwrap();
         assert!(out.contains("first") && out.contains("hi from cron"));
+        // A failing command: recorded as failed, its exit code handed on.
+        assert_eq!(crate::crontab::wrapper_main(&me, "echo oops; exit 3"), 3);
+        let runs = store::runs_of(&a.paths, "say-hi");
+        assert_eq!(runs[0].status, store::Status::Failed);
+        assert_eq!(runs[0].result, "oops");
+        // It keeps 2 runs: the third run deletes the oldest.
+        assert_eq!(crate::crontab::wrapper_main(&me, &cmd), 0);
+        assert_eq!(store::runs_of(&a.paths, "say-hi").len(), 2);
         // Switched off in the list: the next cron time is skipped.
         scheduler::set_paused(&a.paths, true).unwrap();
-        assert_eq!(crate::crontab::run_job(&a.paths, "say-hi"), 0);
-        assert_eq!(store::runs_of(&a.paths, "say-hi").len(), 1);
+        assert_eq!(crate::crontab::wrapper_main(&me, &cmd), 0);
+        assert_eq!(store::runs_of(&a.paths, "say-hi").len(), 2);
     }
 
     #[test]
@@ -3074,8 +3248,12 @@ mod tests {
         assert!(lines.iter().any(|l| l.contains("Step 8 of the task. …")));
         assert!(!lines.iter().any(|l| l.contains("Step 9 of")));
         // A short window still shows the first line and the "…".
-        let lines = screen(&mut a, 90, 30);
-        assert!(lines.iter().any(|l| l.contains("Step 1 of the task. …")));
+        let lines = screen(&mut a, 90, 32);
+        assert!(
+            lines.iter().any(|l| l.contains("Step 1 of the task. …")),
+            "{}",
+            lines.join("\n")
+        );
     }
 
     #[test]

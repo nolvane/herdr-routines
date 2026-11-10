@@ -10,10 +10,16 @@ All notable changes to this plugin. The format follows
 - Classic cron jobs: a shell command can run from the system's crontab
   instead of Herdr ("Runs in: Cron", or `n` then "Classic cron job"), also
   when Herdr is closed. They have their own tab "Cron jobs", are edited
-  like routines, and their runs, output, retries and alerts show in Runs.
-  The plugin keeps them in a marked block of the crontab.
+  like routines, and their runs, output, exit code, retries and alerts
+  show in Runs. Each stays a real line in your crontab, edited in place
+  by the list; its name and other settings live in the plugin, and edits
+  made to the line by hand win. `r` runs one now, in the background.
 - The rest of the crontab shows in the Cron jobs tab too; `⏎` keeps a job
-  as a cron job managed here, moves it to Herdr or copies it.
+  as a cron job managed here (its line stays where it is), moves it to
+  Herdr or copies it.
+- "Keep" per routine and cron job: how many runs stay in Runs, by default
+  the last 30 and none older than 90 days. Replaces the global `history`
+  setting.
 - "routines on/off" at the top (or `S`) switches all routines and cron jobs
   on or off, after asking; off stays off across Herdr restarts.
 - A right click on a routine, cron job or run opens a menu of what can be

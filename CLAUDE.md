@@ -28,7 +28,7 @@ each run in its own tab. What it does and how users install it:
   `autostart.rs`: Herdr at login. `paths.rs`: where files go.
   `approval.rs`: the owner's approval of routines changed outside the
   list. `alert.rs`: notifications and the popup pane about a run.
-  `crontab.rs`: reading and moving the user's cron jobs.
+  `crontab.rs`: the user's crontab, managed cron jobs and their wrapper.
 - `app.rs`: the list's state, keys and mouse. `ui.rs`: drawing, in the look
   of the Git Panel and Multiaccount plugins (keep them alike).
   `form.rs`: the edit form. `editor.rs`: the prompt editor. `pane.rs`: the
@@ -90,13 +90,16 @@ everything afterwards with `herdr-routines stop`,
 ## Non-goals
 
 - No headless agent runs: every agent run is an interactive agent in a
-  tab. Only shell commands can be classic cron jobs (`runs_in = "cron"`),
-  which the system's cron starts through `herdr-routines cron-run`.
+  tab. Only one-line shell commands can be classic cron jobs
+  (`runs_in = "cron"`), which the system's cron starts through the
+  plugin's wrapper (`SHELL=<state>/bin/cron/<id>`, see `crontab.rs`).
 - No scheduler of its own outside Herdr: routines run while the Herdr
   server runs; cron jobs use the system's cron. The optional "start at
   login" entry (`autostart.rs`) starts `herdr server`, not the plugin.
-- The plugin writes only its own marked block of the crontab, and comments
-  other lines out only when the person moves that job here.
+- The plugin changes only its managed jobs' groups in the crontab (marker,
+  `SHELL` lines and the job's own line), and comments other lines out only
+  when the person moves that job here. Every change keeps a backup first.
+  Tests never reach the real crontab: they use `crontab::use_fake`.
 
 ## Releasing
 

@@ -676,12 +676,27 @@ fn draw_details(frame: &mut Frame, app: &App, icons: &Icons, r: &Routine, area: 
         }
         lines.push(row("Agent", text(clip(&agent_words, room))));
     }
-    lines.push(row("Folder", text(clip(&f.folder, room))));
+    if r.is_cron() {
+        // The schedule as the crontab line has it; the command is below.
+        let when = crate::crontab::when(r).unwrap_or_default();
+        lines.push(row(
+            "Crontab",
+            vec![
+                Span::styled(when, Style::new().fg(TEXT)),
+                Span::styled(
+                    clip(" and the command below", room.saturating_sub(12)),
+                    Style::new().fg(FAINT),
+                ),
+            ],
+        ));
+    } else {
+        lines.push(row("Folder", text(clip(&f.folder, room))));
+    }
     let mut limits = format!(
         "{} minute{}, then {}",
         f.time_limit_minutes,
         if f.time_limit_minutes == 1 { "" } else { "s" },
-        if f.stop_at_limit {
+        if f.stop_at_limit || r.is_cron() {
             "stops"
         } else {
             "keeps running"
@@ -696,6 +711,13 @@ fn draw_details(frame: &mut Frame, app: &App, icons: &Icons, r: &Routine, area: 
         limits.push_str(&format!(" · {}", f.alert.label().to_lowercase()));
     }
     lines.push(row("Time limit", text(clip(&limits, room))));
+    lines.push(row(
+        "Keeps",
+        text(clip(
+            &crate::form::keep_text(f.keep_runs, f.keep_days).1,
+            room,
+        )),
+    ));
     if !r.is_shell() {
         let mut extras = Vec::new();
         if !f.check_command.is_empty() {
@@ -2070,7 +2092,10 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
                     "new: Herdr routine, classic cron job, or describe it to Claude",
                 ),
                 ("p", "write the prompt or command"),
-                ("r", "run now (asks first)"),
+                (
+                    "r",
+                    "run now (asks first); a cron job runs in the background, as cron would",
+                ),
                 ("a", "approve what changed outside the list (asks first)"),
                 ("Space", "on / off"),
                 ("c", "copy it (the copy starts switched off)"),

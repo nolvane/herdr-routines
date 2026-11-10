@@ -11,9 +11,6 @@ close_finished_after_minutes = 60
 # Also notify when a run finishes, not only when it needs you.
 notify_finished = false
 
-# Runs kept per routine.
-history = 50
-
 # "nerd" for Nerd Font icons, "plain" for plain symbols.
 icons = "nerd"
 
