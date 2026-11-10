@@ -54,6 +54,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Mode::Confirm(c) => draw_confirm(frame, app, &c),
         Mode::Message { title, lines } => draw_message(frame, app, &title, &lines),
         Mode::Log(l) => draw_log(frame, app, l),
+        Mode::Cron(jobs) => draw_cron(frame, app, &jobs),
         Mode::Normal | Mode::AskQuit => {}
     }
 }
@@ -130,14 +131,11 @@ fn draw_header(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
         None
     } else if crate::autostart::is_on() {
         Some((
-            format!("{} starts at login", icons.running()),
+            format!("{} autostart on", icons.running()),
             Style::new().fg(GREEN),
         ))
     } else {
-        Some((
-            format!("{} not at login · A", icons.running()),
-            Style::new().fg(RED),
-        ))
+        Some(("○ autostart off".to_string(), Style::new().fg(FAINT)))
     };
     let w = chip.width();
     let login_w = login.as_ref().map_or(0, |(t, _)| t.width() + 3);
@@ -245,14 +243,12 @@ fn draw_table(
     rows: Vec<Vec<Text<'static>>>,
     selected: usize,
 ) {
-    let row_h = 3u16;
+    let row_h = ROW_H;
     let visible = (area.height.saturating_sub(1) / row_h).max(1) as usize;
     let first = offset(selected, rows.len(), visible);
     let mut table_rows = Vec::new();
     for (i, cells) in rows.into_iter().enumerate().skip(first).take(visible) {
-        let mut row = Row::new(cells.into_iter().map(Cell::from))
-            .height(2)
-            .bottom_margin(1);
+        let mut row = Row::new(cells.into_iter().map(Cell::from)).height(2);
         if i == selected {
             row = row.style(Style::new().bg(SELECTED_BG));
         }
@@ -419,20 +415,229 @@ fn draw_routines(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
     let widths = cols.iter().map(|(_, _, w)| *w).collect();
     let sel = app.sel_routine;
     let n = rows.len();
-    draw_table(frame, app, area, head, widths, rows, sel);
+    // In a tall enough window the selected routine's details sit right
+    // under the list.
+    let table_h = 1 + ROW_H * n as u16;
+    let (list, details) = if area.height >= DETAILS_FROM && area.width >= 50 {
+        let list_h = table_h.min(area.height - DETAILS_MIN);
+        let details = Rect::new(
+            area.x,
+            area.y + list_h + 1,
+            area.width,
+            area.height - list_h - 1,
+        );
+        (
+            Rect {
+                height: list_h,
+                ..area
+            },
+            Some(details),
+        )
+    } else {
+        (area, None)
+    };
+    draw_table(frame, app, list, head, widths, rows, sel);
     // The last-run cell links to the routine's runs: the column is the
     // table's last one, LAST_W wide, flush right inside the side margins.
     if cols.last().is_some_and(|(c, _, _)| *c == RCol::Last) {
-        let x = area.x + area.width.saturating_sub(1 + LAST_W);
-        let visible = (area.height.saturating_sub(1) / 3).max(1) as usize;
+        let x = list.x + list.width.saturating_sub(1 + LAST_W);
+        let visible = (list.height.saturating_sub(1) / ROW_H).max(1) as usize;
         let first = offset(sel, n, visible);
         for (i, r) in routines.iter().enumerate().skip(first).take(visible) {
-            let y = area.y + 1 + ((i - first) as u16) * 3;
-            if app.latest_run(&r.id).is_some() && y < area.y + area.height {
+            let y = list.y + 1 + ((i - first) as u16) * ROW_H;
+            if app.latest_run(&r.id).is_some() && y < list.y + list.height {
                 app.hits.push((Rect::new(x, y, LAST_W, 1), Hit::RunsOf(i)));
             }
         }
     }
+    if let (Some(area), Some(r)) = (details, routines.get(sel)) {
+        draw_details(frame, app, icons, r, area);
+    }
+}
+
+/// Rows per routine or run in the lists: name and details, no gap.
+const ROW_H: u16 = 2;
+/// The details of the selected routine show from this list height on,
+/// with at least DETAILS_MIN rows for them.
+const DETAILS_FROM: u16 = 24;
+const DETAILS_MIN: u16 = 11;
+
+/// The selected routine in full: everything the form sets, its last run
+/// and the start of its prompt or command.
+fn draw_details(frame: &mut Frame, app: &App, icons: &Icons, r: &Routine, area: Rect) {
+    let inner = Rect::new(
+        area.x + 1,
+        area.y,
+        area.width.saturating_sub(2),
+        area.height,
+    );
+    let w = inner.width as usize;
+    let f = &r.file;
+    let now = Local::now();
+    let mut lines: Vec<Line> = Vec::new();
+    let title = format!(" {}", r.file.name);
+    let rule = w.saturating_sub(title.width() + 2);
+    lines.push(Line::from(vec![
+        Span::styled(title, bold(ACCENT)),
+        Span::styled(format!(" {}", "─".repeat(rule)), Style::new().fg(BORDER)),
+    ]));
+    const LW: usize = 15;
+    let row = |label: &str, value: Vec<Span<'static>>| {
+        let mut spans = vec![Span::styled(
+            format!(" {label:<LW$}"),
+            Style::new().fg(MUTED),
+        )];
+        spans.extend(value);
+        Line::from(spans)
+    };
+    let text = |s: String| vec![Span::styled(s, Style::new().fg(TEXT))];
+    let room = w.saturating_sub(LW + 2);
+    if let Some(p) = &r.problem {
+        lines.push(row(
+            "Problem",
+            vec![Span::styled(clip(p, room), Style::new().fg(RED))],
+        ));
+    } else if !r.approved {
+        lines.push(row(
+            "Approval",
+            vec![Span::styled(
+                "changed outside the list · a shows it and approves",
+                Style::new().fg(YELLOW),
+            )],
+        ));
+    }
+    // Schedule and when it runs next.
+    let mut when = vec![Span::styled(r.schedule_text(), Style::new().fg(TEXT))];
+    let next = if !f.enabled {
+        Some(Span::styled("off", Style::new().fg(RED)))
+    } else {
+        match r.schedule() {
+            Some(crate::schedule::Schedule::AtStart) => None,
+            s => s.and_then(|c| c.next_after(&now)).map(|t| {
+                Span::styled(
+                    format!("next {}", short_time(&t, &now)),
+                    Style::new().fg(FAINT),
+                )
+            }),
+        }
+    };
+    if let Some(next) = next {
+        when.push(Span::styled(" · ", Style::new().fg(FAINT)));
+        when.push(next);
+    }
+    lines.push(row("Schedule", when));
+    if r.is_shell() {
+        lines.push(row("Runs", text("a shell command".into())));
+    } else {
+        let mode = if f.permission_mode.is_empty() {
+            "agent's own permissions".to_string()
+        } else {
+            agent::label(agent::modes(&f.agent), &f.permission_mode)
+        };
+        let model = if f.model.is_empty() {
+            "default model".to_string()
+        } else {
+            agent::label(agent::models(&f.agent), &f.model)
+        };
+        let mut agent_words = format!("{} · {mode} · {model}", f.agent);
+        if !f.effort.is_empty() {
+            agent_words.push_str(&format!(
+                " · {} effort",
+                agent::label(agent::efforts(&f.agent), &f.effort).to_lowercase()
+            ));
+        }
+        lines.push(row("Agent", text(clip(&agent_words, room))));
+    }
+    lines.push(row("Folder", text(clip(&f.folder, room))));
+    let mut limits = format!(
+        "{} minute{}, then {}",
+        f.time_limit_minutes,
+        if f.time_limit_minutes == 1 { "" } else { "s" },
+        if f.stop_at_limit {
+            "stops"
+        } else {
+            "keeps running"
+        }
+    );
+    limits.push_str(&match f.retries {
+        0 => " · no retry".to_string(),
+        1 => format!(" · retries once after {} min", f.retry_delay_minutes),
+        n => format!(" · retries {n}× after {} min", f.retry_delay_minutes),
+    });
+    lines.push(row("Time limit", text(clip(&limits, room))));
+    if !r.is_shell() {
+        let mut extras = Vec::new();
+        if !f.check_command.is_empty() {
+            extras.push(format!("checks first: {}", f.check_command));
+        }
+        if f.remember {
+            extras.push("uses earlier results".into());
+        }
+        if !f.args.is_empty() {
+            extras.push(format!("options: {}", f.args.join(" ")));
+        }
+        if !extras.is_empty() {
+            lines.push(row("Extras", text(clip(&extras.join(" · "), room))));
+        }
+    }
+    let last = match app.latest_run(&r.id) {
+        Some(run) => {
+            let (icon, color) = icons.status(run.status);
+            let mut v = vec![
+                Span::styled(
+                    format!("{icon} {}", run.status.label()),
+                    Style::new().fg(color),
+                ),
+                Span::styled(
+                    format!(" · {}", crate::app::ago(&run.started, &now)),
+                    Style::new().fg(FAINT),
+                ),
+            ];
+            let used = Line::from(v.clone()).width() + 3;
+            if let Some(first) = run.result.lines().find(|l| !l.trim().is_empty()) {
+                v.push(Span::styled(
+                    format!(" · {}", clip(first.trim(), room.saturating_sub(used))),
+                    Style::new().fg(TEXT),
+                ));
+            }
+            v
+        }
+        None => vec![Span::styled("none yet", Style::new().fg(FAINT))],
+    };
+    lines.push(row("Last run", last));
+    // The prompt or command fills the rest.
+    let label = if r.is_shell() { "Command" } else { "Prompt" };
+    let left = (inner.height as usize).saturating_sub(lines.len());
+    if left > 0 {
+        let mut body: Vec<String> = Vec::new();
+        for l in r.prompt.lines() {
+            if body.len() >= left {
+                break;
+            }
+            if l.trim().is_empty() && body.is_empty() {
+                continue;
+            }
+            body.extend(wrap(l, room.max(10)));
+        }
+        let more = body.len() > left;
+        body.truncate(left);
+        if more {
+            if let Some(last) = body.last_mut() {
+                last.push('…');
+            }
+        }
+        if body.is_empty() {
+            lines.push(row(
+                label,
+                vec![Span::styled("empty", Style::new().fg(FAINT))],
+            ));
+        }
+        for (i, b) in body.into_iter().enumerate() {
+            let shown = if i == 0 { label } else { "" };
+            lines.push(row(shown, vec![Span::styled(b, Style::new().fg(MUTED))]));
+        }
+    }
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
 /// Width of the last-run column.
@@ -458,10 +663,8 @@ fn last_run(
                 format!("{icon} {}", run.status.label()),
                 Style::new().fg(color),
             ),
-            Span::styled(
-                format!("  {runs} ›"),
-                Style::new().fg(ACCENT).add_modifier(Modifier::UNDERLINED),
-            ),
+            Span::raw("  "),
+            Span::styled(format!("{runs} ›"), Style::new().fg(ACCENT)),
         ]),
         faint(if run.status.active() {
             format!("{when} · for {}", crate::app::took(run))
@@ -689,6 +892,41 @@ fn button(label: &str, on: bool) -> Span<'static> {
     }
 }
 
+/// A row of the form: a part's heading, an empty row, or a field (by its
+/// place in `Form::fields`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum FormRow {
+    Head(&'static str),
+    Blank,
+    Field(usize),
+    /// A further line of the prompt's preview (1 is its second line).
+    More(usize),
+}
+
+/// The schedule in words for the Schedule heading, such as "runs weekdays
+/// at 09:00 · next Wed 09:00", or what is wrong with it.
+fn schedule_summary(form: &crate::form::Form) -> Span<'static> {
+    let now = Local::now();
+    match form.schedule() {
+        Ok(c) => {
+            let schedule = Schedule::parse(&c).expect("checked");
+            let next = schedule
+                .next_after(&now)
+                .map(|t| format!(" · next {}", short_time(&t, &now)))
+                .unwrap_or_default();
+            // "Weekdays at 09:00" reads "runs weekdays at 09:00".
+            let words = schedule.describe();
+            let mut chars = words.chars();
+            let words = match chars.next() {
+                Some(first) => first.to_lowercase().chain(chars).collect::<String>(),
+                None => words,
+            };
+            Span::styled(format!("runs {words}{next}"), Style::new().fg(GREEN))
+        }
+        Err(e) => Span::styled(e, Style::new().fg(RED)),
+    }
+}
+
 fn draw_form(frame: &mut Frame, app: &mut App, area: Rect) {
     let Some(form) = app.form.as_deref().cloned() else {
         return;
@@ -701,12 +939,65 @@ fn draw_form(frame: &mut Frame, app: &mut App, area: Rect) {
     );
     let fields = form.fields();
     let current = form.current();
-    // Below the fields: the schedule in words, then what the current field
-    // means, set off by an accent bar like a tooltip. A click on a field
-    // selects it and so shows its explanation.
+    // The rows: a heading at the start of each part of the form, and an
+    // empty row before the save button.
+    let mut rows: Vec<FormRow> = Vec::new();
+    let mut last = "";
+    for (i, f) in fields.iter().enumerate() {
+        let s = form.section(*f);
+        if s != last {
+            rows.push(if s.is_empty() {
+                FormRow::Blank
+            } else {
+                FormRow::Head(s)
+            });
+            last = s;
+        }
+        rows.push(FormRow::Field(i));
+    }
+    // The prompt shows its first lines, as many as fit (up to eight), and
+    // ends in "…" when it goes on.
+    let value_w = (inner.width as usize).saturating_sub(LABEL_W + 2).max(10);
+    let mut preview: Vec<String> = Vec::new();
+    for l in form.prompt.trim_end().lines() {
+        if preview.is_empty() && l.trim().is_empty() {
+            continue;
+        }
+        preview.extend(wrap(&l.replace('\t', "    "), value_w));
+    }
+    let prompt_at = fields.iter().position(|f| *f == Field::Prompt);
+    let free = (inner.height as usize).saturating_sub(rows.len() + 2 + 2);
+    let extra = preview.len().saturating_sub(1).min(free).min(7);
+    if let Some(p) = prompt_at {
+        if let Some(at) = rows.iter().position(|r| *r == FormRow::Field(p)) {
+            for j in (1..=extra).rev() {
+                rows.insert(at + 1, FormRow::More(j));
+            }
+        }
+    }
+    let cut = preview.len() > extra + 1;
+    let preview_line = |j: usize| -> Vec<Span<'static>> {
+        let mut line = preview.get(j).cloned().unwrap_or_default();
+        if cut && j == extra {
+            // Room for the "…" that says it goes on.
+            let w = line.width();
+            if w + 2 > value_w {
+                line = clip(&line, value_w.saturating_sub(2));
+                line = line.trim_end_matches('…').to_string();
+            }
+            return vec![
+                Span::styled(line, Style::new().fg(TEXT)),
+                Span::styled(" …", Style::new().fg(ACCENT)),
+            ];
+        }
+        vec![Span::styled(line, Style::new().fg(TEXT))]
+    };
+    // Below the fields: what the current field means, set off by an accent
+    // bar like a tooltip. A click on a field selects it and so shows its
+    // explanation.
     let mut hint = wrap(form.hint(current), inner.width.saturating_sub(4) as usize);
     // Up to four lines, fewer when the fields would no longer all fit.
-    let spare = (inner.height as usize).saturating_sub(fields.len() + 1 + 5);
+    let spare = (inner.height as usize).saturating_sub(rows.len() + 2);
     let hint_rows = spare.clamp(2, 4);
     if hint.len() > hint_rows {
         hint.truncate(hint_rows);
@@ -715,25 +1006,63 @@ fn draw_form(frame: &mut Frame, app: &mut App, area: Rect) {
         }
     }
     let hint_shown = hint.len().min(hint_rows) as u16;
+    // gap, title, text
     let below = if inner.height >= 12 {
-        // gap, summary, gap, title, text
-        4 + hint_shown
+        2 + hint_shown
     } else {
-        1
+        0
     };
     let list_h = inner.height.saturating_sub(below);
-    // An empty row between the last field and the save button.
-    let gap = usize::from(list_h >= 6);
-    let row_of = |i: usize| i + if fields[i] == Field::Save { gap } else { 0 };
-    let rows = fields.len() + gap;
-    let first = offset(row_of(form.field), rows, list_h as usize);
-    for (i, f) in fields.iter().enumerate() {
-        let r = row_of(i);
+    let sel = rows
+        .iter()
+        .position(|r| *r == FormRow::Field(form.field))
+        .unwrap_or(0);
+    let mut first = offset(sel, rows.len(), list_h as usize);
+    // Keep the heading of the selected field's part in view.
+    if first == sel && sel > 0 && matches!(rows[sel - 1], FormRow::Head(_)) {
+        first -= 1;
+    }
+    let schedule_words = schedule_summary(&form);
+    for (r, layout_row) in rows.iter().enumerate() {
         if r < first || r >= first + list_h as usize {
             continue;
         }
         let y = inner.y + (r - first) as u16;
         let row = Rect::new(inner.x, y, inner.width, 1);
+        let i = match layout_row {
+            FormRow::Blank => continue,
+            FormRow::Head(name) => {
+                let mut spans = vec![Span::styled(format!(" {name}"), bold(ACCENT))];
+                if *name == "Schedule" {
+                    spans.push(Span::raw("  "));
+                    spans.push(schedule_words.clone());
+                }
+                let used = Line::from(spans.clone()).width();
+                let rule = (inner.width as usize).saturating_sub(used + 2);
+                if rule > 2 {
+                    spans.push(Span::styled(
+                        format!(" {}", "─".repeat(rule)),
+                        Style::new().fg(BORDER),
+                    ));
+                }
+                frame.render_widget(Paragraph::new(Line::from(spans)), row);
+                continue;
+            }
+            FormRow::More(j) => {
+                // A further line of the prompt; it belongs to the field.
+                let Some(p) = prompt_at else { continue };
+                if p == form.field {
+                    frame.render_widget(Block::new().style(Style::new().bg(SELECTED_BG)), row);
+                }
+                app.hits.push((row, Hit::Field(p)));
+                let mut spans = vec![Span::raw(" ".repeat(LABEL_W + 1))];
+                spans.extend(preview_line(*j));
+                frame.render_widget(Paragraph::new(Line::from(spans)), row);
+                continue;
+            }
+            FormRow::Field(i) => *i,
+        };
+        let f = &fields[i];
         let selected = i == form.field;
         if selected {
             frame.render_widget(Block::new().style(Style::new().bg(SELECTED_BG)), row);
@@ -754,6 +1083,14 @@ fn draw_form(frame: &mut Frame, app: &mut App, area: Rect) {
             spans.push(button("Esc back", false));
             app.hits
                 .push((Rect::new(x + 10, y, 10, 1), Hit::Key('\u{1b}')));
+            // Whether it can be saved, right beside the button.
+            spans.push(Span::raw("   "));
+            spans.push(match form.build() {
+                Ok(_) => Span::styled("ready to save", Style::new().fg(GREEN)),
+                Err(e) => Span::styled(format!("not ready: {e}"), Style::new().fg(YELLOW)),
+            });
+        } else if *f == Field::Prompt && !preview.is_empty() {
+            spans.extend(preview_line(0));
         } else {
             let room = (inner.width as usize).saturating_sub(LABEL_W + 2);
             spans.extend(field_value(&form, *f, selected, room));
@@ -764,42 +1101,8 @@ fn draw_form(frame: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
     // Right under the fields, so it reads as part of the form.
-    let shown = (rows - first).min(list_h as usize) as u16;
-    let y = inner.y + shown + if below > 1 { 1 } else { 0 };
-    let now = Local::now();
-    let mut summary = match form.schedule() {
-        Ok(c) => {
-            let schedule = Schedule::parse(&c).expect("checked");
-            let next = schedule
-                .next_after(&now)
-                .map(|t| format!(" · next {}", short_time(&t, &now)))
-                .unwrap_or_default();
-            // "Weekdays at 09:00" reads "Runs weekdays at 09:00".
-            let words = schedule.describe();
-            let mut chars = words.chars();
-            let words = match chars.next() {
-                Some(first) => first.to_lowercase().chain(chars).collect::<String>(),
-                None => words,
-            };
-            vec![Span::styled(
-                format!("Runs {words}{next}"),
-                Style::new().fg(GREEN),
-            )]
-        }
-        Err(e) => vec![Span::styled(format!("Schedule: {e}"), Style::new().fg(RED))],
-    };
-    if form.schedule().is_ok() {
-        if let Err(e) = form.build() {
-            summary.push(Span::styled(
-                format!(" · not ready: {e}"),
-                Style::new().fg(YELLOW),
-            ));
-        }
-    }
-    frame.render_widget(
-        Paragraph::new(Line::from(summary)),
-        Rect::new(inner.x + 1, y, inner.width.saturating_sub(2), 1),
-    );
+    let shown = (rows.len() - first).min(list_h as usize) as u16;
+    let y = inner.y + shown - 1;
     if below > 2 {
         let bar = || Span::styled("▎ ", Style::new().fg(ACCENT));
         let mut lines = vec![Line::from(vec![
@@ -813,7 +1116,7 @@ fn draw_form(frame: &mut Frame, app: &mut App, area: Rect) {
         );
         frame.render_widget(
             Paragraph::new(Text::from(lines)),
-            Rect::new(inner.x + 1, y + 2, inner.width.saturating_sub(2), below - 3),
+            Rect::new(inner.x + 1, y + 2, inner.width.saturating_sub(2), below - 1),
         );
     }
 }
@@ -1310,6 +1613,90 @@ fn draw_message(frame: &mut Frame, app: &mut App, title: &str, text: &[String]) 
     app.hits.push((Rect::new(inner.x, y, 6, 1), Hit::Key('\n')));
 }
 
+/// The jobs in the crontab, and the choice to move or copy them here.
+fn draw_cron(frame: &mut Frame, app: &mut App, jobs: &[crate::crontab::CronJob]) {
+    let screen = frame.area();
+    let width = screen.width.saturating_sub(4).min(110);
+    let text_w = width.saturating_sub(4) as usize;
+    let mut lines: Vec<Line> = Vec::new();
+    for job in jobs {
+        let when = Schedule::parse(&job.schedule)
+            .map(|s| s.describe())
+            .unwrap_or_else(|_| job.schedule.clone());
+        lines.push(Line::from(vec![
+            Span::styled(format!("{when}  "), bold(TEXT)),
+            Span::styled(
+                clip(
+                    &job.command,
+                    text_w.saturating_sub(when.width() + 2).max(10),
+                ),
+                Style::new().fg(MUTED),
+            ),
+        ]));
+        if let Some(note) = &job.note {
+            lines.push(Line::from(Span::styled(
+                format!("  {note}"),
+                Style::new().fg(YELLOW),
+            )));
+        }
+    }
+    lines.push(Line::from(""));
+    for l in wrap(
+        "Move: they become routines that are on, with their output, retries and notifications here; their lines in your crontab are commented out (a backup is kept), so nothing runs twice. Copy: added switched off; your crontab stays as it is.",
+        text_w,
+    ) {
+        lines.push(Line::from(Span::styled(l, Style::new().fg(FAINT))));
+    }
+    if !crate::autostart::is_on() {
+        for l in wrap(
+            "Autostart is off: routines run only while Herdr runs, cron jobs always. Turn autostart on at the top to run them after a restart too.",
+            text_w,
+        ) {
+            lines.push(Line::from(Span::styled(l, Style::new().fg(YELLOW))));
+        }
+    }
+    let height = (lines.len() as u16 + 4).min(screen.height.saturating_sub(2));
+    let area = centered(screen, width, height);
+    let title = if jobs.len() == 1 {
+        "1 cron job in your crontab".to_string()
+    } else {
+        format!("{} cron jobs in your crontab", jobs.len())
+    };
+    let inner = dialog(frame, area, &title);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)),
+        Rect::new(
+            inner.x,
+            inner.y,
+            inner.width,
+            inner.height.saturating_sub(2),
+        ),
+    );
+    let y = inner.y + inner.height.saturating_sub(1);
+    let mut x = inner.x;
+    let mut spans = Vec::new();
+    for (key, what) in [
+        ("m", "move here"),
+        ("c", "copy, switched off"),
+        ("Esc", "back"),
+    ] {
+        let w = (key.width() + what.width() + 3) as u16;
+        let hit = if key == "Esc" {
+            '\u{1b}'
+        } else {
+            key.chars().next().unwrap_or(' ')
+        };
+        app.hits.push((Rect::new(x, y, w, 1), Hit::Key(hit)));
+        x += w;
+        spans.push(Span::styled(key, bold(MUTED)));
+        spans.push(Span::styled(format!(" {what}  "), Style::new().fg(FAINT)));
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)),
+        Rect::new(inner.x, y, inner.width, 1),
+    );
+}
+
 fn draw_log(frame: &mut Frame, app: &mut App, mut log: LogView) {
     let screen = frame.area();
     let area = centered(
@@ -1459,6 +1846,7 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
                 ("r", "run now (asks first)"),
                 ("a", "approve what changed outside the list (asks first)"),
                 ("Space", "on / off"),
+                ("c", "copy it (the copy starts switched off)"),
                 ("o", "go to the tab of its last run"),
                 ("l", "result and output of its last run"),
                 ("h", "its runs (or click \"n runs\")"),
@@ -1507,7 +1895,7 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
                 ("S", "start the scheduler"),
                 (
                     "A",
-                    "start Herdr at login, or not (routines run after a restart)",
+                    "autostart: Herdr starts at login (routines run after a restart), or not",
                 ),
                 ("i", "Nerd Font icons / plain symbols"),
                 ("Esc", "close a dialog (never the list)"),

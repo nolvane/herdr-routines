@@ -144,6 +144,7 @@ pub enum ConfirmFor {
     Delete(String),
     DiscardForm,
     Autostart,
+    AutostartOff,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -180,6 +181,8 @@ pub enum Mode {
         lines: Vec<String>,
     },
     Log(LogView),
+    /// The jobs in the person's crontab, to move or copy here.
+    Cron(Vec<crate::crontab::CronJob>),
     AskQuit,
 }
 
@@ -272,6 +275,8 @@ pub struct App {
     last_click: Option<(Instant, Hit)>,
     /// What was copied last, for pasting when there is no system clipboard.
     clip: String,
+    /// Ask about starting at login once the intro is closed.
+    autostart_after_intro: bool,
 }
 
 impl App {
@@ -303,6 +308,7 @@ impl App {
             last_load: Instant::now(),
             last_click: None,
             clip: String::new(),
+            autostart_after_intro: false,
         };
         app.reload();
         app
@@ -445,6 +451,44 @@ impl App {
             Err(e) => self.flash(e, RED),
         }
         self.reload();
+    }
+
+    /// `c`: a copy of the selected routine, switched off, without its runs
+    /// or memory. A copy of a routine that waits for approval waits too.
+    fn duplicate(&mut self) {
+        let Some(id) = self.selected_routine().map(|r| r.id.clone()) else {
+            return;
+        };
+        // From disk, as for switching: what is copied is what is approved.
+        let source = match Routine::load(&self.paths, &id) {
+            Ok(r) => r,
+            Err(e) => return self.flash(format!("Cannot copy: {e}"), RED),
+        };
+        let mut name = format!("{} copy", source.file.name);
+        let mut n = 2;
+        while self.routines.iter().any(|r| r.file.name == name) {
+            name = format!("{} copy {n}", source.file.name);
+            n += 1;
+        }
+        let mut copy = source.clone();
+        copy.id = routine::new_id(&self.paths, &name);
+        copy.file.name = name;
+        copy.file.enabled = false;
+        let saved = if source.approved {
+            copy.save_approved(&self.paths)
+        } else {
+            copy.save(&self.paths).map(|_| ())
+        };
+        match saved {
+            Ok(()) => {
+                self.flash(format!("Copied as {}, switched off", copy.file.name), GREEN);
+                self.reload();
+                if let Some(i) = self.routines.iter().position(|r| r.id == copy.id) {
+                    self.sel_routine = i;
+                }
+            }
+            Err(e) => self.flash(format!("Cannot copy: {e}"), RED),
+        }
     }
 
     fn open_run(&mut self, run: Option<Run>) {
@@ -872,30 +916,75 @@ impl App {
         });
     }
 
+    /// `C`: the jobs in the crontab.
+    fn show_cron(&mut self) {
+        match crate::crontab::read() {
+            Ok(text) => {
+                let jobs = crate::crontab::parse(&text);
+                if jobs.is_empty() {
+                    self.flash("No cron jobs in your crontab", MUTED);
+                } else {
+                    self.mode = Mode::Cron(jobs);
+                }
+            }
+            Err(e) => self.flash(format!("Could not read the crontab: {e}"), RED),
+        }
+    }
+
+    fn import_cron(&mut self, jobs: Vec<crate::crontab::CronJob>, moving: bool) {
+        self.mode = Mode::Normal;
+        match crate::crontab::import(&self.paths, &jobs, moving) {
+            Ok(n) => {
+                let what = if n == 1 { "1 cron job" } else { "cron jobs" };
+                let text = match (moving, n) {
+                    (true, 1) => "Moved 1 cron job here".to_string(),
+                    (true, _) => format!("Moved {n} {what} here"),
+                    (false, 1) => "Copied 1 cron job, switched off".to_string(),
+                    (false, _) => format!("Copied {n} {what}, switched off"),
+                };
+                self.flash(text, GREEN);
+            }
+            Err(e) => self.flash(e, RED),
+        }
+        self.view = View::Routines;
+        self.reload();
+    }
+
     /// `A`: start Herdr at login, or not any more (asks before turning on).
     fn toggle_autostart(&mut self) {
         if !crate::autostart::supported() {
             self.flash("Starting at login is not supported here", MUTED);
         } else if crate::autostart::is_on() {
-            match crate::autostart::turn_off() {
-                Ok(()) => self.flash("Herdr no longer starts at login", RED),
-                Err(e) => self.flash(format!("Could not turn it off: {e}"), RED),
-            }
-        } else {
             self.mode = Mode::Confirm(Confirm {
-                question: "Start Herdr at login?".into(),
+                question: "Turn autostart off?".into(),
                 lines: vec![
-                    "Herdr then runs in the background from the moment you log in, so routines run after a restart without opening it. Opening Herdr connects to it as usual.".into(),
-                    "Takes effect at the next login. A turns it off again.".into(),
+                    "Herdr then no longer starts at login: after a restart, routines run only once you open Herdr. Herdr running now keeps running.".into(),
                 ],
-                purpose: ConfirmFor::Autostart,
+                purpose: ConfirmFor::AutostartOff,
             });
+        } else {
+            self.ask_autostart();
         }
+    }
+
+    fn ask_autostart(&mut self) {
+        self.mode = Mode::Confirm(Confirm {
+            question: "Start Herdr at login?".into(),
+            lines: vec![
+                "Herdr then runs in the background from the moment you log in, so routines also run after a restart without opening it. Opening Herdr connects to it as usual.".into(),
+                "Takes effect at the next login. Change it any time with a click on \"autostart\" at the top.".into(),
+            ],
+            purpose: ConfirmFor::Autostart,
+        });
     }
 
     fn confirmed(&mut self, c: Confirm) {
         self.mode = Mode::Normal;
         match c.purpose {
+            ConfirmFor::AutostartOff => match crate::autostart::turn_off() {
+                Ok(()) => self.flash("Autostart is off", RED),
+                Err(e) => self.flash(format!("Could not turn it off: {e}"), RED),
+            },
             ConfirmFor::Autostart => {
                 let mut bin = crate::herdr::bin();
                 if !bin.is_absolute() {
@@ -906,7 +995,7 @@ impl App {
                     }
                 }
                 match crate::autostart::turn_on(&bin.to_string_lossy()) {
-                    Ok(()) => self.flash("Herdr starts at login from now on", GREEN),
+                    Ok(()) => self.flash("Autostart is on: Herdr starts at login", GREEN),
                     Err(e) => self.flash(format!("Could not turn it on: {e}"), RED),
                 }
             }
@@ -1158,8 +1247,17 @@ impl App {
                     KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char(' ')
                 ) {
                     self.mode = Mode::Normal;
+                    if std::mem::take(&mut self.autostart_after_intro) {
+                        self.ask_autostart_once();
+                    }
                 }
             }
+            Mode::Cron(jobs) => match k.code {
+                KeyCode::Char('m') => self.import_cron(jobs, true),
+                KeyCode::Char('c') => self.import_cron(jobs, false),
+                KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::Normal,
+                _ => {}
+            },
             Mode::Log(mut log) => {
                 let page = 10;
                 match k.code {
@@ -1316,6 +1414,7 @@ impl App {
             KeyCode::Char('2') => self.view = View::Runs,
             KeyCode::Char('S') => self.start_scheduler(),
             KeyCode::Char('A') => self.toggle_autostart(),
+            KeyCode::Char('C') => self.show_cron(),
             KeyCode::Char('i') => self.toggle_icons(),
             KeyCode::Char('n') => self.new_routine(),
             KeyCode::Enter => self.enter(),
@@ -1347,6 +1446,7 @@ impl App {
                 KeyCode::Char('r') => self.ask_run(),
                 KeyCode::Char('a') => self.ask_approve(),
                 KeyCode::Char(' ') => self.toggle(),
+                KeyCode::Char('c') => self.duplicate(),
                 KeyCode::Char('o') => {
                     let id = self.selected_routine().unwrap().id.clone();
                     let run = self.latest_run(&id).cloned();
@@ -1547,6 +1647,7 @@ impl App {
     fn show_intro(&mut self) {
         let seen = self.paths.state.join("intro-seen");
         if seen.exists() || !self.routines.is_empty() {
+            self.ask_autostart_once();
             return;
         }
         if paths::write_atomic(&seen, b"").is_ok() {
@@ -1554,6 +1655,19 @@ impl App {
                 title: "How routines work".into(),
                 lines: INTRO.iter().map(|l| l.to_string()).collect(),
             };
+            // Closing the note asks next.
+            self.autostart_after_intro = true;
+        }
+    }
+
+    /// Asks once, on the first open, whether Herdr should start at login.
+    fn ask_autostart_once(&mut self) {
+        let asked = self.paths.state.join("autostart-asked");
+        if asked.exists() || !crate::autostart::supported() || crate::autostart::is_on() {
+            return;
+        }
+        if paths::write_atomic(&asked, b"").is_ok() {
+            self.ask_autostart();
         }
     }
 
@@ -1938,6 +2052,116 @@ mod tests {
     }
 
     #[test]
+    fn cron_jobs_move_here() {
+        let mut a = app("cron");
+        let dir = a.paths.state.clone();
+        let tab = dir.join("fake-crontab.txt");
+        std::fs::write(
+            &tab,
+            "PATH=/usr/bin:/bin\n0 2 * * * /opt/jobs/backup.sh --all\n@reboot ~/start.sh\n",
+        )
+        .unwrap();
+        // A stand-in for crontab: -l prints the file, a path replaces it.
+        let fake = dir.join("crontab");
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = -l ]; then cat '{0}'; else cp \"$1\" '{0}'; fi\n",
+                tab.display()
+            ),
+        )
+        .unwrap();
+        std::process::Command::new("chmod")
+            .args(["+x", &fake.to_string_lossy()])
+            .status()
+            .unwrap();
+        std::env::set_var("HERDR_ROUTINES_CRONTAB", &fake);
+        press(&mut a, KeyCode::Char('C'));
+        let Mode::Cron(jobs) = a.mode.clone() else {
+            panic!("no cron list: {:?}", a.flash);
+        };
+        assert_eq!(jobs.len(), 2);
+        let lines = screen(&mut a, 100, 30);
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("2 cron jobs in your crontab")));
+        assert!(lines.iter().any(|l| l.contains("When Herdr starts")));
+        press(&mut a, KeyCode::Char('m'));
+        std::env::remove_var("HERDR_ROUTINES_CRONTAB");
+        let moved: Vec<&Routine> = a
+            .routines
+            .iter()
+            .filter(|r| r.file.agent == routine::SHELL)
+            .collect();
+        assert_eq!(moved.len(), 2, "{:?}", a.flash);
+        assert!(moved.iter().all(|r| r.file.enabled && r.problem.is_none()));
+        assert!(moved.iter().any(|r| r.file.name == "backup.sh --all"));
+        let now = std::fs::read_to_string(&tab).unwrap();
+        assert!(now.contains("# moved to herdr-routines (routine "), "{now}");
+        assert!(crate::crontab::parse(&now).is_empty());
+        assert!(std::fs::read_dir(&dir).unwrap().flatten().any(|e| e
+            .file_name()
+            .to_string_lossy()
+            .starts_with("crontab-backup-")));
+    }
+
+    #[test]
+    fn a_copy_starts_off_and_keeps_the_approval_state() {
+        let mut a = app("copy");
+        // The first routine was saved in the list, so its copy is approved.
+        a.sel_routine = a
+            .routines
+            .iter()
+            .position(|r| r.file.name == "Morning report")
+            .unwrap();
+        press(&mut a, KeyCode::Char('c'));
+        let copy = a.selected_routine().unwrap().clone();
+        assert_eq!(copy.file.name, "Morning report copy");
+        assert!(!copy.file.enabled && copy.approved);
+        assert_eq!(copy.prompt, "Do task 0.\nThen stop.");
+        assert_eq!(a.run_count(&copy.id), 0);
+        // A second copy gets its own name.
+        a.sel_routine = a
+            .routines
+            .iter()
+            .position(|r| r.file.name == "Morning report")
+            .unwrap();
+        press(&mut a, KeyCode::Char('c'));
+        assert_eq!(
+            a.selected_routine().unwrap().file.name,
+            "Morning report copy 2"
+        );
+        // A copy of a routine that waits for approval waits too.
+        a.sel_routine = a
+            .routines
+            .iter()
+            .position(|r| r.file.name == "Weekly cleanup")
+            .unwrap();
+        press(&mut a, KeyCode::Char('c'));
+        let copy = a.selected_routine().unwrap();
+        assert!(!copy.approved && !copy.file.enabled);
+    }
+
+    #[test]
+    fn a_tall_window_shows_the_selected_routines_details() {
+        let mut a = app("details");
+        a.sel_routine = 0;
+        let name = a.routines[0].file.name.clone();
+        let lines = screen(&mut a, 110, 34);
+        let at = |s: &str| lines.iter().position(|l| l.contains(s));
+        let head = at(&format!(" {name} ─")).expect("details heading");
+        assert!(at(" Schedule       Weekdays").is_some_and(|i| i > head));
+        assert!(at("Do task").is_some_and(|i| i > head), "the prompt shows");
+        // The routines follow each other without empty rows.
+        let first = at(&name).unwrap();
+        let other = &a.routines[1].file.name;
+        assert_eq!(at(other).unwrap(), first + 2);
+        // A short window shows only the list.
+        let lines = screen(&mut a, 110, 20);
+        assert!(!lines.iter().any(|l| l.contains(&format!(" {name} ─"))));
+    }
+
+    #[test]
     fn run_counts_link_to_the_routines_runs() {
         let mut a = app("filter");
         let ids: Vec<(String, String)> = a
@@ -2111,6 +2335,22 @@ mod tests {
         );
         assert_eq!(save, prompt + 2, "one empty row before the button");
         assert!(lines[prompt + 1].trim().is_empty());
+    }
+
+    #[test]
+    fn the_form_shows_more_of_the_prompt_and_says_when_it_goes_on() {
+        let mut a = app("preview");
+        press(&mut a, KeyCode::Char('n'));
+        press(&mut a, KeyCode::Enter);
+        let text: Vec<String> = (1..=12).map(|i| format!("Step {i} of the task.")).collect();
+        a.form.as_mut().unwrap().prompt = text.join("\n");
+        let lines = screen(&mut a, 90, 50);
+        assert!(lines.iter().any(|l| l.contains("Step 1 of")));
+        assert!(lines.iter().any(|l| l.contains("Step 8 of the task. …")));
+        assert!(!lines.iter().any(|l| l.contains("Step 9 of")));
+        // A short window still shows the first line and the "…".
+        let lines = screen(&mut a, 90, 30);
+        assert!(lines.iter().any(|l| l.contains("Step 1 of the task. …")));
     }
 
     #[test]

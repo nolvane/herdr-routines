@@ -7,6 +7,17 @@ All notable changes to this plugin. The format follows
 
 ### Added
 
+- `C` lists the jobs in your crontab and moves them here as shell routines
+  (their lines are commented out after a backup) or copies them switched
+  off.
+- `c` copies a routine; the copy starts switched off, without runs or
+  memory, and waits for approval when the original does.
+- In a tall enough window the selected routine's details show under the
+  list: schedule, agent, folder, limits, extras, last run and the start of
+  the prompt.
+- The list asks once whether Herdr should start at login; the header chip
+  shows it and a click switches it. Turning it off asks too.
+
 - Approval of routines changed outside the list: a routine runs only as
   saved in the list or approved there with `a`, which shows everything it
   would run, the whole prompt or command included, and approves with `y`
@@ -22,6 +33,11 @@ All notable changes to this plugin. The format follows
 
 ### Changed
 
+- The edit form is grouped into parts with headings (routine, schedule,
+  long or failed runs, agent extras, prompt), shows up to eight lines of
+  the prompt with "…" when it goes on, and says beside the save button
+  whether the routine can be saved.
+- The lists have no empty row between routines or runs any more.
 - Extra arguments may no longer set permissions for Claude Code, Codex or
   Gemini; use the permission mode.
 - Routine folder names must be lower case letters, digits and dashes.

@@ -18,6 +18,7 @@ mod approval;
 mod autostart;
 mod clipboard;
 mod cron;
+mod crontab;
 mod editor;
 mod form;
 mod herdr;

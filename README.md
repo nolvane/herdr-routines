@@ -9,33 +9,45 @@ agent asks something and keep talking to it afterwards. A routine can also
 be a plain shell command or script, like a cron job, without any AI.
 
 Routines run as long as the Herdr server runs, also when no Herdr window is
-open. With `A` in the list, Herdr starts in the background at login, so
-routines also run after a restart without opening Herdr.
+open. Herdr can also start in the background at login (the list asks once,
+and the "autostart" chip at the top or `A` switches it), so routines also
+run after a restart without opening Herdr.
 
 ```
- ◷ Scheduled routines    Routines (3)   Runs (41)                      ● scheduler on
+ ◷ Scheduled routines    Routines (3)   Runs (41)     ● autostart on  ● scheduler on
 
     Routine                                     Schedule                  Last run
- ●  Inbox clean up                              Weekdays, hourly at :15   ✓ Finished
+ ●  Inbox clean up                              Weekdays, hourly at :15   ✓ Finished  12 runs ›
     claude · Sonnet · Auto · ~/mail             next in 12 min            48 min ago · took 3 min
-
- ●  Nightly backup                              Daily at 02:00            ✓ Finished
+ ●  Nightly backup                              Daily at 02:00            ✓ Finished  30 runs ›
     shell · ./backup.sh --all · ~/code/app      next 02:00                10 h ago · took 4 min
-
  ●  Release notes                               Monthly on the 1st        –
     claude · Opus · Plan only · ~/code/app      off                       no run yet
+
+ Inbox clean up ──────────────────────────────────────────────────────────────────────
+ Schedule       Weekdays, hourly at :15 · next 10:15
+ Agent          claude · Auto · Sonnet
+ Folder         ~/mail
+ Time limit     30 minutes, then stops · retries once after 5 min
+ Last run       ✓ Finished · 48 min ago · 3 newsletters archived, 2 drafts written
+ Prompt         Sort the new mail in the inbox: archive newsletters,
+                draft replies to questions …
 
  ⏎ edit  n new  r run now  space on/off  ? all keys  q close
 ```
 
 The dot in front of a routine is green when it is on and red when it is
-off; a yellow warning sign marks a routine with a problem.
+off; a yellow warning sign marks a routine with a problem. In a tall enough
+window, the selected routine's details show under the list.
 
 ## What it does
 
 - **List of routines** with their schedule in words, the next time and the
   last run. Switch a routine on or off with one key, run it now, edit it,
-  write its prompt, or create and delete routines. Works with the keyboard
+  write its prompt, copy it (the copy starts switched off), or create and
+  delete routines. The edit form is grouped into parts: the routine, its
+  schedule, what happens when it runs long or fails, the agent extras and
+  the prompt, of which it shows the first lines. Works with the keyboard
   and the mouse, like the other Herdr plugins of this author; `?` shows all
   keys.
 - **Permission mode, model and effort** per routine, picked from a list:
@@ -52,6 +64,11 @@ off; a yellow warning sign marks a routine with a problem.
   folder, with your shell and its environment. Exit code 0 counts as
   finished; any other code marks the run as failed and Herdr shows a
   notification.
+- **Your cron jobs:** `C` lists the jobs in your crontab. `m` moves them
+  here as shell routines (their crontab lines are commented out after a
+  backup in the state folder, so nothing runs twice); `c` copies them,
+  switched off, and leaves the crontab alone. Variables set in the crontab
+  (such as `PATH`) come along; `@reboot` becomes "when Herdr starts".
 - **Create with Claude:** `n`, then "Describe it to Claude", opens a tab
   where Claude asks what the routine should do, writes it and checks that
   it loads. You then approve it in the list with `a`.
@@ -149,13 +166,15 @@ Update with `herdr plugin update`.
 | `r` | Run now (asks first) |
 | `a` | Approve a routine changed outside the list (shows it first) |
 | `space` | Switch on or off |
+| `c` | Copy the routine; the copy starts switched off |
 | `o` | Go to the tab of the last run |
 | `l` | Result and output of the last run |
 | `h` | Only this routine's runs (`Esc` shows all again) |
 | `d` | Delete with its run history (asks first) |
 | `←` `→` | Switch between routines and runs |
 | `S` | Start the scheduler when it is off |
-| `A` | Start Herdr at login, or not any more |
+| `A` | Start Herdr at login, or not any more (asks first) |
+| `C` | Your cron jobs: move or copy them here |
 | `q` | Close the list (asks first); routines keep running |
 
 The mouse works too: click a tab or a row, double click to open, scroll with
@@ -249,11 +268,12 @@ holds the earlier results of a routine that remembers. The plugin's
 folders and files are readable only by you, since prompts, commands and
 saved output can hold secrets.
 
-**Start at login** (`A` in the list) writes a launch agent
+**Start at login** (`A` in the list, or a click on the "autostart" chip;
+the list asks once on its first start) writes a launch agent
 (`~/Library/LaunchAgents/herdr-routines.herdr-server.plist`) on macOS or a
 systemd user service on Linux that runs `herdr server` at login. It takes
-effect at the next login; turning it off removes the entry and leaves a
-running server alone.
+effect at the next login; turning it off (asks first) removes the entry
+and leaves a running server alone.
 
 ## Settings
 

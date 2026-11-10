@@ -406,14 +406,37 @@ impl Form {
         if self.repeat != Repeat::AtStart {
             v.push(Field::Missed);
         }
-        v.extend([Field::Limit, Field::AtLimit, Field::Retry]);
+        v.extend([Field::Enabled, Field::Limit, Field::AtLimit, Field::Retry]);
         if !self.is_shell() {
             v.extend([Field::Check, Field::Remember, Field::Args]);
         }
         // The prompt last, right above the save button: it is the longest
         // field and the one people write after choosing everything else.
-        v.extend([Field::Enabled, Field::Prompt, Field::Save]);
+        v.extend([Field::Prompt, Field::Save]);
         v
+    }
+
+    /// The part of the form a field is in, for the headings.
+    pub fn section(&self, f: Field) -> &'static str {
+        match f {
+            Field::Name
+            | Field::Agent
+            | Field::Mode
+            | Field::Model
+            | Field::Effort
+            | Field::Folder => "Routine",
+            Field::Repeat
+            | Field::Date
+            | Field::Weekday
+            | Field::Time
+            | Field::Cron
+            | Field::Missed
+            | Field::Enabled => "Schedule",
+            Field::Limit | Field::AtLimit | Field::Retry => "If it runs long or fails",
+            Field::Check | Field::Remember | Field::Args => "Agent extras",
+            Field::Prompt => "What to do",
+            Field::Save => "",
+        }
     }
 
     pub fn current(&self) -> Field {

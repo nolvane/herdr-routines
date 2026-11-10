@@ -425,3 +425,26 @@ Why: the fallback resolved newer, unreviewed dependency versions on the
 user's machine at install time. `rust-version = "1.89"` in `Cargo.toml`
 names the oldest Rust that builds it (`File::lock` came in 1.89), so an
 older toolchain fails with a clear message.
+
+## 2026-11-10: Cron jobs move in as approved shell routines
+
+`C` reads `crontab -l` and turns each job into a shell routine in the home
+folder (where cron runs it), with the crontab's variables exported at the
+top of the script and missed times skipped as cron does. Moving comments
+the job's line out of the crontab (marked "moved to herdr-routines") after
+a backup in the state folder; copying adds the routines switched off and
+leaves the crontab alone. The routines are saved approved.
+
+Why: commenting out instead of deleting keeps the crontab readable and
+easy to undo, and a job must not run twice. The owner chose the jobs in the
+list after seeing their lines, so they need no second approval; the
+crontab is the owner's own file.
+
+## 2026-11-10: A copy starts off and keeps the approval state
+
+`c` copies a routine's files as they are on disk (not the list's copy) into
+a new folder, named "<name> copy", switched off, without runs or memory.
+The copy is approved only when the original is.
+
+Why: a copy that runs at once would double every run, and copying must not
+turn a routine that waits for approval into an approved one.
