@@ -1,7 +1,7 @@
 //! The form to create or change a routine.
 
 use crate::agent;
-use crate::routine::{Alert, Missed, Routine, RoutineFile, AGENTS, SHELL};
+use crate::routine::{Alert, Missed, Routine, RoutineFile, RunsIn, AGENTS, SHELL};
 use crate::schedule::{Schedule, AT_START};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,6 +100,7 @@ pub enum Field {
     AtLimit,
     Retry,
     Alert,
+    RunsIn,
     Check,
     Remember,
     Args,
@@ -128,6 +129,7 @@ impl Field {
             Field::AtLimit => "At the time limit",
             Field::Retry => "If it fails",
             Field::Alert => "Tell me by",
+            Field::RunsIn => "Runs in",
             Field::Check => "Check first",
             Field::Remember => "Earlier results",
             Field::Args => "Extra options",
@@ -166,6 +168,7 @@ impl Field {
                 | Field::AtLimit
                 | Field::Retry
                 | Field::Alert
+                | Field::RunsIn
                 | Field::Remember
         )
     }
@@ -200,6 +203,9 @@ impl Field {
             }
             Field::Retry => {
                 "When a run fails (a command ends with an error, an agent does not start), it can be tried again a little later."
+            }
+            Field::RunsIn => {
+                "Herdr: Herdr starts it in a tab, as long as Herdr runs, and you can watch it live. Cron: a classic cron job in your computer's crontab, which also runs when Herdr is closed; its output and result still show in Runs. On macOS, a cron job that works in Documents, Desktop or Downloads needs Full Disk Access for cron."
             }
             Field::Alert => {
                 "How you hear about a run. Notification: Herdr's usual notification when it fails, runs too long or needs you. Popup on problems: a window in Herdr that stays in front until you press OK. Popup always: also when a run finishes."
@@ -271,6 +277,7 @@ pub struct Form {
     pub retries: u32,
     pub retry_delay: u32,
     pub alert: Alert,
+    pub runs_in: RunsIn,
     pub check: String,
     pub remember: bool,
     pub enabled: bool,
@@ -306,6 +313,7 @@ impl Form {
             retries: 0,
             retry_delay: 10,
             alert: Alert::default(),
+            runs_in: RunsIn::default(),
             check: String::new(),
             remember: false,
             enabled: true,
@@ -350,6 +358,7 @@ impl Form {
         f.retries = r.file.retries;
         f.retry_delay = r.file.retry_delay_minutes;
         f.alert = r.file.alert;
+        f.runs_in = r.file.runs_in;
         f.check = r.file.check_command.clone();
         f.remember = r.file.remember;
         f.enabled = r.file.enabled;
@@ -365,6 +374,11 @@ impl Form {
         self.agent() == SHELL
     }
 
+    /// A classic cron job (only shell commands can be one).
+    pub fn is_cron(&self) -> bool {
+        self.is_shell() && self.runs_in == RunsIn::Cron
+    }
+
     /// A field's name: the prompt is the command for a shell routine.
     pub fn label(&self, f: Field) -> &'static str {
         match f {
@@ -378,6 +392,12 @@ impl Form {
             Field::Prompt if self.is_shell() => {
                 "The command or script to run in the folder, such as ./backup.sh. Several lines run one after the other. ⏎ opens the editor."
             }
+            Field::Repeat if self.is_cron() => {
+                "How often it runs: every hour, every day, on weekdays, once a week, once on a date, each time the computer starts, or Custom for any other schedule."
+            }
+            Field::Limit if self.is_cron() => {
+                "After this many minutes the command is stopped and the run counts as timed out."
+            }
             Field::Agent => {
                 "Which AI does the work: Claude Code, Codex, Gemini or another agent Herdr knows. Shell command runs a command or script instead, without AI."
             }
@@ -389,6 +409,10 @@ impl Form {
     pub fn fields(&self) -> Vec<Field> {
         let a = self.agent();
         let mut v = vec![Field::Name, Field::Agent];
+        if self.is_shell() {
+            v.push(Field::RunsIn);
+        }
+        let cron = self.is_cron();
         if !agent::modes(a).is_empty() {
             v.push(Field::Mode);
         }
@@ -412,16 +436,15 @@ impl Form {
             Repeat::AtStart => {}
             _ => v.push(Field::Time),
         }
-        if self.repeat != Repeat::AtStart {
+        // Cron skips missed times and always stops a run at its limit.
+        if self.repeat != Repeat::AtStart && !cron {
             v.push(Field::Missed);
         }
-        v.extend([
-            Field::Enabled,
-            Field::Limit,
-            Field::AtLimit,
-            Field::Retry,
-            Field::Alert,
-        ]);
+        v.extend([Field::Enabled, Field::Limit]);
+        if !cron {
+            v.push(Field::AtLimit);
+        }
+        v.extend([Field::Retry, Field::Alert]);
         if !self.is_shell() {
             v.extend([Field::Check, Field::Remember, Field::Args]);
         }
@@ -436,6 +459,7 @@ impl Form {
         match f {
             Field::Name
             | Field::Agent
+            | Field::RunsIn
             | Field::Mode
             | Field::Model
             | Field::Effort
@@ -533,6 +557,7 @@ impl Form {
             Field::Retry => format!("{}:{}", self.retries, self.retry_delay),
             Field::Remember => if self.remember { "Yes" } else { "No" }.into(),
             Field::Alert => self.alert.label().into(),
+            Field::RunsIn => self.runs_in.label().into(),
             _ => String::new(),
         }
     }
@@ -611,6 +636,10 @@ impl Form {
             Field::Alert => Alert::ALL
                 .iter()
                 .map(|a| item(a.label(), a.label(), a.detail()))
+                .collect(),
+            Field::RunsIn => RunsIn::ALL
+                .iter()
+                .map(|r| item(r.label(), r.label(), r.detail()))
                 .collect(),
             Field::Enabled => vec![
                 item("Yes", "Yes", "Runs on its schedule"),
@@ -719,6 +748,11 @@ impl Form {
                     self.alert = *a;
                 }
             }
+            Field::RunsIn => {
+                if let Some(r) = RunsIn::ALL.iter().find(|r| r.label() == value) {
+                    self.runs_in = *r;
+                }
+            }
             _ => return,
         }
         self.dirty = true;
@@ -806,6 +840,11 @@ impl Form {
             },
             remember: self.remember && !self.is_shell(),
             alert: self.alert,
+            runs_in: if self.is_shell() {
+                self.runs_in
+            } else {
+                RunsIn::Herdr
+            },
         };
         if let Some(problem) = Routine::check(&file, &self.prompt) {
             return Err(problem);

@@ -7,9 +7,16 @@ All notable changes to this plugin. The format follows
 
 ### Added
 
-- `C` lists the jobs in your crontab and moves them here as shell routines
-  (their lines are commented out after a backup) or copies them switched
-  off.
+- Classic cron jobs: a shell command can run from the system's crontab
+  instead of Herdr ("Runs in: Cron", or `n` then "Classic cron job"), also
+  when Herdr is closed. They have their own tab "Cron jobs", are edited
+  like routines, and their runs, output, retries and alerts show in Runs.
+  The plugin keeps them in a marked block of the crontab.
+- The rest of the crontab shows in the Cron jobs tab too; `⏎` keeps a job
+  as a cron job managed here, moves it to Herdr or copies it.
+- "routines on/off" at the top (or `S`) switches all routines and cron jobs
+  on or off, after asking; off stays off across Herdr restarts.
+
 - "Tell me by" per routine: a notification (as before), a popup that
   stays in front until OK when a run fails, runs too long or needs you, or
   a popup for every run. The popup can go to the run's tab.
@@ -40,7 +47,9 @@ All notable changes to this plugin. The format follows
   long or failed runs, agent extras, prompt), shows up to eight lines of
   the prompt with "…" when it goes on, and says beside the save button
   whether the routine can be saved.
-- The lists have no empty row between routines or runs any more.
+- The lists have no empty row between routines or runs any more; the form
+  has one after each part and above the footer.
+- "scheduler on/off" at the top is now "routines on/off".
 - Extra arguments may no longer set permissions for Claude Code, Codex or
   Gemini; use the permission mode.
 - Routine folder names must be lower case letters, digits and dashes.

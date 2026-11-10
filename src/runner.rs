@@ -98,7 +98,7 @@ pub fn extract_result(log: &str) -> String {
 }
 
 /// The last line with text.
-fn last_line(text: &str) -> String {
+pub fn last_line(text: &str) -> String {
     text.lines()
         .rev()
         .map(str::trim)
@@ -729,6 +729,9 @@ fn log_is_old(paths: &Paths, run: &Run) -> bool {
 /// Whether a run still holds its routine, so the next one must wait: an
 /// active run, or a timed out one whose agent still works.
 pub fn occupied(paths: &Paths, run: &Run) -> bool {
+    if run.cron_pid != 0 {
+        return run.status.active() && crate::scheduler::alive(run.cron_pid);
+    }
     if run.status.active() {
         return true;
     }

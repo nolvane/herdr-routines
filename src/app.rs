@@ -28,25 +28,33 @@ const FLASH: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
+    /// Routines Herdr runs.
     Routines,
+    /// Classic cron jobs: this plugin's and the rest of the crontab.
+    Cron,
     Runs,
 }
 
 impl View {
-    pub const ORDER: [View; 2] = [View::Routines, View::Runs];
+    pub const ORDER: [View; 3] = [View::Routines, View::Cron, View::Runs];
 
     pub fn name(self) -> &'static str {
         match self {
             View::Routines => "Routines",
+            View::Cron => "Cron jobs",
             View::Runs => "Runs",
         }
     }
 
-    fn other(self) -> View {
-        match self {
-            View::Routines => View::Runs,
-            View::Runs => View::Routines,
-        }
+    /// The next (or previous) tab.
+    fn step(self, by: i32) -> View {
+        let i = View::ORDER.iter().position(|v| *v == self).unwrap_or(0) as i32;
+        View::ORDER[(i + by).rem_euclid(View::ORDER.len() as i32) as usize]
+    }
+
+    /// A list of routines (with or without cron jobs), not of runs.
+    pub fn lists_routines(self) -> bool {
+        self != View::Runs
     }
 }
 
@@ -130,6 +138,7 @@ impl Picker {
 /// The choices behind `n`.
 const BY_FORM: &str = "form";
 const BY_AGENT: &str = "agent";
+const BY_CRON: &str = "cron";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Input {
@@ -145,6 +154,8 @@ pub enum ConfirmFor {
     DiscardForm,
     Autostart,
     AutostartOff,
+    RoutinesOn,
+    RoutinesOff,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -258,6 +269,8 @@ pub struct App {
     /// The routine whose runs the Runs view shows; None for all.
     pub run_filter: Option<String>,
     pub sel_routine: usize,
+    /// The cursor in the Cron jobs view.
+    pub sel_cron: usize,
     pub sel_run: usize,
     pub scheduler: Option<(u32, String)>,
     pub mode: Mode,
@@ -271,6 +284,10 @@ pub struct App {
     pub opener: Opener,
     /// The editor's text should go to the person's own editor.
     external: bool,
+    /// The person's own cron jobs (not this plugin's), shown under the
+    /// routines, and when the crontab was read last.
+    pub crontab_jobs: Vec<crate::crontab::CronJob>,
+    crontab_read: Option<Instant>,
     last_load: Instant,
     last_click: Option<(Instant, Hit)>,
     /// What was copied last, for pasting when there is no system clipboard.
@@ -293,6 +310,7 @@ impl App {
             all_runs: Vec::new(),
             run_filter: None,
             sel_routine: 0,
+            sel_cron: 0,
             sel_run: 0,
             scheduler: None,
             mode: Mode::Normal,
@@ -305,11 +323,18 @@ impl App {
             hits: Vec::new(),
             opener: open_in_browser,
             external: false,
+            crontab_jobs: Vec::new(),
+            crontab_read: None,
             last_load: Instant::now(),
             last_click: None,
             clip: String::new(),
             autostart_after_intro: false,
         };
+        // Cron jobs changed outside the list (and approved) reach the
+        // crontab when the list opens.
+        if !cfg!(test) {
+            app.sync_cron();
+        }
         app.reload();
         app
     }
@@ -332,7 +357,21 @@ impl App {
             None => self.all_runs.clone(),
         };
         self.scheduler = scheduler::running(&self.paths);
-        self.sel_routine = self.sel_routine.min(self.routines.len().saturating_sub(1));
+        // The crontab changes rarely: read every 15 seconds, or after a
+        // change made here (which clears `crontab_read`).
+        if self
+            .crontab_read
+            .is_none_or(|t| t.elapsed() >= Duration::from_secs(15))
+        {
+            self.crontab_jobs = crate::crontab::read()
+                .map(|t| crate::crontab::parse(&t))
+                .unwrap_or_default();
+            self.crontab_read = Some(Instant::now());
+        }
+        let herdr = self.routines.iter().filter(|r| !r.is_cron()).count();
+        let cron = self.routines.len() - herdr + self.crontab_jobs.len();
+        self.sel_routine = self.sel_routine.min(herdr.saturating_sub(1));
+        self.sel_cron = self.sel_cron.min(cron.saturating_sub(1));
         self.sel_run = self.sel_run.min(self.runs.len().saturating_sub(1));
         self.last_load = Instant::now();
         self.fill_models();
@@ -368,8 +407,61 @@ impl App {
         self.flash = Some((text.into(), color, Instant::now() + FLASH));
     }
 
+    /// The routines the current tab lists: those Herdr runs, or the cron
+    /// jobs (which the person's own crontab jobs follow).
+    pub fn listed(&self) -> Vec<&Routine> {
+        let cron = self.view == View::Cron;
+        self.routines
+            .iter()
+            .filter(|r| r.is_cron() == cron)
+            .collect()
+    }
+
+    /// The cursor of the current list of routines.
+    pub fn list_sel(&self) -> usize {
+        if self.view == View::Cron {
+            self.sel_cron
+        } else {
+            self.sel_routine
+        }
+    }
+
     pub fn selected_routine(&self) -> Option<&Routine> {
-        self.routines.get(self.sel_routine)
+        if !self.view.lists_routines() {
+            return None;
+        }
+        self.listed().get(self.list_sel()).copied()
+    }
+
+    /// The person's own cron job under the cursor (in the Cron jobs tab,
+    /// after this plugin's cron jobs).
+    pub fn selected_cron_job(&self) -> Option<&crate::crontab::CronJob> {
+        if self.view != View::Cron {
+            return None;
+        }
+        self.sel_cron
+            .checked_sub(self.listed().len())
+            .and_then(|i| self.crontab_jobs.get(i))
+    }
+
+    /// Shows a routine in its tab, under the cursor.
+    pub fn select_id(&mut self, id: &str) {
+        let Some(cron) = self
+            .routines
+            .iter()
+            .find(|r| r.id == id)
+            .map(|r| r.is_cron())
+        else {
+            return;
+        };
+        self.view = if cron { View::Cron } else { View::Routines };
+        if let Some(i) = self.listed().iter().position(|r| r.id == id) {
+            if cron {
+                self.sel_cron = i;
+            } else {
+                self.sel_routine = i;
+            }
+        }
     }
 
     pub fn latest_run(&self, id: &str) -> Option<&Run> {
@@ -415,7 +507,7 @@ impl App {
             .spawn();
         match spawned {
             Ok(_) if self.scheduler.is_none() => self.flash(
-                "Starting; the scheduler is off, so the run is not followed (S starts it)",
+                "Starting; routines are off, so the run is not followed (S switches them on)",
                 YELLOW,
             ),
             Ok(_) => self.flash("Starting, its tab opens in the background", GREEN),
@@ -450,7 +542,15 @@ impl App {
             }
             Err(e) => self.flash(e, RED),
         }
+        self.sync_cron();
         self.reload();
+    }
+
+    /// Brings the crontab in line with the cron jobs; says so when it fails.
+    fn sync_cron(&mut self) {
+        if let Err(e) = crate::crontab::sync(&self.paths) {
+            self.flash(format!("Crontab not updated: {e}"), RED);
+        }
     }
 
     /// `c`: a copy of the selected routine, switched off, without its runs
@@ -483,9 +583,7 @@ impl App {
             Ok(()) => {
                 self.flash(format!("Copied as {}, switched off", copy.file.name), GREEN);
                 self.reload();
-                if let Some(i) = self.routines.iter().position(|r| r.id == copy.id) {
-                    self.sel_routine = i;
-                }
+                self.select_id(&copy.id);
             }
             Err(e) => self.flash(format!("Cannot copy: {e}"), RED),
         }
@@ -586,16 +684,26 @@ impl App {
             detail: detail.into(),
         };
         self.mode = Mode::Pick(Picker::new(
-            "New routine".into(),
+            "New".into(),
             vec![
-                item(BY_FORM, "Fill in the form", "Choose every setting yourself"),
+                item(
+                    BY_FORM,
+                    "Herdr routine",
+                    "An agent or a command, run by Herdr in a tab",
+                ),
+                item(
+                    BY_CRON,
+                    "Classic cron job",
+                    "A command in your crontab, runs also when Herdr is closed",
+                ),
                 item(
                     BY_AGENT,
                     "Describe it to Claude",
-                    "Claude asks what you need in a new tab and creates the routine",
+                    "Claude asks what you need in a new tab and creates it",
                 ),
             ],
-            0,
+            // In the Cron jobs tab, a cron job is the likely choice.
+            usize::from(self.view == View::Cron),
             None,
         ));
     }
@@ -682,6 +790,16 @@ impl App {
         self.form = Some(Box::new(Form::new(&folder)));
     }
 
+    /// The form for a classic cron job: a shell command run by cron.
+    fn new_cron_form(&mut self) {
+        self.new_form();
+        if let Some(form) = self.form.as_mut() {
+            form.choose(Field::Agent, routine::SHELL);
+            form.choose(Field::RunsIn, crate::routine::RunsIn::Cron.label());
+            form.dirty = false;
+        }
+    }
+
     fn edit_selected(&mut self) {
         let Some(r) = self.selected_routine().cloned() else {
             return;
@@ -735,15 +853,16 @@ impl App {
             // The owner wrote it in the form: what it saves is approved.
             r.save_approved(&self.paths)?;
         }
+        let cron = crate::crontab::sync(&self.paths)
+            .err()
+            .map(|e| format!("; but {e}"))
+            .unwrap_or_default();
         self.reload();
-        if let Some(i) = self.routines.iter().position(|r| r.id == id) {
-            self.sel_routine = i;
-        }
-        self.view = View::Routines;
+        self.select_id(&id);
         Ok(if waiting {
-            format!("Saved {name}; it still waits for approval (a)")
+            format!("Saved {name}; it still waits for approval (a){cron}")
         } else {
-            format!("Saved {name}")
+            format!("Saved {name}{cron}")
         })
     }
 
@@ -899,6 +1018,7 @@ impl App {
             Ok(()) => self.flash("Approved: it runs as shown", GREEN),
             Err(e) => self.flash(e, RED),
         }
+        self.sync_cron();
         self.reload();
     }
 
@@ -931,22 +1051,31 @@ impl App {
         }
     }
 
-    fn import_cron(&mut self, jobs: Vec<crate::crontab::CronJob>, moving: bool) {
+    fn import_cron(&mut self, jobs: Vec<crate::crontab::CronJob>, how: crate::crontab::Take) {
+        use crate::crontab::Take;
         self.mode = Mode::Normal;
-        match crate::crontab::import(&self.paths, &jobs, moving) {
+        match crate::crontab::import(&self.paths, &jobs, how) {
             Ok(n) => {
-                let what = if n == 1 { "1 cron job" } else { "cron jobs" };
-                let text = match (moving, n) {
-                    (true, 1) => "Moved 1 cron job here".to_string(),
-                    (true, _) => format!("Moved {n} {what} here"),
-                    (false, 1) => "Copied 1 cron job, switched off".to_string(),
-                    (false, _) => format!("Copied {n} {what}, switched off"),
+                let what = if n == 1 {
+                    "1 cron job".to_string()
+                } else {
+                    format!("{n} cron jobs")
+                };
+                let text = match how {
+                    Take::ToHerdr => format!("Moved {what} to Herdr"),
+                    Take::KeepCron => format!("{what} now managed here, still run by cron"),
+                    Take::Copy => format!("Copied {what}, switched off"),
                 };
                 self.flash(text, GREEN);
             }
             Err(e) => self.flash(e, RED),
         }
-        self.view = View::Routines;
+        self.view = if how == Take::KeepCron {
+            View::Cron
+        } else {
+            View::Routines
+        };
+        self.crontab_read = None;
         self.reload();
     }
 
@@ -1005,24 +1134,63 @@ impl App {
                     Ok(()) => self.flash("Deleted", ACCENT),
                     Err(e) => self.flash(e, RED),
                 }
+                self.sync_cron();
                 self.reload();
             }
             ConfirmFor::DiscardForm => self.form = None,
+            ConfirmFor::RoutinesOn => self.routines_on(),
+            ConfirmFor::RoutinesOff => self.routines_off(),
         }
     }
 
-    fn start_scheduler(&mut self) {
+    /// `S` or a click on "routines on/off": all routines on or off, after
+    /// asking.
+    fn toggle_routines(&mut self) {
         if self.scheduler.is_some() {
-            return self.flash("The scheduler is running", GREEN);
+            self.mode = Mode::Confirm(Confirm {
+                question: "Switch all routines off?".into(),
+                lines: vec![
+                    "No routine runs until you switch them on again here, also not after Herdr restarts. Classic cron jobs skip their times too. Runs going on now carry on.".into(),
+                    "Each routine keeps its own on or off.".into(),
+                ],
+                purpose: ConfirmFor::RoutinesOff,
+            });
+        } else {
+            self.mode = Mode::Confirm(Confirm {
+                question: "Switch routines on?".into(),
+                lines: vec![
+                    "Routines that are on run on their schedule again, and classic cron jobs at their times.".into(),
+                ],
+                purpose: ConfirmFor::RoutinesOn,
+            });
+        }
+    }
+
+    fn routines_on(&mut self) {
+        if let Err(e) = scheduler::set_paused(&self.paths, false) {
+            return self.flash(format!("Could not switch them on: {e}"), RED);
+        }
+        if self.scheduler.is_some() {
+            return self.flash("Routines are on", GREEN);
         }
         match scheduler::spawn(&self.paths) {
             Ok(_) => {
                 std::thread::sleep(Duration::from_millis(300));
                 self.reload();
-                self.flash("Scheduler started", GREEN);
+                self.flash("Routines are on", GREEN);
             }
             Err(e) => self.flash(e, RED),
         }
+    }
+
+    fn routines_off(&mut self) {
+        if let Err(e) = scheduler::set_paused(&self.paths, true) {
+            return self.flash(format!("Could not switch them off: {e}"), RED);
+        }
+        scheduler::stop(&self.paths);
+        std::thread::sleep(Duration::from_millis(300));
+        self.reload();
+        self.flash("All routines are off", RED);
     }
 
     fn toggle_icons(&mut self) {
@@ -1067,6 +1235,7 @@ impl App {
         let Some(field) = p.field else {
             match item.value.as_str() {
                 BY_AGENT => self.create_with_agent(),
+                BY_CRON => self.new_cron_form(),
                 _ => self.new_form(),
             }
             return;
@@ -1117,7 +1286,8 @@ impl App {
 
     fn rows_len(&self) -> usize {
         match self.view {
-            View::Routines => self.routines.len(),
+            View::Routines => self.listed().len(),
+            View::Cron => self.listed().len() + self.crontab_jobs.len(),
             View::Runs => self.runs.len(),
         }
     }
@@ -1125,6 +1295,7 @@ impl App {
     fn cursor(&mut self) -> &mut usize {
         match self.view {
             View::Routines => &mut self.sel_routine,
+            View::Cron => &mut self.sel_cron,
             View::Runs => &mut self.sel_run,
         }
     }
@@ -1140,7 +1311,11 @@ impl App {
 
     fn enter(&mut self) {
         match self.view {
-            View::Routines => self.edit_selected(),
+            View::Cron if self.selected_cron_job().is_some() => {
+                let job = self.selected_cron_job().cloned().unwrap();
+                self.mode = Mode::Cron(vec![job]);
+            }
+            View::Routines | View::Cron => self.edit_selected(),
             View::Runs => {
                 let run = self.runs.get(self.sel_run).cloned();
                 self.open_run(run);
@@ -1253,8 +1428,9 @@ impl App {
                 }
             }
             Mode::Cron(jobs) => match k.code {
-                KeyCode::Char('m') => self.import_cron(jobs, true),
-                KeyCode::Char('c') => self.import_cron(jobs, false),
+                KeyCode::Char('k') => self.import_cron(jobs, crate::crontab::Take::KeepCron),
+                KeyCode::Char('m') => self.import_cron(jobs, crate::crontab::Take::ToHerdr),
+                KeyCode::Char('c') => self.import_cron(jobs, crate::crontab::Take::Copy),
                 KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::Normal,
                 _ => {}
             },
@@ -1380,7 +1556,7 @@ impl App {
             KeyCode::Esc => {}
             KeyCode::Char('h') => {
                 let id = match self.view {
-                    View::Routines => self.selected_routine().map(|r| r.id.clone()),
+                    View::Routines | View::Cron => self.selected_routine().map(|r| r.id.clone()),
                     View::Runs => self.runs.get(self.sel_run).map(|r| r.routine_id.clone()),
                 };
                 if id.is_some() && id == self.run_filter && self.view == View::Runs {
@@ -1407,12 +1583,12 @@ impl App {
                 let last = self.rows_len().saturating_sub(1);
                 *self.cursor() = last;
             }
-            KeyCode::Tab | KeyCode::Right | KeyCode::BackTab | KeyCode::Left => {
-                self.view = self.view.other()
-            }
+            KeyCode::Tab | KeyCode::Right => self.view = self.view.step(1),
+            KeyCode::BackTab | KeyCode::Left => self.view = self.view.step(-1),
             KeyCode::Char('1') => self.view = View::Routines,
-            KeyCode::Char('2') => self.view = View::Runs,
-            KeyCode::Char('S') => self.start_scheduler(),
+            KeyCode::Char('2') => self.view = View::Cron,
+            KeyCode::Char('3') => self.view = View::Runs,
+            KeyCode::Char('S') => self.toggle_routines(),
             KeyCode::Char('A') => self.toggle_autostart(),
             KeyCode::Char('C') => self.show_cron(),
             KeyCode::Char('i') => self.toggle_icons(),
@@ -1420,7 +1596,7 @@ impl App {
             KeyCode::Enter => self.enter(),
             KeyCode::Char('l') => {
                 let run = match self.view {
-                    View::Routines => self
+                    View::Routines | View::Cron => self
                         .selected_routine()
                         .and_then(|r| self.latest_run(&r.id))
                         .cloned(),
@@ -1432,7 +1608,7 @@ impl App {
                     None => {}
                 }
             }
-            _ if self.view == View::Routines && self.selected_routine().is_some() => match k.code {
+            _ if self.selected_routine().is_some() => match k.code {
                 KeyCode::Char('e') => self.edit_selected(),
                 KeyCode::Char('p') => {
                     let r = self.selected_routine().cloned().unwrap();
@@ -1506,8 +1682,8 @@ impl App {
             }
             Hit::RunsOf(i) => {
                 if normal {
-                    self.sel_routine = i;
-                    let id = self.routines.get(i).map(|r| r.id.clone());
+                    *self.cursor() = i;
+                    let id = self.listed().get(i).map(|r| r.id.clone());
                     self.filter_runs(id);
                 }
             }
@@ -1903,6 +2079,7 @@ retries = 0                       # try a failed run again this many times (0-3)
 retry_delay_minutes = 10          # ...this many minutes apart
 check_command = ""                # agents only: a shell command run first; the agent starts only if it exits 0, and gets its output
 remember = false                  # agents only: each run gets the results of the last ten runs
+runs_in = "herdr"                 # shell only: "herdr" (a tab, while Herdr runs) or "cron" (a classic cron job, also when Herdr is closed)
 alert = "notification"            # "notification", "popup-on-problems" (a popup that stays until OK when a run fails, runs too long or needs me) or "popup" (also when it finishes)
 
 Instead of cron, schedule can be "@once YYYY-MM-DD HH:MM" (runs once, then the routine switches off) or "@start" (each time Herdr starts).
@@ -2055,17 +2232,12 @@ mod tests {
         assert!(all.contains("By hand"), "{all}");
     }
 
-    #[test]
-    fn cron_jobs_move_here() {
-        let mut a = app("cron");
+    /// A stand-in for `crontab` on this test's thread: -l prints the file,
+    /// a path replaces it. Returns the file.
+    fn fake_crontab(a: &App, text: &str) -> std::path::PathBuf {
         let dir = a.paths.state.clone();
         let tab = dir.join("fake-crontab.txt");
-        std::fs::write(
-            &tab,
-            "PATH=/usr/bin:/bin\n0 2 * * * /opt/jobs/backup.sh --all\n@reboot ~/start.sh\n",
-        )
-        .unwrap();
-        // A stand-in for crontab: -l prints the file, a path replaces it.
+        std::fs::write(&tab, text).unwrap();
         let fake = dir.join("crontab");
         std::fs::write(
             &fake,
@@ -2079,7 +2251,33 @@ mod tests {
             .args(["+x", &fake.to_string_lossy()])
             .status()
             .unwrap();
-        std::env::set_var("HERDR_ROUTINES_CRONTAB", &fake);
+        crate::crontab::use_fake(Some(&fake));
+        tab
+    }
+
+    #[test]
+    fn cron_jobs_show_in_the_list_and_move_to_herdr() {
+        let mut a = app("cron");
+        let tab = fake_crontab(
+            &a,
+            "PATH=/usr/bin:/bin\n0 2 * * * /opt/jobs/backup.sh --all\n@reboot ~/start.sh\n",
+        );
+        a.crontab_read = None;
+        a.reload();
+        // The crontab's jobs show in their own tab, not among the routines.
+        assert_eq!(a.crontab_jobs.len(), 2);
+        let lines = screen(&mut a, 120, 40);
+        assert!(!lines.iter().any(|l| l.contains("in your crontab ·")));
+        assert!(lines.iter().any(|l| l.contains("Cron jobs (2)")));
+        press(&mut a, KeyCode::Char('2'));
+        assert_eq!(a.view, View::Cron);
+        let lines = screen(&mut a, 120, 40);
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("backup.sh --all") && l.contains("Daily at 02:00")));
+        assert!(lines.iter().any(|l| l.contains("in your crontab ·")));
+        assert!(a.selected_cron_job().is_some());
+        assert!(lines.iter().any(|l| l.contains("⏎ manage it here")));
         press(&mut a, KeyCode::Char('C'));
         let Mode::Cron(jobs) = a.mode.clone() else {
             panic!("no cron list: {:?}", a.flash);
@@ -2089,24 +2287,155 @@ mod tests {
         assert!(lines
             .iter()
             .any(|l| l.contains("2 cron jobs in your crontab")));
-        assert!(lines.iter().any(|l| l.contains("When Herdr starts")));
+        assert!(lines.iter().any(|l| l.contains("When the computer starts")));
         press(&mut a, KeyCode::Char('m'));
-        std::env::remove_var("HERDR_ROUTINES_CRONTAB");
         let moved: Vec<&Routine> = a
             .routines
             .iter()
             .filter(|r| r.file.agent == routine::SHELL)
             .collect();
         assert_eq!(moved.len(), 2, "{:?}", a.flash);
-        assert!(moved.iter().all(|r| r.file.enabled && r.problem.is_none()));
+        assert!(moved
+            .iter()
+            .all(|r| r.file.enabled && r.problem.is_none() && !r.is_cron()));
         assert!(moved.iter().any(|r| r.file.name == "backup.sh --all"));
         let now = std::fs::read_to_string(&tab).unwrap();
         assert!(now.contains("# moved to herdr-routines (routine "), "{now}");
         assert!(crate::crontab::parse(&now).is_empty());
-        assert!(std::fs::read_dir(&dir).unwrap().flatten().any(|e| e
-            .file_name()
-            .to_string_lossy()
-            .starts_with("crontab-backup-")));
+        assert!(a.crontab_jobs.is_empty(), "the list shows them as routines");
+        assert!(std::fs::read_dir(a.paths.state.join("crontab-backups"))
+            .unwrap()
+            .flatten()
+            .next()
+            .is_some());
+        crate::crontab::use_fake(None);
+    }
+
+    #[test]
+    fn cron_jobs_kept_in_cron_are_managed_here() {
+        let mut a = app("keepcron");
+        let tab = fake_crontab(&a, "MAILTO=\"\"\n*/5 * * * * echo hi >> /tmp/x.log\n");
+        a.crontab_read = None;
+        a.reload();
+        a.view = View::Cron;
+        press(&mut a, KeyCode::Enter);
+        assert!(matches!(a.mode, Mode::Cron(_)));
+        press(&mut a, KeyCode::Char('k'));
+        assert_eq!(a.view, View::Cron);
+        assert_eq!(a.listed().len(), 1, "now one of this plugin's cron jobs");
+        let job = a
+            .routines
+            .iter()
+            .find(|r| r.is_cron())
+            .cloned()
+            .unwrap_or_else(|| panic!("{:?}", a.flash));
+        assert!(job.file.enabled && job.approved && job.problem.is_none());
+        let now = std::fs::read_to_string(&tab).unwrap();
+        // The old line is commented out, the plugin's block calls cron-run.
+        assert!(now.contains("# moved to herdr-routines (routine "), "{now}");
+        assert!(now.contains("# BEGIN herdr-routines"), "{now}");
+        assert!(
+            now.contains("*/5 * * * * HERDR_PLUGIN_CONFIG_DIR="),
+            "{now}"
+        );
+        assert!(now.contains(&format!("cron-run {}\n", job.id)), "{now}");
+        assert!(crate::crontab::parse(&now).is_empty(), "the block is ours");
+        assert!(crate::crontab::binary(&a.paths).exists());
+        // Off: its line goes; on again: it comes back.
+        a.select_id(&job.id);
+        press(&mut a, KeyCode::Char(' '));
+        let now = std::fs::read_to_string(&tab).unwrap();
+        assert!(!now.contains("cron-run"), "{now}");
+        assert!(!now.contains("# BEGIN herdr-routines"), "{now}");
+        press(&mut a, KeyCode::Char(' '));
+        let now = std::fs::read_to_string(&tab).unwrap();
+        assert!(now.contains(&format!("cron-run {}\n", job.id)), "{now}");
+        // Deleting it removes the block again.
+        press(&mut a, KeyCode::Char('d'));
+        press(&mut a, KeyCode::Char('y'));
+        let now = std::fs::read_to_string(&tab).unwrap();
+        assert!(
+            !now.contains("herdr-routines\n") && !now.contains("cron-run"),
+            "{now}"
+        );
+        crate::crontab::use_fake(None);
+    }
+
+    #[test]
+    fn a_cron_run_is_recorded_with_its_output() {
+        let a = app("cronrun");
+        let mut f = Form::new("/tmp");
+        f.name = "Say hi".into();
+        f.choose(Field::Agent, routine::SHELL);
+        f.choose(Field::RunsIn, crate::routine::RunsIn::Cron.label());
+        f.prompt = "echo first\necho hi from cron".into();
+        let (file, prompt) = f.build().unwrap();
+        let r = Routine {
+            id: "say-hi".into(),
+            file,
+            prompt,
+            problem: None,
+            unreadable: false,
+            approved: true,
+        };
+        r.save_approved(&a.paths).unwrap();
+        assert_eq!(crate::crontab::run_job(&a.paths, "say-hi"), 0);
+        let runs = store::runs_of(&a.paths, "say-hi");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, store::Status::Finished);
+        assert_eq!(runs[0].result, "hi from cron");
+        assert!(runs[0].cron_pid != 0 && runs[0].tab_closed);
+        let out = std::fs::read_to_string(runs[0].file(&a.paths, "out")).unwrap();
+        assert!(out.contains("first") && out.contains("hi from cron"));
+        // Switched off in the list: the next cron time is skipped.
+        scheduler::set_paused(&a.paths, true).unwrap();
+        assert_eq!(crate::crontab::run_job(&a.paths, "say-hi"), 0);
+        assert_eq!(store::runs_of(&a.paths, "say-hi").len(), 1);
+    }
+
+    #[test]
+    fn the_routines_chip_switches_all_of_them_after_asking() {
+        let mut a = app("chip");
+        a.scheduler = None;
+        let lines = screen(&mut a, 120, 30);
+        assert!(lines.iter().any(|l| l.contains("○ routines off")));
+        let chip = a
+            .hits
+            .iter()
+            .find_map(|(r, h)| (*h == Hit::Key('S')).then_some(*r))
+            .expect("the chip is clickable");
+        a.click(chip.x + 1, chip.y);
+        let Mode::Confirm(c) = a.mode.clone() else {
+            panic!("no question");
+        };
+        assert_eq!(c.question, "Switch routines on?");
+        press(&mut a, KeyCode::Char('n'));
+        a.scheduler = Some((1, String::new()));
+        let lines = screen(&mut a, 120, 30);
+        assert!(lines.iter().any(|l| l.contains("routines on")));
+        press(&mut a, KeyCode::Char('S'));
+        let Mode::Confirm(c) = a.mode.clone() else {
+            panic!("no question");
+        };
+        assert_eq!(c.question, "Switch all routines off?");
+    }
+
+    #[test]
+    fn a_new_classic_cron_job_is_a_shell_command_in_cron() {
+        let mut a = app("newcron");
+        press(&mut a, KeyCode::Char('n'));
+        press(&mut a, KeyCode::Down);
+        press(&mut a, KeyCode::Enter);
+        let form = a.form.as_ref().expect("the form");
+        assert!(form.is_cron());
+        let fields = form.fields();
+        assert!(fields.contains(&Field::RunsIn));
+        assert!(!fields.contains(&Field::Missed) && !fields.contains(&Field::AtLimit));
+        assert!(!fields.contains(&Field::Mode));
+        let lines = screen(&mut a, 100, 40);
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("Runs in") && l.contains("‹ Cron ›")));
     }
 
     #[test]
@@ -2329,7 +2658,10 @@ mod tests {
         let mut a = app("layout");
         press(&mut a, KeyCode::Char('n'));
         press(&mut a, KeyCode::Enter);
-        let lines = screen(&mut a, 90, 34);
+        let lines = screen(&mut a, 90, 40);
+        let tight = screen(&mut a, 90, 32);
+        // The explanation keeps an empty row above the footer.
+        assert!(tight[tight.len() - 2].trim().is_empty());
         let at = |s: &str| lines.iter().position(|l| l.contains(s)).unwrap();
         let prompt = at(" Prompt ");
         let save = at("⏎ save");
@@ -2339,6 +2671,8 @@ mod tests {
         );
         assert_eq!(save, prompt + 2, "one empty row before the button");
         assert!(lines[prompt + 1].trim().is_empty());
+        // Each part ends with an empty row when the window is tall enough.
+        assert!(lines[at(" Schedule ") - 1].trim().is_empty());
     }
 
     #[test]

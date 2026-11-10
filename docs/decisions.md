@@ -426,6 +426,51 @@ user's machine at install time. `rust-version = "1.89"` in `Cargo.toml`
 names the oldest Rust that builds it (`File::lock` came in 1.89), so an
 older toolchain fails with a clear message.
 
+## 2026-11-10: Classic cron jobs through the crontab
+
+A shell routine can run from the system's crontab (`runs_in = "cron"`)
+instead of Herdr's scheduler. The plugin keeps one marked block in the
+crontab (`# BEGIN herdr-routines` … `# END herdr-routines`), one line per
+cron job that is on, and rewrites only that block, after a backup in
+`crontab-backups/` (last five kept), whenever such a routine is saved,
+switched, deleted or approved, and when the list opens. Each line calls
+`herdr-routines cron-run <id>` from a copy of the binary in the state
+folder (the plugin's own folder changes with every update) with the
+plugin's folders, socket and Herdr binary as variables. `cron-run` runs
+the command in the login shell, records the run like any other (a run
+record with `cron_pid` instead of a tab, which Herdr's scheduler leaves
+alone), retries, alerts, and refuses a routine that waits for approval.
+`@reboot` stands for "when the computer starts"; a single run on a date
+uses its five cron fields and switches itself off. Agents stay Herdr-only:
+an agent run needs a tab.
+
+Why: the owner wants to choose between a Herdr routine and a traditional
+cron job. A marked block keeps the person's own lines untouched; going
+through the plugin binary gives cron jobs the same runs, results and
+approval check as routines, which a bare crontab line could not.
+
+## 2026-11-10: Separate tabs for routines and cron jobs
+
+Routines (run by Herdr) and cron jobs (run by cron: the plugin's own and
+the rest of the crontab) are two tabs, next to Runs. Each has its own
+cursor; `n` in the Cron jobs tab preselects "Classic cron job".
+
+Why: the two run differently (a tab while Herdr runs, or cron always) and
+the crontab's other jobs are not managed here until taken over; mixing
+them in one list made it unclear what runs where.
+
+## 2026-11-10: One switch for all routines
+
+The "routines on/off" chip (or `S`) switches all of them, after asking.
+Off writes `paused` in the state folder and stops the scheduler; `start`
+and `restart` then do not start one (also not when Herdr starts), and
+`cron-run` skips its times. On removes the marker and starts the
+scheduler. Each routine keeps its own on or off.
+
+Why: one place to stop everything, for example before travelling, that
+holds across restarts; a stopped scheduler alone came back with the next
+Herdr start and never covered cron jobs.
+
 ## 2026-11-10: Cron jobs move in as approved shell routines
 
 `C` reads `crontab -l` and turns each job into a shell routine in the home

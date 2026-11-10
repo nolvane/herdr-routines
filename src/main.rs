@@ -12,6 +12,7 @@
 //! - `fire <id>` starts a routine now
 //! - `routines` prints the routines and their latest run as JSON
 //! - `alert-pane` (pane) the popup about a run, for routines that ask for it
+//! - `cron-run <id>` (from the crontab) runs a routine set to run in cron
 
 mod agent;
 mod alert;
@@ -155,6 +156,11 @@ fn main() {
     let paths = Paths::from_env();
     paths::secure_roots(&paths);
     let code = match command.as_str() {
+        // Switched off in the list: stays off until switched on there.
+        "start" | "restart" if scheduler::paused(&paths) => {
+            println!("routines are switched off in the list; not started");
+            0
+        }
         "start" => {
             if let Some(pid) = scheduler::keep_running(&paths) {
                 println!("already running for another Herdr session, pid {pid}");
@@ -202,6 +208,10 @@ fn main() {
         }
         "run" => scheduler::run(&paths),
         "alert-pane" => alert::pane(&paths),
+        "cron-run" => match std::env::args().nth(2) {
+            Some(id) => crontab::run_job(&paths, &id),
+            None => 2,
+        },
         "list" => match list(paths) {
             Ok(()) => 0,
             Err(e) => {

@@ -10,8 +10,8 @@ use crate::routine::Routine;
 use crate::schedule::Schedule;
 use crate::store::Run;
 use crate::theme::{
-    self, Icons, ACCENT, BAR_BG, BORDER, FAINT, GREEN, MARK_BG, MUTED, RED, SELECTED_BG, TEXT,
-    YELLOW,
+    self, Icons, ACCENT, BAR_BG, BLUE, BORDER, FAINT, GREEN, MARK_BG, MUTED, RED, SELECTED_BG,
+    TEXT, YELLOW,
 };
 use chrono::Local;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -42,7 +42,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         draw_form(frame, app, body);
     } else {
         match app.view {
-            View::Routines => draw_routines(frame, app, &icons, body),
+            View::Routines | View::Cron => draw_routines(frame, app, &icons, body),
             View::Runs => draw_runs(frame, app, &icons, body),
         }
     }
@@ -87,7 +87,10 @@ fn draw_header(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
         spans.push(Span::styled(title, bold(ACCENT)));
         for view in View::ORDER {
             let count = match view {
-                View::Routines => app.routines.len(),
+                View::Routines => app.routines.iter().filter(|r| !r.is_cron()).count(),
+                View::Cron => {
+                    app.routines.iter().filter(|r| r.is_cron()).count() + app.crontab_jobs.len()
+                }
                 View::Runs => app.runs.len(),
             };
             let label = match (view, app.filter_name()) {
@@ -116,15 +119,13 @@ fn draw_header(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
     let used = left.width();
     frame.render_widget(Paragraph::new(left), line);
 
+    // Whether routines run at all (the scheduler); a click switches them.
     let (chip, style) = match app.scheduler {
         Some(_) => (
-            format!("{} scheduler on", icons.running()),
+            format!("{} routines on", icons.running()),
             Style::new().fg(GREEN),
         ),
-        None => (
-            format!("{} scheduler off · S starts it", icons.running()),
-            Style::new().fg(RED),
-        ),
+        None => ("○ routines off".to_string(), Style::new().fg(RED)),
     };
     // Left of it, whether Herdr starts at login (A switches it).
     let login = if !in_list || !crate::autostart::supported() {
@@ -141,7 +142,7 @@ fn draw_header(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
     let login_w = login.as_ref().map_or(0, |(t, _)| t.width() + 3);
     let right = line.x + line.width;
     if used + w + 3 <= line.width as usize {
-        if app.scheduler.is_none() && in_list {
+        if in_list {
             let x = right - w as u16;
             app.hits
                 .push((Rect::new(x, line.y, w as u16, 1), Hit::Key('S')));
@@ -296,7 +297,12 @@ fn routine_detail(r: &Routine) -> Line<'static> {
             .lines()
             .find(|l| !l.trim().is_empty())
             .unwrap_or("");
-        return faint(format!("shell · {} · {}", clip(first.trim(), 40), f.folder));
+        let kind = if r.is_cron() { "cron job" } else { "shell" };
+        return faint(format!(
+            "{kind} · {} · {}",
+            clip(first.trim(), 40),
+            f.folder
+        ));
     }
     let mut parts = vec![f.agent.clone()];
     if !f.model.is_empty() {
@@ -328,27 +334,51 @@ enum RCol {
 }
 
 fn draw_routines(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
-    if app.routines.is_empty() {
+    let cron_view = app.view == View::Cron;
+    let routines: Vec<Routine> = app.listed().into_iter().cloned().collect();
+    let crontab_jobs = if cron_view {
+        app.crontab_jobs.clone()
+    } else {
+        Vec::new()
+    };
+    if routines.is_empty() && crontab_jobs.is_empty() {
         let path = crate::paths::shorten(&app.paths.routines_dir());
-        empty_note(
-            frame,
-            area,
-            &[
-                ("No routines yet.", TEXT),
-                ("", TEXT),
+        let lines: Vec<(String, Color)> = if cron_view {
+            vec![
+                ("No cron jobs.".into(), TEXT),
+                (String::new(), TEXT),
                 (
-                    "n creates one: fill in a short form, or describe it to Claude.",
+                    "n, then \"Classic cron job\", creates one: a command cron runs, also when Herdr is closed.".into(),
                     MUTED,
                 ),
-                (&format!("Routines are plain files in {path}."), FAINT),
-            ],
-        );
+                (
+                    "Jobs already in your crontab show here too.".into(),
+                    FAINT,
+                ),
+            ]
+        } else {
+            vec![
+                ("No routines yet.".into(), TEXT),
+                (String::new(), TEXT),
+                (
+                    "n creates one: fill in a short form, or describe it to Claude.".into(),
+                    MUTED,
+                ),
+                (format!("Routines are plain files in {path}."), FAINT),
+            ]
+        };
+        let refs: Vec<(&str, Color)> = lines.iter().map(|(t, c)| (t.as_str(), *c)).collect();
+        empty_note(frame, area, &refs);
         return;
     }
     let cols = fit(
         vec![
             (RCol::Mark, "", Constraint::Length(2)),
-            (RCol::Routine, "Routine", Constraint::Fill(1)),
+            (
+                RCol::Routine,
+                if cron_view { "Cron job" } else { "Routine" },
+                Constraint::Fill(1),
+            ),
             (RCol::Schedule, "Schedule", Constraint::Length(26)),
             (RCol::Last, "Last run", Constraint::Length(LAST_W)),
         ],
@@ -357,7 +387,6 @@ fn draw_routines(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
         24,
     );
     let now = Local::now();
-    let routines = app.routines.clone();
     let rows: Vec<Vec<Text<'static>>> = routines
         .iter()
         .map(|r| {
@@ -384,6 +413,9 @@ fn draw_routines(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
                             Line::from(Span::styled("off", Style::new().fg(RED)))
                         } else {
                             match r.schedule() {
+                                Some(crate::schedule::Schedule::AtStart) if r.is_cron() => {
+                                    faint("next computer start")
+                                }
                                 Some(crate::schedule::Schedule::AtStart) => {
                                     faint("next Herdr start")
                                 }
@@ -411,9 +443,49 @@ fn draw_routines(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
                 .collect()
         })
         .collect();
+    // The person's own cron jobs follow: cron runs them, not this plugin.
+    let mut rows = rows;
+    for job in &crontab_jobs {
+        let when = Schedule::parse(&job.schedule).ok();
+        let next = match &when {
+            Some(Schedule::AtStart) => faint("next computer start"),
+            Some(s) => match s.next_after(&now) {
+                Some(t) => faint(format!("next {}", crate::app::until(&t, &now))),
+                None => faint("–"),
+            },
+            None => faint("–"),
+        };
+        let words = match &when {
+            Some(Schedule::AtStart) => "When the computer starts".to_string(),
+            Some(s) => s.describe(),
+            None => job.schedule.clone(),
+        };
+        rows.push(
+            cols.iter()
+                .map(|(c, _, _)| match c {
+                    RCol::Mark => Text::from(Span::styled("◇", Style::new().fg(BLUE))),
+                    RCol::Routine => Text::from(vec![
+                        Line::from(Span::styled(
+                            crate::crontab::name_for(&job.command),
+                            bold(TEXT),
+                        )),
+                        faint(format!("in your crontab · {}", clip(&job.command, 50))),
+                    ]),
+                    RCol::Schedule => Text::from(vec![
+                        Line::from(Span::styled(words.clone(), Style::new().fg(TEXT))),
+                        next.clone(),
+                    ]),
+                    RCol::Last => Text::from(vec![
+                        Line::from(Span::styled("not followed here", Style::new().fg(MUTED))),
+                        faint("⏎ manage it here"),
+                    ]),
+                })
+                .collect(),
+        );
+    }
     let head = cols.iter().map(|(_, h, _)| *h).collect();
     let widths = cols.iter().map(|(_, _, w)| *w).collect();
-    let sel = app.sel_routine;
+    let sel = app.list_sel();
     let n = rows.len();
     // In a tall enough window the selected routine's details sit right
     // under the list.
@@ -450,9 +522,57 @@ fn draw_routines(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
             }
         }
     }
-    if let (Some(area), Some(r)) = (details, routines.get(sel)) {
-        draw_details(frame, app, icons, r, area);
+    if let Some(area) = details {
+        if let Some(r) = routines.get(sel) {
+            draw_details(frame, app, icons, r, area);
+        } else if let Some(job) = app.selected_cron_job().cloned() {
+            draw_cron_details(frame, &job, area);
+        }
     }
+}
+
+/// The person's own cron job in full, and what ⏎ does with it.
+fn draw_cron_details(frame: &mut Frame, job: &crate::crontab::CronJob, area: Rect) {
+    let inner = Rect::new(
+        area.x + 1,
+        area.y,
+        area.width.saturating_sub(2),
+        area.height,
+    );
+    let w = inner.width as usize;
+    let title = format!(" {}", crate::crontab::name_for(&job.command));
+    let rule = w.saturating_sub(title.width() + 2);
+    let mut lines = vec![Line::from(vec![
+        Span::styled(title, bold(ACCENT)),
+        Span::styled(format!(" {}", "─".repeat(rule)), Style::new().fg(BORDER)),
+    ])];
+    const LW: usize = 15;
+    let room = w.saturating_sub(LW + 2).max(10);
+    let row = |label: &str, text: String, color: Color| {
+        Line::from(vec![
+            Span::styled(format!(" {label:<LW$}"), Style::new().fg(MUTED)),
+            Span::styled(text, Style::new().fg(color)),
+        ])
+    };
+    lines.push(row("Line", clip(job.line.trim(), room), TEXT));
+    if !job.env.is_empty() {
+        let vars: Vec<String> = job.env.iter().map(|(k, _)| k.clone()).collect();
+        lines.push(row("Variables", clip(&vars.join(", "), room), TEXT));
+    }
+    if let Some(note) = &job.note {
+        lines.push(row("Note", clip(note, room), YELLOW));
+    }
+    lines.push(Line::from(""));
+    for l in wrap(
+        "Cron runs this job, not Herdr, so this list does not see its runs. ⏎ manages it here: keep it as a cron job (it still runs when Herdr is closed) or move it to Herdr, and see its output, result and failures in Runs.",
+        w.saturating_sub(2),
+    ) {
+        lines.push(Line::from(Span::styled(
+            format!(" {l}"),
+            Style::new().fg(FAINT),
+        )));
+    }
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
 /// Rows per routine or run in the lists: name and details, no gap.
@@ -527,7 +647,14 @@ fn draw_details(frame: &mut Frame, app: &App, icons: &Icons, r: &Routine, area: 
     }
     lines.push(row("Schedule", when));
     if r.is_shell() {
-        lines.push(row("Runs", text("a shell command".into())));
+        lines.push(row(
+            "Runs",
+            text(if r.is_cron() {
+                "a classic cron job, from your crontab (also when Herdr is closed)".into()
+            } else {
+                "a shell command, in a Herdr tab".into()
+            }),
+        ));
     } else {
         let mode = if f.permission_mode.is_empty() {
             "agent's own permissions".to_string()
@@ -944,19 +1071,30 @@ fn draw_form(frame: &mut Frame, app: &mut App, area: Rect) {
     let current = form.current();
     // The rows: a heading at the start of each part of the form, and an
     // empty row before the save button.
-    let mut rows: Vec<FormRow> = Vec::new();
-    let mut last = "";
-    for (i, f) in fields.iter().enumerate() {
-        let s = form.section(*f);
-        if s != last {
-            rows.push(if s.is_empty() {
-                FormRow::Blank
-            } else {
-                FormRow::Head(s)
-            });
-            last = s;
+    // An empty row closes each part, so the parts read apart; in a window
+    // too low for everything, only the one before the save button stays.
+    let layout = |spaced: bool| {
+        let mut rows: Vec<FormRow> = Vec::new();
+        let mut last = "";
+        for (i, f) in fields.iter().enumerate() {
+            let s = form.section(*f);
+            if s != last {
+                if s.is_empty() || (spaced && !rows.is_empty()) {
+                    rows.push(FormRow::Blank);
+                }
+                if !s.is_empty() {
+                    rows.push(FormRow::Head(s));
+                }
+                last = s;
+            }
+            rows.push(FormRow::Field(i));
         }
-        rows.push(FormRow::Field(i));
+        rows
+    };
+    let mut rows = layout(true);
+    // Room needed below the fields: gaps and the explanation (5 rows).
+    if rows.len() + 5 > inner.height as usize {
+        rows = layout(false);
     }
     // The prompt shows its first lines, as many as fit (up to eight), and
     // ends in "…" when it goes on.
@@ -969,7 +1107,7 @@ fn draw_form(frame: &mut Frame, app: &mut App, area: Rect) {
         preview.extend(wrap(&l.replace('\t', "    "), value_w));
     }
     let prompt_at = fields.iter().position(|f| *f == Field::Prompt);
-    let free = (inner.height as usize).saturating_sub(rows.len() + 2 + 2);
+    let free = (inner.height as usize).saturating_sub(rows.len() + 3 + 2);
     let extra = preview.len().saturating_sub(1).min(free).min(7);
     if let Some(p) = prompt_at {
         if let Some(at) = rows.iter().position(|r| *r == FormRow::Field(p)) {
@@ -1000,7 +1138,7 @@ fn draw_form(frame: &mut Frame, app: &mut App, area: Rect) {
     // explanation.
     let mut hint = wrap(form.hint(current), inner.width.saturating_sub(4) as usize);
     // Up to four lines, fewer when the fields would no longer all fit.
-    let spare = (inner.height as usize).saturating_sub(rows.len() + 2);
+    let spare = (inner.height as usize).saturating_sub(rows.len() + 3);
     let hint_rows = spare.clamp(2, 4);
     if hint.len() > hint_rows {
         hint.truncate(hint_rows);
@@ -1009,9 +1147,9 @@ fn draw_form(frame: &mut Frame, app: &mut App, area: Rect) {
         }
     }
     let hint_shown = hint.len().min(hint_rows) as u16;
-    // gap, title, text
+    // gap, title, text, and a gap before the footer
     let below = if inner.height >= 12 {
-        2 + hint_shown
+        3 + hint_shown
     } else {
         0
     };
@@ -1119,7 +1257,7 @@ fn draw_form(frame: &mut Frame, app: &mut App, area: Rect) {
         );
         frame.render_widget(
             Paragraph::new(Text::from(lines)),
-            Rect::new(inner.x + 1, y + 2, inner.width.saturating_sub(2), below - 1),
+            Rect::new(inner.x + 1, y + 2, inner.width.saturating_sub(2), below - 2),
         );
     }
 }
@@ -1303,7 +1441,14 @@ fn draw_footer(frame: &mut Frame, app: &mut App, area: Rect) {
             .selected_routine()
             .is_some_and(|r| !r.approved && !r.unreadable);
         match app.view {
-            View::Routines => vec![
+            View::Cron if app.selected_cron_job().is_some() => vec![
+                ("⏎", "manage it here", Some(Hit::Key('\n'))),
+                ("n", "new", Some(Hit::Key('n'))),
+                ("C", "all cron jobs", Some(Hit::Key('C'))),
+                ("?", "all keys", Some(Hit::Key('?'))),
+                ("q", "close", Some(Hit::Key('q'))),
+            ],
+            View::Routines | View::Cron => vec![
                 ("⏎", "edit", Some(Hit::Key('\n'))),
                 ("n", "new", Some(Hit::Key('n'))),
                 if pending {
@@ -1623,9 +1768,12 @@ fn draw_cron(frame: &mut Frame, app: &mut App, jobs: &[crate::crontab::CronJob])
     let text_w = width.saturating_sub(4) as usize;
     let mut lines: Vec<Line> = Vec::new();
     for job in jobs {
-        let when = Schedule::parse(&job.schedule)
-            .map(|s| s.describe())
-            .unwrap_or_else(|_| job.schedule.clone());
+        let when = match Schedule::parse(&job.schedule) {
+            // In the crontab, `@reboot` means the computer's start.
+            Ok(Schedule::AtStart) => "When the computer starts".to_string(),
+            Ok(s) => s.describe(),
+            Err(_) => job.schedule.clone(),
+        };
         lines.push(Line::from(vec![
             Span::styled(format!("{when}  "), bold(TEXT)),
             Span::styled(
@@ -1645,14 +1793,14 @@ fn draw_cron(frame: &mut Frame, app: &mut App, jobs: &[crate::crontab::CronJob])
     }
     lines.push(Line::from(""));
     for l in wrap(
-        "Move: they become routines that are on, with their output, retries and notifications here; their lines in your crontab are commented out (a backup is kept), so nothing runs twice. Copy: added switched off; your crontab stays as it is.",
+        "Keep as cron job: cron still runs it, also when Herdr is closed, but you see, edit and switch it here, with its output and result in Runs. Move to Herdr: Herdr runs it in a tab instead. Both comment the old line in your crontab out (a backup is kept), so nothing runs twice. Copy: added to Herdr switched off; your crontab stays as it is.",
         text_w,
     ) {
         lines.push(Line::from(Span::styled(l, Style::new().fg(FAINT))));
     }
     if !crate::autostart::is_on() {
         for l in wrap(
-            "Autostart is off: routines run only while Herdr runs, cron jobs always. Turn autostart on at the top to run them after a restart too.",
+            "Autostart is off: jobs moved to Herdr run only while Herdr runs; kept as cron jobs they always run. Turn autostart on at the top for Herdr to start at login.",
             text_w,
         ) {
             lines.push(Line::from(Span::styled(l, Style::new().fg(YELLOW))));
@@ -1679,8 +1827,9 @@ fn draw_cron(frame: &mut Frame, app: &mut App, jobs: &[crate::crontab::CronJob])
     let mut x = inner.x;
     let mut spans = Vec::new();
     for (key, what) in [
-        ("m", "move here"),
-        ("c", "copy, switched off"),
+        ("k", "keep as cron job"),
+        ("m", "move to Herdr"),
+        ("c", "copy, off"),
         ("Esc", "back"),
     ] {
         let w = (key.width() + what.width() + 3) as u16;
@@ -1844,7 +1993,10 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
             "Routines",
             &[
                 ("⏎  e", "edit the routine"),
-                ("n", "new routine: the form, or describe it to Claude"),
+                (
+                    "n",
+                    "new: Herdr routine, classic cron job, or describe it to Claude",
+                ),
                 ("p", "write the prompt or command"),
                 ("r", "run now (asks first)"),
                 ("a", "approve what changed outside the list (asks first)"),
@@ -1893,12 +2045,19 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
             "List",
             &[
                 ("↑ ↓  j k", "move"),
-                ("← →  Tab  1 2", "routines / runs"),
+                ("← →  Tab  1 2 3", "routines / cron jobs / runs"),
                 ("Mouse", "click to choose, double click to open"),
-                ("S", "start the scheduler"),
+                (
+                    "S",
+                    "all routines and cron jobs on or off (or click \"routines\" at the top)",
+                ),
                 (
                     "A",
                     "autostart: Herdr starts at login (routines run after a restart), or not",
+                ),
+                (
+                    "C",
+                    "your crontab's jobs (◇ under Cron jobs): keep as cron job, move to Herdr or copy",
                 ),
                 ("i", "Nerd Font icons / plain symbols"),
                 ("Esc", "close a dialog (never the list)"),

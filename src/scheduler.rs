@@ -172,6 +172,10 @@ fn tick(
     let server = paths.server_id();
     let mut started = Started::load(paths);
     for r in &routines {
+        // Cron jobs: the crontab starts them (`crontab::run_job`).
+        if r.is_cron() {
+            continue;
+        }
         let last = checked.0.get(&r.id).copied();
         checked.0.insert(r.id.clone(), now);
         let at_start = matches!(r.schedule(), Some(Schedule::AtStart));
@@ -261,6 +265,15 @@ fn tick(
     let in_view = workspace_in_view(&settings.workspace)?;
     let me = paths.server_id();
     for mut run in store::all_runs(paths) {
+        if run.cron_pid != 0 {
+            // A cron job's run belongs to its process; only one that ended
+            // without finishing the record is closed here.
+            if run.status.active() && !alive(run.cron_pid) {
+                run.finish(Status::Closed, "The cron run ended before it finished");
+                let _ = run.save(paths);
+            }
+            continue;
+        }
         if run.server != me {
             // Pane ids belong to the server the run was started on. When
             // that server is gone, so is the agent.
@@ -409,6 +422,29 @@ pub fn stop(paths: &Paths) {
     let _ = std::fs::remove_file(paths.pid_file());
 }
 
+/// The marker of "routines off" in the list: no scheduler starts (also not
+/// when Herdr starts) and cron jobs skip their times, until switched on.
+fn paused_file(paths: &Paths) -> std::path::PathBuf {
+    paths.state.join("paused")
+}
+
+pub fn paused(paths: &Paths) -> bool {
+    paused_file(paths).exists()
+}
+
+/// Switches all routines off (`true`) or on again.
+pub fn set_paused(paths: &Paths, off: bool) -> Result<(), String> {
+    if off {
+        paths::write_atomic(&paused_file(paths), b"switched off in the list\n")
+            .map_err(|e| e.to_string())
+    } else {
+        match std::fs::remove_file(paused_file(paths)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.to_string()),
+            _ => Ok(()),
+        }
+    }
+}
+
 /// Identifies the server behind the socket: a new server binds a new socket
 /// file, so its device and inode change.
 fn socket_identity(socket: &Path) -> Option<(u64, u64)> {
@@ -501,6 +537,7 @@ mod tests {
                 check_command: String::new(),
                 remember: false,
                 alert: Default::default(),
+                runs_in: Default::default(),
             },
             prompt: "go".into(),
             problem: None,

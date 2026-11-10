@@ -137,6 +137,10 @@ pub struct Run {
     /// 0 for the first try, 1 for the first retry and so on.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub attempt: u32,
+    /// A run of a cron job: the pid of the `cron-run` process, which owns
+    /// the record (it has no tab, and Herdr's scheduler leaves it alone).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cron_pid: u32,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -181,6 +185,7 @@ impl Run {
             turns_at_end: None,
             result: String::new(),
             attempt: 0,
+            cron_pid: 0,
         }
     }
 

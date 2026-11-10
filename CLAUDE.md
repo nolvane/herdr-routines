@@ -89,10 +89,14 @@ everything afterwards with `herdr-routines stop`,
 
 ## Non-goals
 
-- No headless runs: every run is an interactive agent in a tab.
+- No headless agent runs: every agent run is an interactive agent in a
+  tab. Only shell commands can be classic cron jobs (`runs_in = "cron"`),
+  which the system's cron starts through `herdr-routines cron-run`.
 - No scheduler of its own outside Herdr: routines run while the Herdr
-  server runs. The optional "start at login" entry (`autostart.rs`) starts
-  `herdr server`, not the plugin.
+  server runs; cron jobs use the system's cron. The optional "start at
+  login" entry (`autostart.rs`) starts `herdr server`, not the plugin.
+- The plugin writes only its own marked block of the crontab, and comments
+  other lines out only when the person moves that job here.
 
 ## Releasing
 

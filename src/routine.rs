@@ -108,6 +108,40 @@ impl Alert {
     }
 }
 
+/// Where a shell routine runs from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum RunsIn {
+    /// Herdr's scheduler starts it in a tab, while Herdr runs.
+    #[default]
+    Herdr,
+    /// A line in the user's crontab starts it (`herdr-routines cron-run`),
+    /// also when Herdr does not run. Shell commands only.
+    Cron,
+}
+
+impl RunsIn {
+    pub const ALL: [RunsIn; 2] = [RunsIn::Herdr, RunsIn::Cron];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            RunsIn::Herdr => "Herdr",
+            RunsIn::Cron => "Cron",
+        }
+    }
+
+    pub fn detail(self) -> &'static str {
+        match self {
+            RunsIn::Herdr => "In a tab in Herdr, while Herdr runs",
+            RunsIn::Cron => "A classic cron job, also when Herdr is closed",
+        }
+    }
+}
+
+fn is_herdr(r: &RunsIn) -> bool {
+    *r == RunsIn::Herdr
+}
+
 fn is_notification(a: &Alert) -> bool {
     *a == Alert::Notification
 }
@@ -178,6 +212,9 @@ pub struct RoutineFile {
     /// A notification, or a popup that stays until it is answered.
     #[serde(default, skip_serializing_if = "is_notification")]
     pub alert: Alert,
+    /// Herdr's scheduler, or a classic cron job (shell commands only).
+    #[serde(default, skip_serializing_if = "is_herdr")]
+    pub runs_in: RunsIn,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -314,6 +351,9 @@ impl Routine {
                 "the prompt is empty".into()
             });
         }
+        if file.runs_in == RunsIn::Cron && file.agent != SHELL {
+            return Some("only a shell command can run as a cron job".into());
+        }
         if file.agent == SHELL && !file.args.is_empty() {
             return Some("a shell command takes no extra arguments".into());
         }
@@ -325,6 +365,11 @@ impl Routine {
 
     pub fn is_shell(&self) -> bool {
         self.file.agent == SHELL
+    }
+
+    /// A classic cron job: the crontab starts it, not Herdr's scheduler.
+    pub fn is_cron(&self) -> bool {
+        self.file.runs_in == RunsIn::Cron
     }
 
     /// The file next to `routine.toml` with what the routine runs: the
@@ -483,6 +528,7 @@ pub fn load_all(paths: &Paths) -> Vec<Routine> {
                     check_command: String::new(),
                     remember: false,
                     alert: Alert::default(),
+                    runs_in: RunsIn::default(),
                 },
                 prompt: String::new(),
                 problem: Some(e),
@@ -598,6 +644,7 @@ mod tests {
             check_command: String::new(),
             remember: false,
             alert: Alert::Notification,
+            runs_in: RunsIn::Herdr,
         }
     }
 

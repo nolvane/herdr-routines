@@ -6,15 +6,18 @@ Gemini, OpenCode or any other agent Herdr knows), a folder and a time. When
 the time comes, the plugin opens a tab in the background, starts the agent
 there and hands it the prompt. You can watch any run live, answer when the
 agent asks something and keep talking to it afterwards. A routine can also
-be a plain shell command or script, like a cron job, without any AI.
+be a plain shell command or script, without any AI, and such a command can
+also be a classic cron job that your system's cron runs.
 
 Routines run as long as the Herdr server runs, also when no Herdr window is
 open. Herdr can also start in the background at login (the list asks once,
 and the "autostart" chip at the top or `A` switches it), so routines also
-run after a restart without opening Herdr.
+run after a restart without opening Herdr. Classic cron jobs run whenever
+the computer is on. The "routines" chip at the top (or `S`) switches all of
+them on or off at once.
 
 ```
- ◷ Scheduled routines    Routines (3)   Runs (41)     ● autostart on  ● scheduler on
+ ◷ Scheduled routines    Routines (3)   Cron jobs (2)   Runs (41)     ● autostart on   ● routines on
 
     Routine                                     Schedule                  Last run
  ●  Inbox clean up                              Weekdays, hourly at :15   ✓ Finished  12 runs ›
@@ -64,11 +67,20 @@ window, the selected routine's details show under the list.
   folder, with your shell and its environment. Exit code 0 counts as
   finished; any other code marks the run as failed and Herdr shows a
   notification.
-- **Your cron jobs:** `C` lists the jobs in your crontab. `m` moves them
-  here as shell routines (their crontab lines are commented out after a
-  backup in the state folder, so nothing runs twice); `c` copies them,
-  switched off, and leaves the crontab alone. Variables set in the crontab
-  (such as `PATH`) come along; `@reboot` becomes "when Herdr starts".
+- **Classic cron jobs** have their own tab. `n`, then "Classic cron job",
+  creates one: a shell command that the system's cron runs from your
+  crontab, also when Herdr is closed. It is edited, switched and copied like
+  a routine, and its runs (output, result, failures, retries, alerts) show
+  in Runs like any other. The plugin keeps these jobs in a marked block of
+  your crontab and rewrites only that block (after a backup in the state
+  folder). On macOS, a cron job that works in Documents, Desktop or
+  Downloads needs Full Disk Access for `/usr/sbin/cron` (System Settings,
+  Privacy & Security, Full Disk Access).
+- **Your other cron jobs** show in the Cron jobs tab too (◇). `⏎` on one (or
+  `C` for all) offers: keep it as a cron job but manage it here, move it to
+  Herdr (it runs in a tab instead), or copy it to Herdr switched off. Moving
+  comments the old crontab line out after a backup, so nothing runs twice.
+  Variables set in the crontab (such as `PATH`) come along.
 - **Create with Claude:** `n`, then "Describe it to Claude", opens a tab
   where Claude asks what the routine should do, writes it and checks that
   it loads. You then approve it in the list with `a`.
@@ -165,7 +177,7 @@ Update with `herdr plugin update`.
 | --- | --- |
 | `↑` `↓` | Move |
 | `⏎` | Edit the routine (in Runs: go to the run's tab) |
-| `n` | New routine: fill in the form, or describe it to Claude |
+| `n` | New: a Herdr routine, a classic cron job, or describe it to Claude |
 | `p` | Write the prompt |
 | `r` | Run now (asks first) |
 | `a` | Approve a routine changed outside the list (shows it first) |
@@ -175,10 +187,10 @@ Update with `herdr plugin update`.
 | `l` | Result and output of the last run |
 | `h` | Only this routine's runs (`Esc` shows all again) |
 | `d` | Delete with its run history (asks first) |
-| `←` `→` | Switch between routines and runs |
-| `S` | Start the scheduler when it is off |
+| `←` `→` `1` `2` `3` | Switch between routines, cron jobs and runs |
+| `S` | All routines and cron jobs on or off (asks first) |
 | `A` | Start Herdr at login, or not any more (asks first) |
-| `C` | Your cron jobs: move or copy them here |
+| `C` | Your crontab's other jobs: keep them as cron jobs, move or copy them |
 | `q` | Close the list (asks first); routines keep running |
 
 The mouse works too: click a tab or a row, double click to open, scroll with
