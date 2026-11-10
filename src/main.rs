@@ -79,9 +79,16 @@ pub fn leave_terminal() {
 
 fn list(paths: Paths) -> std::io::Result<()> {
     let app = app::App::new(paths);
+    // Herdr keeps right clicks for its own pane menu unless the pane asks
+    // for them; the list has its own menu.
+    let right_clicks = herdr::right_clicks_to_me(true);
     let mut terminal = enter_terminal();
     let result = app.run(&mut terminal);
     leave_terminal();
+    if right_clicks {
+        // The pane may stay (a shell the list was started in by hand).
+        herdr::right_clicks_to_me(false);
+    }
     pane::forget_self();
     result
 }

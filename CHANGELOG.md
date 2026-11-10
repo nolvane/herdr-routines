@@ -22,7 +22,8 @@ All notable changes to this plugin. The format follows
   setting.
 - "routines on/off" at the top (or `S`) switches all routines and cron jobs
   on or off, after asking; off stays off across Herdr restarts.
-- A right click on a routine, cron job or run opens a menu of what can be
+- A right click on a routine, cron job or run opens a menu (the list asks
+  Herdr to pass right clicks on to it) of what can be
   done with it (edit, run, switch, copy, runs, output, delete and more),
   each entry with its key.
 

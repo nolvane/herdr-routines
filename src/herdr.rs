@@ -289,6 +289,17 @@ pub fn open_popup(entrypoint: &str, width: u16, height: u16, env: &[(&str, &str)
     run(&refs).is_ok()
 }
 
+/// Where right clicks in this process's own pane go: `true` to the pane
+/// (the list's menu), `false` back to Herdr's pane menu. Herdr keeps them
+/// for its own menu unless a pane asks. Nothing outside a Herdr pane.
+pub fn right_clicks_to_me(mine: bool) -> bool {
+    let Ok(pane) = std::env::var("HERDR_PANE_ID") else {
+        return false;
+    };
+    let target = if mine { "pane" } else { "herdr" };
+    run(&["pane", "input", &pane, "--right-click", target]).is_ok()
+}
+
 pub fn notify(title: &str, body: &str, sound: &str) {
     let _ = call(&[
         "notification",

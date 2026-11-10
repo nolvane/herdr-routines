@@ -573,3 +573,27 @@ The copy is approved only when the original is.
 
 Why: a copy that runs at once would double every run, and copying must not
 turn a routine that waits for approval into an approved one.
+
+## 2026-11-10: The list asks Herdr for right clicks
+
+Herdr keeps right clicks in a pane for its own pane menu unless the pane
+routes them to its program. When the list starts in a Herdr pane, it runs
+`herdr pane input <its pane> --right-click pane` so its own menu opens;
+when it closes, it routes them back to Herdr (the pane may be a shell the
+list was started in by hand).
+
+Why: without it, a right click never reached the list and the menu could
+not open in Herdr, only in the tests.
+
+## 2026-11-10: macOS and Linux only
+
+The plugin declares `platforms = ["linux", "macos"]`, like the owner's
+other Herdr plugins. It builds and passes clippy for Linux
+(`cargo clippy --target x86_64-unknown-linux-gnu`) but has not been run
+there. Windows is not supported: the code uses Unix files and processes
+(links, file modes, process groups, `/bin/sh`) and cron, and Herdr's
+plugin build runs `sh`.
+
+Why: Herdr runs on Windows, but a Windows version would need the Task
+Scheduler instead of cron and PowerShell instead of `sh`, which is a
+separate piece of work for the owner to decide on.
