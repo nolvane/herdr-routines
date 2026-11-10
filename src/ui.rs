@@ -9,7 +9,8 @@ use crate::form::{Field, Form};
 use crate::routine::Routine;
 use crate::store::Run;
 use crate::theme::{
-    self, Icons, ACCENT, BAR_BG, BORDER, FAINT, GREEN, MUTED, RED, SELECTED_BG, TEXT, YELLOW,
+    self, Icons, ACCENT, BAR_BG, BORDER, FAINT, GREEN, MARK_BG, MUTED, RED, SELECTED_BG, TEXT,
+    YELLOW,
 };
 use chrono::Local;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -110,10 +111,10 @@ fn draw_header(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
     let (chip, style) = match app.scheduler {
         Some(_) => (
             format!("{} scheduler on", icons.running()),
-            Style::new().fg(FAINT),
+            Style::new().fg(GREEN),
         ),
         None => (
-            format!("{} scheduler off · S starts it", icons.warning()),
+            format!("{} scheduler off · S starts it", icons.running()),
             Style::new().fg(RED),
         ),
     };
@@ -297,7 +298,7 @@ fn draw_routines(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
                 ("No routines yet.", TEXT),
                 ("", TEXT),
                 (
-                    "n creates one: what the agent should do, which agent, in which folder and when.",
+                    "n creates one: fill in a short form, or describe it to Claude.",
                     MUTED,
                 ),
                 (&format!("Routines are plain files in {path}."), FAINT),
@@ -751,22 +752,43 @@ fn draw_editor(frame: &mut Frame, app: &mut App, area: Rect) {
             Rect::new(text.x + 1, text.y, text.width.saturating_sub(1), 1),
         );
     }
+    let marked = ed.text.selection();
+    let plain = Style::new().fg(TEXT);
+    let mark = Style::new().fg(TEXT).bg(MARK_BG);
     let lines: Vec<Line> = rows
         .iter()
         .skip(ed.text.top)
         .take(height)
-        .map(|(l, s, e)| {
-            let s: String = ed.text.lines[*l][*s..*e]
-                .iter()
-                .map(|c| {
-                    if *c == '\t' {
-                        "    ".to_string()
-                    } else {
-                        c.to_string()
-                    }
-                })
-                .collect();
-            Line::from(Span::styled(s, Style::new().fg(TEXT)))
+        .map(|&(l, s, e)| {
+            // Runs of marked and unmarked characters.
+            let mut spans: Vec<Span> = Vec::new();
+            let mut run = String::new();
+            let mut run_marked = false;
+            for col in s..e {
+                let c = ed.text.lines[l][col];
+                let m = marked.is_some_and(|(a, b)| (l, col) >= a && (l, col) < b);
+                if m != run_marked && !run.is_empty() {
+                    let style = if run_marked { mark } else { plain };
+                    spans.push(Span::styled(std::mem::take(&mut run), style));
+                }
+                run_marked = m;
+                if c == '\t' {
+                    run.push_str("    ");
+                } else {
+                    run.push(c);
+                }
+            }
+            // A marked line break shows as one marked space.
+            let next_marked = marked.is_some_and(|(a, b)| (l, e) >= a && (l, e) < b);
+            let last_of_line = e == ed.text.lines[l].len();
+            if !run.is_empty() {
+                let style = if run_marked { mark } else { plain };
+                spans.push(Span::styled(run, style));
+            }
+            if last_of_line && next_marked {
+                spans.push(Span::styled(" ", mark));
+            }
+            Line::from(spans)
         })
         .collect();
     if !(ed.text.lines.len() == 1 && ed.text.lines[0].is_empty()) {
@@ -1202,7 +1224,7 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
             "Routines",
             &[
                 ("⏎  e", "edit the routine"),
-                ("n", "new routine"),
+                ("n", "new routine: the form, or describe it to Claude"),
                 ("p", "write the prompt or command"),
                 ("r", "run now (asks first)"),
                 ("Space", "on / off"),
@@ -1234,6 +1256,10 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
             &[
                 ("Esc", "done, keeps what you wrote"),
                 ("Ctrl+Z  Ctrl+Y", "undo / redo"),
+                ("Shift+arrows", "mark text; or drag with the mouse"),
+                ("Double click", "mark a word"),
+                ("Ctrl+A", "mark everything"),
+                ("Ctrl+C  X  V", "copy, cut, paste"),
                 ("arrows  Mouse", "move; ⏎ starts a new line"),
                 ("Ctrl+O", "open in another editor ($VISUAL, $EDITOR)"),
             ],

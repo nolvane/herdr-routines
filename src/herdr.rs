@@ -124,6 +124,27 @@ pub fn open_tab(workspace_label: &str, cwd: &str, tab_label: &str) -> Result<Pla
     Ok(place)
 }
 
+/// A new tab in the workspace the list runs in, shown right away, with
+/// these environment variables (`KEY=VALUE`).
+pub fn open_focused_tab(cwd: &str, tab_label: &str, env: &[String]) -> Result<Place, Error> {
+    let ws = std::env::var("HERDR_WORKSPACE_ID").unwrap_or_default();
+    let mut a = vec![
+        "tab", "create", "--cwd", cwd, "--label", tab_label, "--focus",
+    ];
+    if !ws.is_empty() {
+        a.extend(["--workspace", ws.as_str()]);
+    }
+    for e in env {
+        a.extend(["--env", e.as_str()]);
+    }
+    let v = call(&a)?;
+    Ok(Place {
+        workspace_id: s(&v["result"]["tab"]["workspace_id"]),
+        tab_id: s(&v["result"]["tab"]["tab_id"]),
+        pane_id: s(&v["result"]["root_pane"]["pane_id"]),
+    })
+}
+
 pub fn agent_start(name: &str, kind: &str, pane: &str, args: &[String]) -> Result<(), Error> {
     let mut a: Vec<&str> = vec![
         "agent",

@@ -198,3 +198,40 @@ English word for what the plugin does, and Herdr is the host it extends. No
 agent or vendor name is in it, so no trademark is used as a product name.
 Inside the list the tab "Routines" and the default workspace for runs keep
 the plain word, since they name the things listed, not the plugin.
+
+## 2026-11-10: Create a routine by describing it to Claude
+
+`n` asks whether to fill in the form or describe the routine to Claude.
+The second opens a tab in the list's workspace, in the plugin's config
+folder, with Claude in Auto mode. The brief goes in as its first message
+(`herdr agent prompt`, since a multi-line start argument is refused), once
+Claude takes it, also after a "trust this folder?" question. It holds the
+file format and asks Claude to ask what is needed in one message, show a
+summary before writing, leave other routines alone, and check the result
+with `herdr-routines routines`; the tab gets the list's config and state
+folders as environment variables so that check reads the same routines.
+The list and scheduler pick up the files as they pick up any edit.
+
+Why: the owner wanted routines made by an agent. Claude writes the same
+files a person would, so nothing new has to be kept in sync. Auto mode
+lets it write the files and run the check without a question each time
+(`acceptEdits` still asked before the check). Claude only, since it is the
+agent the owner uses and the brief relies on its flags.
+
+## 2026-11-10: Marking text in the prompt editor
+
+Shift with the arrows, a mouse drag, a double click (a word) and `Ctrl+A`
+mark text; typing or `Backspace` replaces it, `Ctrl+C`, `Ctrl+X` and
+`Ctrl+V` copy, cut and paste through the system clipboard (`pbcopy`, or
+`wl-copy`/`xclip` on Linux, with a copy inside the list as fallback). The
+scheduler status chip is green when it runs, red when it does not.
+
+Why: the owner wants to edit prompts faster. The list captures the mouse,
+so the terminal's own selection does not reach the text; the editor has to
+mark itself.
+
+## 2026-11-10: No cost limit per run (yet)
+
+A USD limit next to the time limit was asked for. Claude Code only enforces
+`--max-budget-usd` in headless `--print` runs, and runs here are interactive
+tabs on purpose. Not built; open for the owner's decision.

@@ -1,6 +1,7 @@
 //! The list's state and what the keys and the mouse do. Drawing is in
 //! `ui.rs`.
 
+use crate::clipboard;
 use crate::editor::TextArea;
 use crate::form::{Field, Form, OTHER_MODEL};
 use crate::paths::{self, Paths};
@@ -80,8 +81,13 @@ pub struct Picker {
     pub title: String,
     pub items: Vec<crate::form::Item>,
     pub sel: usize,
-    pub field: Field,
+    /// The form field it fills; None for "how to create a routine".
+    pub field: Option<Field>,
 }
+
+/// The choices behind `n`.
+const BY_FORM: &str = "form";
+const BY_AGENT: &str = "agent";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Input {
@@ -211,6 +217,8 @@ pub struct App {
     external: bool,
     last_load: Instant,
     last_click: Option<(Instant, Hit)>,
+    /// What was copied last, for pasting when there is no system clipboard.
+    clip: String,
 }
 
 impl App {
@@ -239,6 +247,7 @@ impl App {
             external: false,
             last_load: Instant::now(),
             last_click: None,
+            clip: String::new(),
         };
         app.reload();
         app
@@ -350,6 +359,98 @@ impl App {
             lines,
             scroll: u16::MAX,
             max: 0,
+        });
+    }
+
+    /// `n`: fill in the form, or describe the routine to Claude.
+    fn new_routine(&mut self) {
+        let item = |value: &str, label: &str, detail: &str| crate::form::Item {
+            value: value.into(),
+            label: label.into(),
+            detail: detail.into(),
+        };
+        self.mode = Mode::Pick(Picker {
+            title: "New routine".into(),
+            items: vec![
+                item(BY_FORM, "Fill in the form", "Choose every setting yourself"),
+                item(
+                    BY_AGENT,
+                    "Describe it to Claude",
+                    "Claude asks what you need in a new tab and creates the routine",
+                ),
+            ],
+            sel: 0,
+            field: None,
+        });
+    }
+
+    /// Opens a tab next to the list with Claude, briefed to create a
+    /// routine with the person. Claude writes the files; the scheduler and
+    /// the list pick them up.
+    fn create_with_agent(&mut self) {
+        let config = self.paths.config.clone();
+        let brief = agent_brief(&self.paths);
+        // So `herdr-routines routines` in that tab reads these routines.
+        let env = vec![
+            format!("HERDR_PLUGIN_CONFIG_DIR={}", config.display()),
+            format!("HERDR_PLUGIN_STATE_DIR={}", self.paths.state.display()),
+        ];
+        if let Err(e) = std::fs::create_dir_all(self.paths.routines_dir()) {
+            self.flash(format!("Could not prepare the folder: {e}"), RED);
+            return;
+        }
+        self.flash("Opening a tab with Claude…", ACCENT);
+        std::thread::spawn(move || {
+            let result =
+                crate::herdr::open_focused_tab(&config.to_string_lossy(), "New routine", &env)
+                    .and_then(|place| {
+                        // Auto: it writes the files and runs the check without
+                        // asking, and a safety check still stops risky steps.
+                        let args = ["--permission-mode".into(), "auto".into()];
+                        // The new tab's shell needs a moment before it takes
+                        // the agent, as for runs.
+                        let mut started = Ok(());
+                        for attempt in 0..6 {
+                            if attempt > 0 {
+                                std::thread::sleep(Duration::from_secs(2));
+                            }
+                            started = crate::herdr::agent_start(
+                                "new-routine",
+                                "claude",
+                                &place.pane_id,
+                                &args,
+                            );
+                            match &started {
+                                Err(e) if e.code != "agent_not_ready" && e.code != "timeout" => {}
+                                _ => break,
+                            }
+                        }
+                        match started {
+                            Err(e) if e.code != "agent_not_ready" && e.code != "timeout" => {
+                                return Err(e);
+                            }
+                            _ => {}
+                        }
+                        // The brief goes in as the first message once Claude
+                        // takes it, also after it asked something first (such
+                        // as whether to trust the folder). Up to ten minutes.
+                        let mut last = Ok(());
+                        for _ in 0..300 {
+                            last = crate::herdr::agent_prompt(&place.pane_id, &brief);
+                            match &last {
+                                Err(e)
+                                    if e.code == "agent_not_ready" || e.code == "agent_blocked" =>
+                                {
+                                    std::thread::sleep(Duration::from_secs(2));
+                                }
+                                _ => break,
+                            }
+                        }
+                        last
+                    });
+            if let Err(e) = result {
+                crate::herdr::notify("Could not start Claude", &e.to_string(), "none");
+            }
         });
     }
 
@@ -575,13 +676,20 @@ impl App {
             title: form.label(field).into(),
             items,
             sel,
-            field,
+            field: Some(field),
         });
     }
 
     fn picked(&mut self, p: Picker) {
         self.mode = Mode::Normal;
         let Some(item) = p.items.get(p.sel) else {
+            return;
+        };
+        let Some(field) = p.field else {
+            match item.value.as_str() {
+                BY_AGENT => self.create_with_agent(),
+                _ => self.new_form(),
+            }
             return;
         };
         if item.value == OTHER_MODEL {
@@ -598,7 +706,7 @@ impl App {
             return;
         }
         if let Some(form) = self.form.as_mut() {
-            form.choose(p.field, &item.value);
+            form.choose(field, &item.value);
         }
     }
 
@@ -666,7 +774,8 @@ impl App {
             return;
         }
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-        if ctrl && k.code == KeyCode::Char('c') {
+        let writing = self.editor.is_some() && matches!(self.mode, Mode::Normal);
+        if ctrl && k.code == KeyCode::Char('c') && !writing {
             self.mode = Mode::AskQuit;
             return;
         }
@@ -786,6 +895,27 @@ impl App {
             KeyCode::Esc => self.save_editor(),
             KeyCode::Char('s') if ctrl => self.save_editor(),
             KeyCode::Char('o') if ctrl => self.external = true,
+            KeyCode::Char('c') | KeyCode::Char('x') if ctrl => {
+                let Some(ed) = self.editor.as_mut() else {
+                    return;
+                };
+                let text = if k.code == KeyCode::Char('x') {
+                    ed.text.cut()
+                } else {
+                    ed.text.selected_text()
+                };
+                if let Some(text) = text {
+                    clipboard::set(&text);
+                    self.clip = text;
+                }
+            }
+            KeyCode::Char('v') if ctrl => {
+                let text = clipboard::get().unwrap_or_else(|| self.clip.clone());
+                if let Some(ed) = self.editor.as_mut() {
+                    ed.text.paste(&text);
+                    ed.text.follow();
+                }
+            }
             _ => {
                 if let Some(ed) = self.editor.as_mut() {
                     ed.text.key(&k);
@@ -848,7 +978,7 @@ impl App {
             KeyCode::Char('2') => self.view = View::Runs,
             KeyCode::Char('S') => self.start_scheduler(),
             KeyCode::Char('i') => self.toggle_icons(),
-            KeyCode::Char('n') => self.new_form(),
+            KeyCode::Char('n') => self.new_routine(),
             KeyCode::Enter => self.enter(),
             KeyCode::Char('l') => {
                 let run = match self.view {
@@ -890,6 +1020,20 @@ impl App {
     }
 
     // ---- mouse ------------------------------------------------------------
+
+    /// Dragging in the editor marks text.
+    fn drag(&mut self, x: u16, y: u16) {
+        if !matches!(self.mode, Mode::Normal) {
+            return;
+        }
+        let Some((rect, _)) = self.hits.iter().find(|(_, h)| *h == Hit::Text).copied() else {
+            return;
+        };
+        if let Some(ed) = self.editor.as_mut() {
+            ed.text
+                .drag(y as i32 - rect.y as i32, x.saturating_sub(rect.x) as usize);
+        }
+    }
 
     fn click(&mut self, x: u16, y: u16) {
         let Some((rect, hit)) = self
@@ -965,6 +1109,9 @@ impl App {
             Hit::Text => {
                 if let Some(ed) = self.editor.as_mut() {
                     ed.text.place((y - rect.y) as usize, (x - rect.x) as usize);
+                    if double {
+                        ed.text.select_word();
+                    }
                 }
             }
             Hit::Link => {
@@ -1010,6 +1157,7 @@ impl App {
             Event::Paste(text) => self.paste(&text),
             Event::Mouse(m) => match m.kind {
                 MouseEventKind::Down(MouseButton::Left) => self.click(m.column, m.row),
+                MouseEventKind::Drag(MouseButton::Left) => self.drag(m.column, m.row),
                 MouseEventKind::ScrollDown => self.wheel(1),
                 MouseEventKind::ScrollUp => self.wheel(-1),
                 _ => {}
@@ -1175,6 +1323,38 @@ pub fn open_in_browser(opener: &str, url: &str) -> bool {
         }
         Err(_) => false,
     }
+}
+
+/// What Claude is told when it creates a routine with the person.
+pub fn agent_brief(paths: &Paths) -> String {
+    let dir = paths::shorten(&paths.routines_dir());
+    let bin = std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "herdr-routines".into());
+    format!(
+        r#"Help me create a scheduled routine for the Herdr plugin herdr-routines. Talk to me in the language I write in, short and plain; I may not be a developer.
+
+How routines work: each routine is a folder {dir}/<id>/ (id: lowercase words joined by dashes, unique). It holds routine.toml and either prompt.md (what the agent is told) or, for agent = "shell", command.sh (a shell command or script, run with my $SHELL in the folder; exit code 0 counts as finished). A scheduler reads these files every few seconds and opens a tab for each run at the scheduled time. Nobody watches a run while it works.
+
+routine.toml:
+name = "Weekly dependency check"
+enabled = true
+schedule = "0 7 * * 1"            # cron, 5 fields, local time: minute hour day month weekday
+agent = "claude"                  # claude, codex, gemini, opencode, any kind Herdr knows, or "shell"
+permission_mode = "auto"          # optional. claude: auto, acceptEdits, plan, dontAsk, bypassPermissions, manual. codex: auto, read-only, full-access. gemini: auto_edit, yolo
+model = "sonnet"                  # optional. claude: fable, opus, sonnet, haiku; others: a model name they know
+effort = "medium"                 # optional, claude only: low, medium, high, xhigh, max
+args = []                         # extra command line options for the agent, usually empty; never for shell
+folder = "~/code/app"             # where it runs
+missed = "run-once"               # when the computer was off at the time: "run-once" or "skip"
+time_limit_minutes = 120
+
+What to do:
+1. Ask me what the routine should do, how often and when, and in which folder, unless I already said it. Ask everything you need in one short message. Suggest sensible choices (a cheaper model for simple jobs, "auto" so nobody has to approve steps, a plain shell command when no AI is needed).
+2. For an agent routine, write prompt.md as clear instructions for an agent working alone: what to do, where, what to report at the end, and what it must not do. For a shell routine, write command.sh.
+3. Show me a short summary (name, schedule in words, agent, model, folder) and create the files once I agree. Do not change or delete other routines unless I ask.
+4. Run `{bin} routines` and check that the new routine shows "problem": null; fix the files if not. Then tell me it is ready and that it appears in the list (Ctrl+B, U)."#
+    )
 }
 
 #[cfg(test)]
@@ -1347,6 +1527,7 @@ mod tests {
     fn the_prompt_sits_above_the_save_button() {
         let mut a = app("layout");
         press(&mut a, KeyCode::Char('n'));
+        press(&mut a, KeyCode::Enter);
         let lines = screen(&mut a, 90, 30);
         let at = |s: &str| lines.iter().position(|l| l.contains(s)).unwrap();
         let prompt = at(" Prompt ");
@@ -1363,6 +1544,7 @@ mod tests {
     fn the_selected_field_explains_itself() {
         let mut a = app("explain");
         press(&mut a, KeyCode::Char('n'));
+        press(&mut a, KeyCode::Enter);
         a.form.as_mut().unwrap().select(Field::Mode);
         for (w, h) in [(90, 34), (80, 24)] {
             let lines = screen(&mut a, w, h);
@@ -1376,6 +1558,7 @@ mod tests {
     fn the_form_saves_mode_and_model() {
         let mut a = app("form");
         press(&mut a, KeyCode::Char('n'));
+        press(&mut a, KeyCode::Enter);
         for c in "Check links".chars() {
             press(&mut a, KeyCode::Char(c));
         }

@@ -14,6 +14,7 @@
 
 mod agent;
 mod app;
+mod clipboard;
 mod cron;
 mod editor;
 mod form;

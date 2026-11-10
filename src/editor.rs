@@ -74,7 +74,13 @@ pub struct TextArea {
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
     last: Last,
+    /// Where marking started (Shift with the arrows, or a mouse drag); the
+    /// marked text runs from here to the cursor.
+    pub anchor: Option<(usize, usize)>,
 }
+
+/// A spot in the text: `(line, column)`.
+pub type Pos = (usize, usize);
 
 impl TextArea {
     pub fn new(text: &str) -> TextArea {
@@ -91,7 +97,112 @@ impl TextArea {
             undo: Vec::new(),
             redo: Vec::new(),
             last: Last::Other,
+            anchor: None,
         }
+    }
+
+    // ---- marking ----------------------------------------------------------
+
+    /// The marked text as `(start, end)`, None when nothing is marked.
+    pub fn selection(&self) -> Option<(Pos, Pos)> {
+        let a = self.anchor?;
+        let b = (self.row, self.col);
+        match a.cmp(&b) {
+            std::cmp::Ordering::Less => Some((a, b)),
+            std::cmp::Ordering::Greater => Some((b, a)),
+            std::cmp::Ordering::Equal => None,
+        }
+    }
+
+    pub fn selected_text(&self) -> Option<String> {
+        let ((r1, c1), (r2, c2)) = self.selection()?;
+        if r1 == r2 {
+            return Some(self.lines[r1][c1..c2].iter().collect());
+        }
+        let mut out: String = self.lines[r1][c1..].iter().collect();
+        for l in &self.lines[r1 + 1..r2] {
+            out.push('\n');
+            out.extend(l.iter());
+        }
+        out.push('\n');
+        out.extend(self.lines[r2][..c2].iter());
+        Some(out)
+    }
+
+    /// Removes the marked text (one undo step). True when something was
+    /// marked. Clears the mark either way.
+    fn delete_selection(&mut self) -> bool {
+        let Some(((r1, c1), (r2, c2))) = self.selection() else {
+            self.anchor = None;
+            return false;
+        };
+        self.anchor = None;
+        self.save_undo(Last::Other);
+        let tail = self.lines[r2].split_off(c2);
+        if r1 == r2 {
+            self.lines[r1].truncate(c1);
+        } else {
+            self.lines[r1].truncate(c1);
+            self.lines.drain(r1 + 1..=r2);
+        }
+        self.lines[r1].extend(tail);
+        self.row = r1;
+        self.col = c1;
+        self.last = Last::Other;
+        true
+    }
+
+    /// Cuts the marked text out and returns it.
+    pub fn cut(&mut self) -> Option<String> {
+        let text = self.selected_text()?;
+        self.delete_selection();
+        self.follow();
+        Some(text)
+    }
+
+    pub fn select_all(&mut self) {
+        self.anchor = Some((0, 0));
+        self.go_to_end();
+        self.follow();
+    }
+
+    /// Marks the word at the cursor (a double click).
+    pub fn select_word(&mut self) {
+        let l = &self.lines[self.row];
+        let word = |c: char| !c.is_whitespace();
+        let mut s = self.col.min(l.len());
+        let mut e = s;
+        if (e < l.len() && word(l[e])) || (s > 0 && word(l[s - 1])) {
+            while s > 0 && word(l[s - 1]) {
+                s -= 1;
+            }
+            while e < l.len() && word(l[e]) {
+                e += 1;
+            }
+        }
+        self.anchor = Some((self.row, s));
+        self.col = e;
+    }
+
+    /// Moves the cursor to a spot on screen while the mark stays (a drag).
+    pub fn drag(&mut self, y: i32, x: usize) {
+        if self.anchor.is_none() {
+            self.anchor = Some((self.row, self.col));
+        }
+        // Dragging past the edge scrolls.
+        if y < 0 {
+            self.scroll(-1);
+        } else if y as usize >= self.height {
+            self.scroll(1);
+        }
+        let y = (y.max(0) as usize).min(self.height.saturating_sub(1));
+        let rows = self.rows();
+        let Some(&(line, s, e)) = rows.get(self.top + y).or(rows.last()) else {
+            return;
+        };
+        self.row = line;
+        self.col = self.col_at(line, s, e, x, rows.get(self.top + y + 1));
+        self.want_x = None;
     }
 
     pub fn text(&self) -> String {
@@ -105,6 +216,7 @@ impl TextArea {
     /// New text from outside (the person's own editor), as one undo step.
     pub fn replace(&mut self, text: &str) {
         self.save_undo(Last::Other);
+        self.anchor = None;
         self.lines = text.split('\n').map(|l| l.chars().collect()).collect();
         self.go_to_end();
         self.top = 0;
@@ -180,6 +292,7 @@ impl TextArea {
         self.col = self.col_at(line, s, e, x, rows.get(self.top + y + 1));
         self.want_x = None;
         self.last = Last::Other;
+        self.anchor = None;
     }
 
     /// The character index at screen column `x` of the row `(s, e)`.
@@ -263,6 +376,8 @@ impl TextArea {
         if c == '\n' {
             return self.newline();
         }
+        // Typing replaces the marked text.
+        self.delete_selection();
         // A new word starts a new undo step.
         if c == ' ' {
             self.last = Last::Other;
@@ -274,6 +389,7 @@ impl TextArea {
 
     /// Pasted text, as one undo step.
     pub fn paste(&mut self, text: &str) {
+        self.delete_selection();
         self.save_undo(Last::Other);
         for c in text.chars() {
             match c {
@@ -295,6 +411,7 @@ impl TextArea {
     }
 
     pub fn newline(&mut self) {
+        self.delete_selection();
         self.save_undo(Last::Other);
         let rest = self.lines[self.row].split_off(self.col);
         self.lines.insert(self.row + 1, rest);
@@ -303,7 +420,7 @@ impl TextArea {
     }
 
     pub fn backspace(&mut self) {
-        if self.col == 0 && self.row == 0 {
+        if self.delete_selection() || (self.col == 0 && self.row == 0) {
             return;
         }
         self.save_undo(Last::Deleting);
@@ -319,6 +436,9 @@ impl TextArea {
     }
 
     pub fn delete(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         let len = self.lines[self.row].len();
         if self.col == len && self.row + 1 == self.lines.len() {
             return;
@@ -334,6 +454,9 @@ impl TextArea {
 
     /// Deletes the word before the cursor.
     fn delete_word(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         let start = self.word_left_col();
         if start == self.col {
             return self.backspace();
@@ -344,6 +467,7 @@ impl TextArea {
     }
 
     pub fn undo(&mut self) {
+        self.anchor = None;
         if let Some((lines, row, col)) = self.undo.pop() {
             self.redo.push((
                 std::mem::replace(&mut self.lines, lines),
@@ -357,6 +481,7 @@ impl TextArea {
     }
 
     pub fn redo(&mut self) {
+        self.anchor = None;
         if let Some((lines, row, col)) = self.redo.pop() {
             self.undo.push((
                 std::mem::replace(&mut self.lines, lines),
@@ -426,11 +551,31 @@ impl TextArea {
     pub fn key(&mut self, k: &KeyEvent) -> bool {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let alt = k.modifiers.contains(KeyModifiers::ALT);
+        let shift = k.modifiers.contains(KeyModifiers::SHIFT);
         let page = self.height.max(2) as i32 - 1;
+        let moving = matches!(
+            k.code,
+            KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::Home
+                | KeyCode::End
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+        );
+        if moving {
+            // Shift with a movement marks; without it the mark goes.
+            if !shift {
+                self.anchor = None;
+            } else if self.anchor.is_none() {
+                self.anchor = Some((self.row, self.col));
+            }
+        }
         match k.code {
             KeyCode::Char('z') if ctrl => self.undo(),
             KeyCode::Char('y') if ctrl => self.redo(),
-            KeyCode::Char('a') if ctrl => self.home(),
+            KeyCode::Char('a') if ctrl => self.select_all(),
             KeyCode::Char('e') if ctrl => self.end(),
             KeyCode::Char('w') if ctrl => self.delete_word(),
             KeyCode::Char('b') if alt => self.word_left(),
@@ -581,5 +726,53 @@ mod tests {
         t.col = 2;
         key(&mut t, KeyCode::Delete);
         assert_eq!(t.text(), "abcd");
+    }
+
+    fn shifted(t: &mut TextArea, code: KeyCode) {
+        t.key(&KeyEvent::new(code, KeyModifiers::SHIFT));
+    }
+
+    #[test]
+    fn marking_with_shift_replaces_and_deletes() {
+        let mut t = TextArea::new("hello world\nsecond line");
+        t.width = 40;
+        t.col = 6;
+        for _ in 0..5 {
+            shifted(&mut t, KeyCode::Right);
+        }
+        assert_eq!(t.selected_text().as_deref(), Some("world"));
+        typed(&mut t, "there");
+        assert_eq!(t.text(), "hello there\nsecond line");
+        assert!(t.selection().is_none());
+        // Across lines, then Backspace removes it all; undo brings it back.
+        t.col = 6;
+        shifted(&mut t, KeyCode::Down);
+        assert_eq!(t.selected_text().as_deref(), Some("there\nsecond"));
+        key(&mut t, KeyCode::Backspace);
+        assert_eq!(t.text(), "hello  line");
+        t.undo();
+        assert_eq!(t.text(), "hello there\nsecond line");
+        // Moving without Shift drops the mark.
+        shifted(&mut t, KeyCode::Right);
+        key(&mut t, KeyCode::Right);
+        assert!(t.selection().is_none());
+    }
+
+    #[test]
+    fn select_all_cut_word_and_drag() {
+        let mut t = TextArea::new("one two\nthree");
+        t.width = 40;
+        t.height = 5;
+        t.key(&KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert_eq!(t.selected_text().as_deref(), Some("one two\nthree"));
+        assert_eq!(t.cut().as_deref(), Some("one two\nthree"));
+        assert_eq!(t.text(), "");
+        t.paste("one two\nthree");
+        t.place(0, 5);
+        t.select_word();
+        assert_eq!(t.selected_text().as_deref(), Some("two"));
+        t.place(0, 0);
+        t.drag(1, 3);
+        assert_eq!(t.selected_text().as_deref(), Some("one two\nthr"));
     }
 }

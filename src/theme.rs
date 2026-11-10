@@ -15,6 +15,8 @@ pub const RED: Color = Color::Rgb(0xF0, 0x56, 0x6D);
 pub const YELLOW: Color = Color::Rgb(0xE8, 0xB9, 0x4E);
 pub const BLUE: Color = Color::Rgb(0x6C, 0xA8, 0xF0);
 pub const BAR_BG: Color = Color::Rgb(0x25, 0x28, 0x3E);
+/// Marked text in the prompt editor.
+pub const MARK_BG: Color = Color::Rgb(0x4A, 0x40, 0x8C);
 
 pub struct Icons {
     pub nerd: bool,
@@ -60,10 +62,6 @@ impl Icons {
     /// In front of the title.
     pub fn title(&self) -> &'static str {
         self.pick("\u{f455}", "◷")
-    }
-
-    pub fn warning(&self) -> &'static str {
-        self.pick("\u{f421}", "!")
     }
 
     /// The scheduler runs.

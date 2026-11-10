@@ -47,9 +47,14 @@ off; a yellow warning sign marks a routine with a problem.
   folder, with your shell and its environment. Exit code 0 counts as
   finished; any other code marks the run as failed and Herdr shows a
   notification.
+- **Create with Claude:** `n`, then "Describe it to Claude", opens a tab
+  where Claude asks what the routine should do, writes it and checks that
+  it loads.
 - **Prompt editor** in the list: type, paste, move with the arrows or the
-  mouse, undo with `Ctrl+Z`. `Esc` closes it and keeps what you wrote.
-  `Ctrl+O` opens the prompt in your own editor instead.
+  mouse, mark text with Shift and the arrows or by dragging, copy, cut and
+  paste with `Ctrl+C`, `Ctrl+X`, `Ctrl+V`, undo with `Ctrl+Z`. `Esc`
+  closes it and keeps what you wrote. `Ctrl+O` opens the prompt in your own
+  editor instead.
 - **Runs** of all routines, newest first: status, how it was started (on
   time, catch-up or by hand), how long it took. `⏎` jumps to the run's tab,
   `l` shows its saved output once the tab is closed.
@@ -104,7 +109,7 @@ Update with `herdr plugin update`.
 | --- | --- |
 | `↑` `↓` | Move |
 | `⏎` | Edit the routine (in Runs: go to the run's tab) |
-| `n` | New routine |
+| `n` | New routine: fill in the form, or describe it to Claude |
 | `p` | Write the prompt |
 | `r` | Run now (asks first) |
 | `space` | Switch on or off |
