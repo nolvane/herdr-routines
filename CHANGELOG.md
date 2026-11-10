@@ -1,0 +1,21 @@
+# Changelog
+
+All notable changes to this plugin. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+
+## [Unreleased]
+
+## [0.1.0] - 2026-11-10
+
+### Added
+
+- Scheduler that starts with Herdr and runs routines on five-field cron
+  schedules in local time, each run as an interactive agent in its own tab.
+- Any agent kind Herdr can start (Claude, Codex, Gemini, OpenCode and more).
+- "Needs you" detection with a notification, also for questions before the
+  agent is ready; the prompt follows once answered.
+- Missed times caught up once or skipped, per routine; no overlapping runs;
+  time limit per routine; finished tabs closed after an hour.
+- List of routines and runs with a form to create and edit routines, prompt
+  editing in your editor, run now, on and off, delete, and saved output.
+- `routines` (JSON) and `fire <id>` commands for scripts and other agents.

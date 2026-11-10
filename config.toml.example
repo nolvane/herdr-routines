@@ -1,0 +1,24 @@
+# Settings for the Routines plugin. Copy to the plugin's config directory
+# (`herdr plugin config-dir routines`) as config.toml. Every line is optional;
+# these are the defaults.
+
+# The workspace runs open in; created when missing.
+workspace = "Routines"
+
+# Close the tab of a finished run after this many minutes (0 keeps them).
+close_finished_after_minutes = 60
+
+# Also notify when a run finishes, not only when it needs you.
+notify_finished = false
+
+# Runs kept per routine.
+history = 50
+
+# "nerd" for Nerd Font icons, "plain" for plain symbols.
+icons = "nerd"
+
+# Where the "open" action shows the list: "overlay", "split" or "tab".
+placement = "overlay"
+
+# The side of a split: "down", "up", "left" or "right".
+split_direction = "down"

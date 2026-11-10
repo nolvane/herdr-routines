@@ -1,0 +1,373 @@
+//! Routines and settings, stored as small TOML files a person or an agent
+//! can edit by hand.
+
+use crate::cron::Cron;
+use crate::paths::{self, Paths};
+use serde::{Deserialize, Serialize};
+
+/// The agent kinds Herdr can start (`herdr agent start --kind`), in the order
+/// the edit form cycles through them.
+pub const AGENTS: &[&str] = &[
+    "claude",
+    "codex",
+    "gemini",
+    "cursor",
+    "opencode",
+    "copilot",
+    "amp",
+    "cline",
+    "droid",
+    "kiro",
+    "qwen",
+    "kimi",
+    "grok",
+    "devin",
+    "pi",
+    "agy",
+    "omp",
+    "mastracode",
+    "hermes",
+    "kilo",
+    "qodercli",
+    "letta",
+    "maki",
+    "muse",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum Missed {
+    /// After a time Herdr was not running, run once for all missed times.
+    #[default]
+    RunOnce,
+    /// Skip missed times; wait for the next one.
+    Skip,
+}
+
+impl Missed {
+    pub fn label(self) -> &'static str {
+        match self {
+            Missed::RunOnce => "Run once",
+            Missed::Skip => "Skip",
+        }
+    }
+
+    pub fn toggled(self) -> Missed {
+        match self {
+            Missed::RunOnce => Missed::Skip,
+            Missed::Skip => Missed::RunOnce,
+        }
+    }
+}
+
+fn yes() -> bool {
+    true
+}
+fn default_agent() -> String {
+    "claude".into()
+}
+fn default_folder() -> String {
+    "~".into()
+}
+fn default_limit() -> u32 {
+    120
+}
+
+/// The file `routine.toml`. The prompt sits next to it in `prompt.md`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RoutineFile {
+    pub name: String,
+    #[serde(default = "yes")]
+    pub enabled: bool,
+    /// Five-field cron in local time, such as `15 8-18 * * 1-5`.
+    pub schedule: String,
+    /// A Herdr agent kind, such as `claude` or `codex`.
+    #[serde(default = "default_agent")]
+    pub agent: String,
+    /// Arguments for the agent, such as `["--model", "opus"]`.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// The folder the agent starts in.
+    #[serde(default = "default_folder")]
+    pub folder: String,
+    #[serde(default)]
+    pub missed: Missed,
+    /// After this many minutes a run counts as timed out (its tab stays).
+    #[serde(default = "default_limit")]
+    pub time_limit_minutes: u32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Routine {
+    pub id: String,
+    pub file: RoutineFile,
+    pub prompt: String,
+    /// Why the routine cannot run, if it cannot.
+    pub problem: Option<String>,
+    /// `routine.toml` could not be read: the other fields are stand-ins.
+    pub unreadable: bool,
+}
+
+impl Routine {
+    pub fn cron(&self) -> Option<Cron> {
+        Cron::parse(&self.file.schedule).ok()
+    }
+
+    pub fn schedule_text(&self) -> String {
+        match Cron::parse(&self.file.schedule) {
+            Ok(c) => c.describe(),
+            Err(_) => format!("Invalid: {}", self.file.schedule),
+        }
+    }
+
+    /// Checks what would stop a run.
+    pub fn check(file: &RoutineFile, prompt: &str) -> Option<String> {
+        if file.name.trim().is_empty() {
+            return Some("the name is empty".into());
+        }
+        if let Err(e) = Cron::parse(&file.schedule) {
+            return Some(format!("schedule: {e}"));
+        }
+        if !AGENTS.contains(&file.agent.as_str()) {
+            return Some(format!("unknown agent \"{}\"", file.agent));
+        }
+        if !paths::expand(&file.folder).is_dir() {
+            return Some(format!("folder {} does not exist", file.folder));
+        }
+        if prompt.trim().is_empty() {
+            return Some("the prompt is empty".into());
+        }
+        if file.time_limit_minutes == 0 {
+            return Some("the time limit is 0 minutes".into());
+        }
+        None
+    }
+
+    pub fn load(paths: &Paths, id: &str) -> Result<Routine, String> {
+        let dir = paths.routine_dir(id);
+        let text = std::fs::read_to_string(dir.join("routine.toml"))
+            .map_err(|e| format!("cannot read routine.toml: {e}"))?;
+        let file: RoutineFile =
+            toml::from_str(&text).map_err(|e| format!("routine.toml: {}", e.message()))?;
+        let prompt = std::fs::read_to_string(dir.join("prompt.md")).unwrap_or_default();
+        let problem = Routine::check(&file, &prompt);
+        Ok(Routine {
+            id: id.to_string(),
+            file,
+            prompt,
+            problem,
+            unreadable: false,
+        })
+    }
+
+    pub fn save(&self, paths: &Paths) -> Result<(), String> {
+        let dir = paths.routine_dir(&self.id);
+        let text = toml::to_string(&self.file).map_err(|e| e.to_string())?;
+        let header = "# A Herdr routine. The prompt is in prompt.md next to this file.\n";
+        paths::write_atomic(
+            &dir.join("routine.toml"),
+            format!("{header}{text}").as_bytes(),
+        )
+        .map_err(|e| format!("cannot save: {e}"))?;
+        paths::write_atomic(&dir.join("prompt.md"), self.prompt.as_bytes())
+            .map_err(|e| format!("cannot save the prompt: {e}"))
+    }
+
+    pub fn delete(paths: &Paths, id: &str) -> Result<(), String> {
+        std::fs::remove_dir_all(paths.routine_dir(id)).map_err(|e| e.to_string())?;
+        let _ = std::fs::remove_dir_all(paths.runs_dir(id));
+        Ok(())
+    }
+}
+
+/// Every routine, sorted by name. Folders that do not load show up with
+/// their problem, so a typo in a file is visible instead of silently ignored.
+pub fn load_all(paths: &Paths) -> Vec<Routine> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(paths.routines_dir()) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let id = entry.file_name().to_string_lossy().to_string();
+        if id.starts_with('.') {
+            continue;
+        }
+        match Routine::load(paths, &id) {
+            Ok(r) => out.push(r),
+            Err(e) => out.push(Routine {
+                id: id.clone(),
+                file: RoutineFile {
+                    name: id.clone(),
+                    enabled: false,
+                    schedule: String::new(),
+                    agent: default_agent(),
+                    args: Vec::new(),
+                    folder: default_folder(),
+                    missed: Missed::default(),
+                    time_limit_minutes: default_limit(),
+                },
+                prompt: String::new(),
+                problem: Some(e),
+                unreadable: true,
+            }),
+        }
+    }
+    out.sort_by_key(|r| r.file.name.to_lowercase());
+    out
+}
+
+/// A folder name for a new routine: lower case letters, digits and dashes,
+/// not yet taken.
+pub fn new_id(paths: &Paths, name: &str) -> String {
+    let mut base = String::new();
+    for c in name.chars().flat_map(char::to_lowercase) {
+        if c.is_ascii_alphanumeric() {
+            base.push(c);
+        } else if !base.ends_with('-') && !base.is_empty() {
+            base.push('-');
+        }
+    }
+    let base = base.trim_end_matches('-');
+    let base: String = if base.is_empty() {
+        "routine".into()
+    } else {
+        base.chars().take(40).collect()
+    };
+    let mut id = base.clone();
+    let mut n = 2;
+    while paths.routine_dir(&id).exists() {
+        id = format!("{base}-{n}");
+        n += 1;
+    }
+    id
+}
+
+/// The settings in `config.toml`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Settings {
+    /// The workspace the runs open in; created when missing.
+    pub workspace: String,
+    /// Close the tab of a finished run after this many minutes (0 = never).
+    pub close_finished_after_minutes: u32,
+    /// Also notify when a run finishes, not only when it needs you.
+    pub notify_finished: bool,
+    /// Runs kept per routine.
+    pub history: usize,
+    /// `nerd` for Nerd Font icons, `plain` for plain symbols.
+    pub icons: String,
+    /// Where `open` shows the list: `overlay`, `split` or `tab`.
+    pub placement: String,
+    /// The side of a split: `down`, `up`, `left` or `right`.
+    pub split_direction: String,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings {
+            workspace: "Routines".into(),
+            close_finished_after_minutes: 60,
+            notify_finished: false,
+            history: 50,
+            icons: "nerd".into(),
+            placement: "overlay".into(),
+            split_direction: "down".into(),
+        }
+    }
+}
+
+impl Settings {
+    pub fn load(paths: &Paths) -> Settings {
+        std::fs::read_to_string(paths.settings_file())
+            .ok()
+            .and_then(|t| toml::from_str(&t).ok())
+            .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_paths(tag: &str) -> Paths {
+        let dir =
+            std::env::temp_dir().join(format!("herdr-routines-test-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        Paths {
+            config: dir.join("config"),
+            state: dir.join("state"),
+            socket: dir.join("sock"),
+        }
+    }
+
+    fn sample() -> RoutineFile {
+        RoutineFile {
+            name: "Morning report".into(),
+            enabled: true,
+            schedule: "0 8 * * 1-5".into(),
+            agent: "claude".into(),
+            args: vec![],
+            folder: "~".into(),
+            missed: Missed::RunOnce,
+            time_limit_minutes: 60,
+        }
+    }
+
+    #[test]
+    fn ids_are_unique_slugs() {
+        let p = temp_paths("ids");
+        assert_eq!(new_id(&p, "Morning Report!"), "morning-report");
+        std::fs::create_dir_all(p.routine_dir("morning-report")).unwrap();
+        assert_eq!(new_id(&p, "Morning Report"), "morning-report-2");
+        assert_eq!(new_id(&p, "!!!"), "routine");
+    }
+
+    #[test]
+    fn save_and_load_round_trip() {
+        let p = temp_paths("roundtrip");
+        let r = Routine {
+            id: "morning-report".into(),
+            file: sample(),
+            prompt: "Write the report.".into(),
+            problem: None,
+            unreadable: false,
+        };
+        r.save(&p).unwrap();
+        let back = Routine::load(&p, "morning-report").unwrap();
+        assert_eq!(back.file, r.file);
+        assert_eq!(back.prompt, r.prompt);
+        assert_eq!(back.problem, None);
+        assert_eq!(load_all(&p).len(), 1);
+        Routine::delete(&p, "morning-report").unwrap();
+        assert!(load_all(&p).is_empty());
+    }
+
+    #[test]
+    fn minimal_file_gets_defaults() {
+        let f: RoutineFile = toml::from_str("name = \"x\"\nschedule = \"0 9 * * *\"").unwrap();
+        assert!(f.enabled);
+        assert_eq!(f.agent, "claude");
+        assert_eq!(f.missed, Missed::RunOnce);
+        let f: RoutineFile =
+            toml::from_str("name = \"x\"\nschedule = \"0 9 * * *\"\nmissed = \"skip\"").unwrap();
+        assert_eq!(f.missed, Missed::Skip);
+    }
+
+    #[test]
+    fn checks_find_problems() {
+        let mut f = sample();
+        assert_eq!(Routine::check(&f, "go"), None);
+        assert!(Routine::check(&f, " ").is_some());
+        f.schedule = "nope".into();
+        assert!(Routine::check(&f, "go").unwrap().starts_with("schedule"));
+        f = sample();
+        f.agent = "robot".into();
+        assert!(Routine::check(&f, "go").is_some());
+        f = sample();
+        f.folder = "/does/not/exist/here".into();
+        assert!(Routine::check(&f, "go").is_some());
+    }
+}
