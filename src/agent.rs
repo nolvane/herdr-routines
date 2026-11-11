@@ -318,7 +318,17 @@ pub fn flags(file: &RoutineFile) -> Vec<String> {
 /// match also when their value is attached (`-sdanger-full-access`) or
 /// when they sit in a group (`-dy`). Also listed are options that grant
 /// rights another way: tool allow lists, settings files and config
-/// profiles.
+/// profiles; options that start other programs or load code or settings
+/// (MCP servers, plugins, extensions, agent definitions), that switch
+/// the person's own safeguards off (hooks, sandbox), that widen where the
+/// agent may write, and that hand the session to somewhere else.
+///
+/// This is a list of what is known to be risky, not of what is safe: it
+/// cannot be complete, and agents gain options. So the approval view also
+/// warns whenever a routine has extra arguments at all. Claude Code's
+/// options were checked against `claude --help` (2026-11-11); those of
+/// Codex and Gemini are the ones known from their documentation and were
+/// not checked against an installed version.
 fn permission_options(agent: &str) -> (&'static [&'static str], &'static [char]) {
     match agent {
         "claude" => (
@@ -328,7 +338,29 @@ fn permission_options(agent: &str) -> (&'static [&'static str], &'static [char])
                 "allowdangerouslyskippermissions",
                 "allowedtools",
                 "settings",
+                "settingsources",
                 "permissionprompttool",
+                "permissionprompts",
+                // Start programs or load code and definitions.
+                "mcpconfig",
+                "plugindir",
+                "pluginurl",
+                "agents",
+                "agent",
+                // Skip the person's hooks and other safeguards.
+                "bare",
+                "safemode",
+                // Write a file anywhere, or run the session elsewhere.
+                "debugfile",
+                "remotecontrol",
+                "cloud",
+                "environment",
+                "teleport",
+                "desktop",
+                "bg",
+                "background",
+                // Let it drive the browser.
+                "chrome",
             ],
             &[],
         ),
@@ -340,10 +372,28 @@ fn permission_options(agent: &str) -> (&'static [&'static str], &'static [char])
                 "sandbox",
                 "askforapproval",
                 "profile",
+                // Widen what the sandbox lets it write.
+                "adddir",
+                "cd",
+                // Switch features (safeguards among them) on or off.
+                "enable",
+                "disable",
             ],
-            &['s', 'a', 'p'],
+            &['s', 'a', 'p', 'C'],
         ),
-        "gemini" => (&["approvalmode", "yolo", "allowedtools"], &['y']),
+        "gemini" => (
+            &[
+                "approvalmode",
+                "yolo",
+                "allowedtools",
+                "allowedmcpservernames",
+                "extensions",
+                "includedirectories",
+                "sandbox",
+                "nosandbox",
+            ],
+            &['y', 'e', 's'],
+        ),
         _ => (&[], &[]),
     }
 }
@@ -357,7 +407,8 @@ fn normalized(name: &str) -> String {
 }
 
 /// A Codex config setting (`-c key=value`) that changes the sandbox, the
-/// approvals or the profile.
+/// approvals or the profile, starts other programs (MCP servers, the
+/// `notify` program, hooks) or sends the session to another provider.
 fn codex_permission_setting(value: &str) -> bool {
     let key = value
         .trim_start_matches(['=', '"', '\''])
@@ -365,9 +416,17 @@ fn codex_permission_setting(value: &str) -> bool {
         .next()
         .unwrap_or("")
         .to_lowercase();
-    ["sandbox", "approval", "profile"]
-        .iter()
-        .any(|k| key.contains(k))
+    [
+        "sandbox",
+        "approval",
+        "profile",
+        "mcp_servers",
+        "notify",
+        "hook",
+        "model_provider",
+    ]
+    .iter()
+    .any(|k| key.contains(k))
 }
 
 /// The first extra argument that changes the agent's permissions, if any.
@@ -545,6 +604,26 @@ mod tests {
         assert!(with("gemini", &["--allowed-tools", "run_shell_command"]).is_some());
         assert!(with("claude", &["--allowedTools", "Bash"]).is_some());
         assert!(with("claude", &["--settings", "{}"]).is_some());
+        // Options that start programs, load code or settings, switch
+        // safeguards off or widen the sandbox.
+        assert!(with("claude", &["--mcp-config", "servers.json"]).is_some());
+        assert!(with("claude", &["--plugin-dir=/tmp/p"]).is_some());
+        assert!(with("claude", &["--plugin-url", "https://example.com/p.zip"]).is_some());
+        assert!(with("claude", &["--agents", "{}"]).is_some());
+        assert!(with("claude", &["--setting-sources", "project"]).is_some());
+        assert!(with("claude", &["--bare"]).is_some());
+        assert!(with("claude", &["--debug-file", "/tmp/x"]).is_some());
+        assert!(with("claude", &["--remote-control"]).is_some());
+        assert!(with("claude", &["--chrome"]).is_some());
+        assert!(with("claude", &["--cloud"]).is_some());
+        assert!(with("codex", &["-c", "mcp_servers.x.command=sh"]).is_some());
+        assert!(with("codex", &["-c", "notify=[\"sh\",\"-c\",\"id\"]"]).is_some());
+        assert!(with("codex", &["--config", "model_provider=other"]).is_some());
+        assert!(with("codex", &["--add-dir", "/"]).is_some());
+        assert!(with("codex", &["-C", "/"]).is_some());
+        assert!(with("gemini", &["--extensions", "x"]).is_some());
+        assert!(with("gemini", &["-e", "x"]).is_some());
+        assert!(with("gemini", &["--no-sandbox"]).is_some());
         // Other arguments stay free.
         assert!(with("claude", &["--verbose", "--add-dir", "../docs"]).is_none());
         assert!(with("codex", &["-c", "model_reasoning_effort=high"]).is_none());
