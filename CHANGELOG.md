@@ -53,6 +53,17 @@ All notable changes to this plugin. The format follows
   and do not run.
 - The list shows a routine's extra arguments under its name, and "run now"
   shows the full options.
+- `herdr-routines release-cron` hands every managed cron job back to cron
+  as a plain crontab line, for before the plugin or its state folder is
+  removed (README, "Uninstall").
+- `herdr-routines runs [<id>]` prints the run history as JSON, and
+  `routines` now prints every setting of a routine.
+- The crontab as it was before the plugin first changed it is kept for
+  good (`crontab-backups/crontab-first.txt`), besides the last five
+  backups.
+- The approval view warns whenever a routine has extra arguments, shows
+  how many runs it keeps, and says for a cron job that its line goes into
+  the crontab and runs in the home folder, also when Herdr is closed.
 
 ### Changed
 
@@ -74,6 +85,29 @@ All notable changes to this plugin. The format follows
   newer dependency versions at install time. Building needs Rust 1.89 or
   newer.
 - Long lines in the output view wrap instead of being cut off.
+- `fire <id>` on a classic cron job starts it in the background as cron
+  would run it (as `r` in the list does) instead of opening a tab.
+- A routine's numbers have bounds: at most 3 retries at least a minute
+  apart, a time limit of at most a year, at most 100,000 runs and 36,500
+  days kept. A cron job's folder must be `~`. Routine files must be plain
+  text files of at most 1 MB. A routine outside these shows the problem
+  and does not run.
+- Extra arguments for Claude Code, Codex and Gemini may no longer hold
+  options known to start other programs, load code or settings, switch
+  safeguards off or widen the sandbox (such as `--mcp-config`,
+  `--plugin-dir`, `--bare`, Codex `-c mcp_servers.…`, Gemini
+  `--extensions`).
+- A routine too long to show in full (more than 65,535 rows) cannot be
+  approved in the list.
+- "Skipped" and "Nothing to do" notes are kept besides the runs (as many
+  again) and no longer count as runs in "Keep".
+- The scheduler no longer gives up when Herdr does not answer for ten
+  minutes: it tries once a minute until Herdr answers or its server is
+  gone, and then hands over to another Herdr session that waits for one.
+- `routines.log` is moved to `routines.log.1` at 2 MB. The output view
+  shows the end of a very long output.
+- A result is kept up to 2,000 characters, a check command's output up to
+  8,000; both go into later prompts marked as data.
 
 ### Fixed
 
@@ -88,6 +122,42 @@ All notable changes to this plugin. The format follows
 - Run records that name another folder than their own are ignored.
 - A shell routine refuses to run from a state folder whose path has a quote
   or backslash, which some shells would read differently.
+- A cron job set for one date no longer runs again a year later.
+- Crontab lines that are not UTF-8, and Windows line ends, stay as they
+  are when the plugin changes the crontab; a cron job whose command is not
+  UTF-8 runs; output that is not UTF-8 shows instead of an empty view.
+- A cron job's errors are joined to its output without shell text, so a
+  crontab `SHELL` such as csh or fish works.
+- Text after a `%` in a managed cron job's line reaches the command as its
+  input again.
+- A time limit stops a cron job or check command together with everything
+  it started, not only its shell.
+- A huge `keep_days` no longer stops the scheduler.
+- Pane ids of the list are kept per Herdr server; "stop at the limit"
+  closes a tab only when the run's pane is still in it.
+- Calls to `herdr` and `crontab` have a time limit, so one that hangs
+  cannot hang the scheduler or the list.
+
+### Security
+
+- A cron job that waits for approval is never written into the crontab,
+  whichever key is pressed: its approved line stays until `a` approves the
+  change. `space` only switches that line on or off.
+- The cron wrapper never approves anything, and uses only the settings
+  the owner approved (name, time limit, retries, alerts, runs kept). So do
+  alerts and the pruning of the run history; a routine file that no longer
+  reads deletes no history.
+- Saving in the form or the editor keeps a routine approved only when it
+  was approved when opened and unchanged since; "run now" reads the
+  routine again after the `y`.
+- Two changes to the crontab at the same time can no longer lose one: they
+  wait for each other, and a crontab that changed while it was read is
+  read again instead of being overwritten.
+- A scheduler or cron run is recognised by its pid and start time, not by
+  the process name.
+- The `fire`, `status` and other commands print text from routine files
+  without control characters.
+- The unit tests cannot reach a real Herdr any more.
 
 ## [0.1.0] - 2026-11-10
 

@@ -597,3 +597,205 @@ plugin build runs `sh`.
 Why: Herdr runs on Windows, but a Windows version would need the Task
 Scheduler instead of cron and PowerShell instead of `sh`, which is a
 separate piece of work for the owner to decide on.
+
+## 2026-11-11: Only an approved cron job reaches the crontab
+
+`crontab::write_job` writes nothing for a routine that waits for approval,
+whoever calls it (switching, the form, the editor, a copy). Its group in
+the crontab stays the one the owner approved until `a` approves the
+change. `space` on such a cron job calls `crontab::switch`, which only
+puts `#off ` in front of the approved line or takes it away. The cron
+wrapper reads the routine as it was approved (`Approvals::routine`, from
+the approved file contents in `approved.json`), never the files on disk,
+and never approves: after a single run on a date it saves the approved
+routine switched off only when the files are still the approved ones, and
+otherwise just switches the crontab line off. Alerts and the pruning of
+the history use the approved settings too; a routine file that no longer
+reads prunes nothing.
+
+Why: the security review of 2026-11-11 found that keys which never ask
+(`space`, `Esc` in the editor) wrote a changed command into the crontab,
+and that the wrapper approved whatever was on disk when a dated job ran.
+Both let something with file access run a command the owner never saw.
+
+## 2026-11-11: Saving is judged against what was opened
+
+The form and the editor remember the routine's files as read when they
+opened and whether those were approved (`App::opened`). What they save
+stays approved only when that was so and the files are unchanged since.
+"Run now" reads the routine again after the `y` (`App::fire`,
+`crontab::run_now`, the `fire` command).
+
+Why: judged at the moment of saving, text that came from a change made
+elsewhere could be approved by saving it, if the files were put back in
+between.
+
+## 2026-11-11: A routine too long to show cannot be approved in the list
+
+The approval and output views scroll over at most 65,535 rows (the type
+ratatui scrolls with). An approval view with more rows shows its end,
+says so and does not offer `y`. The output view shows the end of a long
+output (the last 2 MB), and `f` opens the whole file.
+
+Why: `y` is offered once the view is scrolled to its end, and beyond
+65,535 rows the end could not be reached, so text nobody could scroll to
+would have been approved. Refusing is one small change in `draw_log`;
+scrolling with a wider type would have touched the whole view while the
+list is being reworked. A prompt of that length is not one a person
+reads in a list anyway.
+
+## 2026-11-11: The crontab is changed as bytes, under a lock, on a fresh read
+
+The crontab is read and written as lines of bytes (`crontab::Tab`). A
+change replaces the lines of one group and leaves all others as they are:
+text that is not UTF-8 and Windows line ends survive, and a managed job
+whose time and command did not change keeps its own line byte for byte.
+Every change goes through `crontab::change`: under a lock file in the
+state folder it reads the crontab, works out the new one, reads again and
+installs only when nothing changed in between, else it starts over (three
+times, then an error). The first backup ever (`crontab-first.txt`) is
+never deleted; of the later ones the last five stay.
+
+Why: reading the crontab as text replaced bytes that are not UTF-8 in
+other people's lines; two changes at once (a second list, a wrapper
+switching a dated job off) could lose one; and five rolling backups were
+gone after five changes, the original crontab with them. `crontab` has no
+"replace only if unchanged", so a short moment between the last read and
+the install remains; the lock closes it for the plugin's own processes.
+
+## 2026-11-11: Managed cron jobs can be handed back; no uninstall hook
+
+`herdr-routines release-cron` turns every managed group back into the
+job's own plain line (commented out when it was off). The README says to
+run it before the plugin or its state folder is removed.
+
+Why: a managed job is started through `SHELL=<state>/bin/cron/<id>`.
+Once that folder is gone, cron cannot start the job and reports nothing.
+Herdr's plugin manifest has build, startup, pane and action entries but
+no entry that runs when a plugin is removed, so this cannot be done for
+the owner; it is a command and a warning in the README instead.
+
+## 2026-11-11: A dated cron job is checked against its date
+
+The wrapper runs a cron job set for one date (`@once`) only on that date,
+as long as its crontab line is still the one written for it.
+
+Why: a crontab line has no year. If the run on the date did not happen or
+the job was not switched off afterwards, cron would start it again every
+year.
+
+## 2026-11-11: Commands run in their own process group, without shell text
+
+Check commands, cron jobs and the tools the plugin calls are started as
+the leader of a new process group, and the time limit stops the whole
+group (`killpg`). Standard output and errors are joined through one pipe
+that this process makes, not by putting `exec 2>&1;` in front of the
+command. A cron job's output goes to its file and on to cron as it comes;
+in memory stay its first 256 KB and its last 16 KB. A cron job gets cron's
+input on its first try.
+
+Why: stopping only the shell left what it had started running after the
+limit. `exec 2>&1` is not understood by every shell a crontab can name
+(csh, fish). Holding the whole output in memory twice had no bound. This
+adds `libc` (MIT OR Apache-2.0, already a dependency of the other crates)
+as a direct dependency for the one `killpg` call; the standard library has
+no way to signal a process group.
+
+## 2026-11-11: A process is known by its pid and start time
+
+The pid file and a cron run's record hold the process's start time as
+`ps -o lstart=` prints it, next to the pid. A scheduler or cron run counts
+as alive only when both match. Records without a start time (written by
+an older version) fall back to the process name.
+
+Why: the name alone depends on where the plugin is installed, is cut
+short on Linux, and matches any other process of the plugin; a pid is
+handed out again.
+
+## 2026-11-11: The scheduler stays while its server is there
+
+Every `herdr` and `crontab` call has a time limit (20 seconds, 90 for
+`agent start`). A round first asks Herdr something cheap and stops when
+that fails. After about ten minutes of failures the scheduler no longer
+exits: while the server's socket is still its own and something listens
+on it, it tries once a minute. It exits when the socket changed (a new
+server starts its own scheduler) or when nobody listens on it any more.
+A `start` from another Herdr session that finds this scheduler notes its
+socket in `waiting-servers`; when this scheduler's server goes, it starts
+a scheduler for the first of those that still listens.
+
+Why: only Herdr's startup hook starts the scheduler (see "The scheduler
+runs inside Herdr"). One that gave up while the server was only slow left
+no scheduler until the next Herdr restart, without a word; and a session
+whose `start` had been turned away never got one after the other session
+ended.
+
+## 2026-11-11: Limits on what is read and kept
+
+Routine files, the memory file and state files a routine can influence
+are read only when they are plain files of at most 1 MB
+(`paths::read_limited`), so a pipe or a device in their place cannot hang
+or fill the reader. `Routine::check` bounds the numbers (3 retries at
+least a minute apart, a year of time limit, 100,000 runs, 36,500 days).
+`routines.log` is moved aside at 2 MB. Histories are pruned when a run
+ends and otherwise every 60 rounds, not in every round. "Skipped" and
+"Nothing to do" records are counted apart from real runs.
+
+Why: a `keep_days` beyond the calendar stopped the scheduler with a
+panic, and unbounded retries, files and logs could fill the disk or keep
+the scheduler busy. Notes of skipped times pushed real runs and their
+output out of a short history.
+
+## 2026-11-11: Text from runs goes into prompts as data
+
+A check command's output and remembered results are cut (8,000 and 2,000
+characters), lose characters that do not show, have code fences replaced
+and are put into the prompt inside a fenced block with the sentence that
+they are information, not instructions (`runner::as_data`).
+
+Why: this text can hold anything the run read. Unmarked and unbounded, it
+was the easiest way for outside text to steer a later run. This lowers
+that risk and cannot remove it: the agent still reads the text.
+
+## 2026-11-11: More options are closed to extra arguments, and all are flagged
+
+Added to "Extra arguments cannot set permissions": options that start
+other programs or load code or settings (Claude Code `--mcp-config`,
+`--plugin-dir`, `--plugin-url`, `--agents`, `--agent`,
+`--setting-sources`; Codex `-c mcp_servers.…`, `-c notify=…`, hooks,
+`-c model_provider=…`; Gemini `--extensions`,
+`--allowed-mcp-server-names`), that switch safeguards off (Claude Code
+`--bare`, `--safe-mode`; Codex `--enable`, `--disable`; Gemini
+`--sandbox`, `--no-sandbox`), that widen where the agent may write (Codex
+`--add-dir`, `-C`; Gemini `--include-directories`) or send the session
+elsewhere or give it more to act on (Claude Code `--remote-control`,
+`--cloud`, `--environment`, `--teleport`, `--desktop`, `--bg`, `--chrome`,
+`--debug-file`). The approval view also shows a warning line whenever a
+routine has extra arguments at all.
+
+Why: a list of forbidden options can never be complete, because agents
+gain options, so the warning is the part that holds. Claude Code's
+options were checked against its `--help` on this date; Codex and Gemini
+were not installed here, so theirs are the ones known from their
+documentation, not checked against an installed version, and should be
+checked by someone who has them. Claude Code's
+`--add-dir` stays allowed: the README names it as the example of a useful
+extra argument, and the approval view shows it.
+
+## 2026-11-11: Tests cannot reach Herdr
+
+In tests, `herdr::program` returns a stand-in set per thread with
+`herdr::use_fake`, and none by default, like `crontab::use_fake`.
+
+Why: tests ran the `herdr` in `HERDR_BIN_PATH` or on the PATH, so a test
+run inside a Herdr session could send notifications to it or open panes.
+
+## 2026-11-11: ratatui without its default features
+
+`ratatui` is built with `crossterm`, `layout-cache` and `underline-color`
+only. `scripts/check.sh` runs `cargo audit` when it is installed and says
+so when it is not.
+
+Why: the default features also bring the macros crate and the calendar
+widget, which the list does not use; fewer dependencies are less to
+audit. The checks never install tools themselves.

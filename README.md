@@ -76,9 +76,15 @@ window, the selected routine's details show under the list.
   and show in the list. Its runs (output, result, exit code, failures,
   retries, alerts) show in Runs like any other, and `r` runs it now, in
   the background, as cron would. Every change to the crontab keeps a
-  backup of it in the state folder first. On macOS, a cron job that works
-  in Documents, Desktop or Downloads needs Full Disk Access for
+  backup of it in the state folder first (`crontab-backups/`: the crontab
+  as it was before the plugin first changed it stays there for good, of
+  the later ones the last five), changes only the job's own lines and
+  leaves every other line as it is, byte for byte. On macOS, a cron job
+  that works in Documents, Desktop or Downloads needs Full Disk Access for
   `/usr/sbin/cron` (System Settings, Privacy & Security, Full Disk Access).
+  **Before you remove the plugin or its state folder, hand these jobs
+  back to cron** (see [Uninstall](#uninstall)): cron starts them through
+  that folder and cannot start them without it.
 - **Your other cron jobs** show in the Cron jobs tab too (◇). `⏎` on one (or
   `C` for all) offers: keep it as a cron job but manage it here (its line
   stays where it is, as you wrote it), move it to Herdr (it runs in a tab
@@ -91,7 +97,9 @@ window, the selected routine's details show under the list.
   command through that wrapper, which records the run, runs the command
   with the shell your crontab had, hands its output on to cron and returns
   its exit code. While routines are switched off in the list, the wrapper
-  skips the job's times.
+  skips the job's times. The name, time limit, retries and alerts it uses
+  are the ones you approved; at the time limit it stops the command and
+  everything the command started.
 - **Run history:** each routine and cron job keeps its last 30 runs, none
   older than 90 days, by default. "Keep" in the form changes that (such as
   10 runs, 100 runs and a year, or all runs).
@@ -106,8 +114,17 @@ window, the selected routine's details show under the list.
   `y`. When a waiting routine's time comes, Herdr tells you once. So an
   agent that writes routine files the normal way cannot make the
   scheduler run something you have not seen, such as a stronger
-  permission mode or a shell command. It does not cover the agent's own
-  settings in the routine's folder (such as `.claude/settings.json`),
+  permission mode or a shell command. A cron job that waits keeps the
+  crontab line you approved (`space` still switches that line on and off);
+  the changed command reaches the crontab only when you approve it. For a
+  cron job the view says that it is one: where its line goes, that cron
+  starts it also when Herdr is closed, and that it runs in your home
+  folder. Extra arguments get a warning line of their own. A routine too
+  long to show in full (more than 65,535 rows) cannot be approved in the
+  list; shorten it first. Saving in the form or the editor keeps a routine
+  approved only when it was approved when you opened it and nothing else
+  changed its files meanwhile. The approval does not cover the agent's
+  own settings in the routine's folder (such as `.claude/settings.json`),
   which the agent reads at start like in any other session.
 - **Prompt editor** in the list: type, paste, move with the arrows or the
   mouse, mark text with Shift and the arrows or by dragging, copy, cut and
@@ -118,23 +135,33 @@ window, the selected routine's details show under the list.
   time, catch-up, retry or by hand), how long it took and what it came to.
   "n runs" next to a routine (or `h`) shows only its runs. `⏎` jumps to the
   run's tab, `l` shows its result and output, also after the tab is
-  closed, and `f` opens the output file.
+  closed (of a very long output its end), and `f` opens the output file.
 - **Output kept:** a shell command's whole output goes into a file; an
   agent's tab is saved every minute while it is open, so closing the tab by
   hand loses nothing.
 - **Results:** each agent run is asked to end with a short summary, which
   the list shows next to the run. With "Earlier results" on, the next run
   starts with the summaries of the last ten runs (kept in one small file per
-  routine), so a daily routine knows what it did before.
+  routine), so a daily routine knows what it did before. A summary is kept
+  up to 2,000 characters.
 - **Check first:** an optional shell command that runs before the agent,
   such as "are there new files?". When it ends without an error the agent
-  starts and gets its output; otherwise the run is noted as "Nothing to do"
-  and costs nothing.
+  starts and gets its output (the first 8,000 characters); otherwise the
+  run is noted as "Nothing to do" and costs nothing.
+- **Text from runs is handed on as data:** a check command's output and
+  earlier results can hold whatever a run read (a mail, a web page, a
+  commit message). They go into the next prompt cut to length, without
+  hidden characters, inside a marked block, with the note not to follow
+  instructions in them. That lowers the risk that such text steers the
+  agent; it cannot rule it out, so give a routine that reads untrusted
+  text a permission mode that fits.
 - **Retries:** a failed run (a command ending with an error, an agent that
   does not start) can be tried again up to three times a few minutes later.
 - **Once, or when Herdr starts:** besides repeating schedules, a routine can
   run once on a date (then it switches itself off) or each time the Herdr
-  server starts.
+  server starts. A cron job set for one date runs on that date only: its
+  crontab line has no year, so cron would start it again a year later,
+  and the plugin's wrapper then skips it.
 - **Needs you:** when an agent asks a question or waits for an approval, the
   run is marked and Herdr shows a notification. Answer it in the tab; the
   run carries on. This also covers questions before the agent is ready, such
@@ -148,10 +175,13 @@ window, the selected routine's details show under the list.
   time, each routine either runs once afterwards or skips to its next time,
   as you set it per routine.
 - **No overlap:** a routine that is still running is not started again; the
-  skipped time shows in the runs.
+  skipped time shows in the runs. Such notes ("Skipped", "Nothing to do")
+  are kept besides the runs and never push a real run out of the history.
 - **Time limit** per routine: a run still going after it is marked as timed
   out and you get a notification. Its tab stays open, or, if you choose
-  "Stop the run", it is closed, which ends the agent or command.
+  "Stop the run", it is closed, which ends the agent or command. A cron
+  job and a check command are stopped at their limit, together with
+  everything they started.
 - **Tidy:** the tab of a finished run closes after an hour (configurable),
   unless you picked up the conversation in it.
 
@@ -182,6 +212,35 @@ description = "herdr-routines (split)"
 ```
 
 Update with `herdr plugin update`.
+
+## Uninstall
+
+**First hand your managed cron jobs back to cron.** A cron job the plugin
+manages is started by cron through a small wrapper in the plugin's state
+folder (`SHELL=…/bin/cron/<id>` above its line in the crontab). Without
+that folder cron can no longer start the job at all, and it does not tell
+you. So before you remove the plugin or delete its state folder, run:
+
+```sh
+herdr-routines release-cron
+```
+
+It takes the plugin's marker and `SHELL` lines out of your crontab and
+leaves each job's own line as an ordinary cron job, where it was (a job
+that was switched off stays, commented out). The crontab as it was before
+is in `crontab-backups/` in the state folder. `crontab -l` shows the
+result. Routines that Herdr runs need nothing: they stop with the plugin.
+
+If the plugin is already gone, the copy that the wrappers use may still be
+there: `~/.local/state/herdr/plugins/herdr-routines/bin/herdr-routines
+release-cron` does the same. Otherwise edit the crontab by hand
+(`crontab -e`): delete the lines `# herdr-routines: …` and the `SHELL=`
+line above and below each job.
+
+Then remove the plugin with Herdr's plugin command, switch "start at
+login" off before if you turned it on (`A` in the list), and delete the
+config and state folders if you do not want to keep the routines and
+their runs.
 
 ## Keys
 
@@ -244,7 +303,8 @@ missed = "run-once"
 time_limit_minutes = 120
 # Optional: close the run's tab at the time limit (default: keep it)
 # stop_at_limit = true
-# Optional: try a failed run again, this many times, minutes apart
+# Optional: try a failed run again, this many times (at most 3), minutes
+# apart (at least 1)
 # retries = 2
 # retry_delay_minutes = 10
 # Optional, agents only: a shell command run first; the agent starts only
@@ -262,13 +322,20 @@ time_limit_minutes = 120
 routine has `agent = "shell"` and its command in `command.sh` instead; it
 runs in your `$SHELL`, line by line like a script. With `runs_in = "cron"`
 it is a classic cron job: `command.sh` is then one line, which the list
-writes into your crontab once the routine is approved.
+writes into your crontab once the routine is approved. A cron job runs in
+your home folder, so its `folder` is `~` (use `cd` in the command for
+another one).
 
 You, the list or another agent can create and change these files; the
 scheduler reads them every few seconds. A routine with a mistake shows up in
 the list with what is wrong. A change made outside the list takes effect
 once you approve it with `a` in the list (see "Your approval" above). The
 folder name is the routine's id: lower case letters, digits and dashes.
+The files are plain text files of at most 1 MB each. The numbers have
+bounds: a time limit of at most a year, at most 3 retries, at most
+100,000 runs and 36,500 days kept. A routine outside them shows the
+problem and does not run. While a change waits for approval, the history
+is still pruned by the approved `keep_runs` and `keep_days`.
 
 **Schedules** are cron expressions with five fields in local time: `*`,
 values, ranges `8-18`, steps `*/15`, lists `1,15`, and month and day names
@@ -291,11 +358,19 @@ folder. With a mode that asks before changes, a run waits in its tab until
 you answer. Other agents take their flags through `args`. For Claude Code,
 Codex and Gemini, `args` may not set permissions (such as
 `--dangerously-skip-permissions` or `--sandbox`): that is what
-`permission_mode` is for, so the list always shows the real mode. The list
-shows `args` under the routine's name.
+`permission_mode` is for, so the list always shows the real mode. Nor may
+they hold options known to start other programs, load code or settings,
+switch safeguards off or widen where the agent may write (such as
+`--mcp-config`, `--plugin-dir`, `--settings`, `--bare`, Codex
+`-c mcp_servers.…` or `--add-dir`, Gemini `--extensions`). That list
+cannot be complete, since agents gain options: the list shows `args`
+under the routine's name, and the approval view warns whenever a routine
+has any. Approve extra arguments only when you know each of them.
 
 Runs are kept in the plugin's state directory
-(`~/.local/state/herdr/plugins/herdr-routines/`), 50 per routine: under
+(`~/.local/state/herdr/plugins/herdr-routines/`), by default the last 30
+per routine and none older than 90 days ("Keep" in the form, `keep_runs`
+and `keep_days` in the file): under
 `runs/<routine id>/`, each run has a record `<run id>.json` (status,
 times, result) and next to it its output (`.log` from the tab, `.out` from
 a shell command), the prompt it got (`.prompt`) and, for shell commands,
@@ -323,14 +398,27 @@ opens. How many runs are kept is set per routine (see "Run history").
 ## Command line
 
 ```sh
-herdr-routines routines   # all routines and their last run as JSON
-herdr-routines fire <id>  # run an approved routine now
-herdr-routines status     # whether the scheduler runs
+herdr-routines routines      # all routines, every setting and their last run, as JSON
+herdr-routines runs [<id>]   # the run history (of one routine), newest first, as JSON
+herdr-routines fire <id>     # run an approved routine now
+herdr-routines status        # whether the scheduler runs
+herdr-routines release-cron  # hand managed cron jobs back to cron (see Uninstall)
 ```
+
+`fire` on a classic cron job does what `r` in the list does: it starts the
+job in the background, as cron would run it, and returns at once;
+`runs <id>` shows how it went. For a routine Herdr runs, it waits until
+the agent is up.
 
 The plugin actions "herdr-routines: restart the scheduler", "stop" and "status" do
 the same from Herdr. The scheduler log is `routines.log` in the state
-directory.
+directory; at 2 MB it is moved to `routines.log.1` and started anew.
+
+The scheduler stays with its Herdr server: when the server does not answer
+for about ten minutes it keeps trying once a minute instead of giving up, and it
+ends when the server is gone. When several Herdr sessions run, one
+scheduler serves them all; when its session ends, it hands over to another
+session that is still running.
 
 ## Licence
 

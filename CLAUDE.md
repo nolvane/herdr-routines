@@ -50,6 +50,22 @@ each run in its own tab. What it does and how users install it:
   approved (`approval.rs`). Anything the list saves for the owner goes
   through `Routine::save_approved` or `approval::approve_file`; plain
   `Routine::save` leaves the routine waiting for approval.
+- What runs or decides without the owner looking (the cron wrapper,
+  alerts, pruning the history) uses the routine as approved
+  (`Approvals::routine`), never the files on disk. Nothing but `a` in the
+  list approves; the form and the editor keep an approval only for what
+  they opened (`App::opened_approved`).
+- The crontab changes only through `crontab::change` (lock, fresh read,
+  bytes kept), and `crontab::write_job` writes nothing for a routine that
+  waits for approval.
+- Files a routine or a run can put something else in place of (routine
+  files, memory, output) are read with `paths::read_limited` or
+  `read_tail_lossy`: plain files, a size limit, no failing on bytes that
+  are not UTF-8.
+- Commands that come from a routine or the crontab, and the `herdr` and
+  `crontab` tools, are started through `shell.rs` (own process group,
+  time limit); `herdr` only through `herdr.rs`. Text that came back from
+  a run goes into a prompt through `runner::as_data`.
 - Herdr calls about a run's agent use `Run::agent_target`; calls about its
   pane check `own_pane` first (same tab and terminal).
 - The scheduler and a `fire` process both write run records: a record in
@@ -67,10 +83,15 @@ each run in its own tab. What it does and how users install it:
 ./scripts/check.sh --stage quick
 ```
 
-Every stage runs the same steps: gitleaks secret scan, `cargo fmt --check`,
-`cargo clippy` with warnings as errors, the unit tests and the release build.
+Every stage runs the same steps: gitleaks secret scan, `cargo audit` when
+it is installed, `cargo fmt --check`, `cargo clippy` with warnings as
+errors, the unit tests and the release build.
 There are no integration tests in the checks, since they need a running
-Herdr server and an agent that is logged in.
+Herdr server and an agent that is logged in. The unit tests cannot reach
+Herdr or the crontab: both are stand-ins a test sets for its own thread
+(`herdr::use_fake`, `crontab::use_fake`), and without one there is none.
+Regression tests for the approval rules live in
+`src/app_security_tests.rs`.
 
 To try a change by hand without touching your own Herdr session, use a
 throwaway session and separate config and state folders:
@@ -100,6 +121,7 @@ everything afterwards with `herdr-routines stop`,
   `SHELL` lines and the job's own line), and comments other lines out only
   when the person moves that job here. Every change keeps a backup first.
   Tests never reach the real crontab: they use `crontab::use_fake`.
+  `herdr-routines release-cron` hands the managed jobs back as plain lines.
 
 ## Releasing
 
