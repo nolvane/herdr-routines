@@ -531,7 +531,10 @@ pub fn when(r: &Routine) -> Option<String> {
             t.day(),
             t.month()
         )),
-        Schedule::Cron(_) => Some(r.file.schedule.trim().to_string()),
+        // Only what cron itself understands; "every two weeks" and the
+        // last day of a month are Herdr's own.
+        Schedule::Cron(c) => c.classic().then(|| r.file.schedule.trim().to_string()),
+        Schedule::Every(_) => None,
     }
 }
 

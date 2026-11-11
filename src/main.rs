@@ -21,6 +21,7 @@ mod alert;
 mod app;
 mod approval;
 mod autostart;
+mod awake;
 mod clipboard;
 mod cron;
 mod crontab;

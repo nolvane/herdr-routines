@@ -6,6 +6,11 @@
 //! both Sunday. As in classic cron, when both day of month and day of week
 //! are restricted, a day matching either one counts; a field starting with
 //! `*` (such as `*/2`) does not count as restricted, so then both must match.
+//!
+//! Beyond classic cron (so not for jobs the system's cron runs, see
+//! `Cron::classic`): day of month `L` (the last day) and `LW` (the last
+//! working day, Monday to Friday); day of week `mon#1` (the first Monday of
+//! the month, up to `#5`) and `friL` (the last Friday).
 
 use chrono::{DateTime, Datelike, Duration, Local, TimeZone, Timelike, Utc};
 
@@ -19,6 +24,14 @@ pub struct Cron {
     weekdays: Vec<bool>,
     days_any: bool,
     weekdays_any: bool,
+    /// `L` in the day of month: the last day of the month.
+    last_day: bool,
+    /// `LW` in the day of month: the last day from Monday to Friday.
+    last_workday: bool,
+    /// `mon#2` in the day of week: (weekday from Sunday, which one of the month).
+    nth: Vec<(u32, u32)>,
+    /// `friL` in the day of week: the last such weekday of the month.
+    last_weekdays: Vec<u32>,
 }
 
 const MONTHS: [&str; 12] = [
@@ -95,9 +108,55 @@ impl Cron {
         }
         let minutes = field(parts[0], 0, 59, &[], 0).map_err(|e| format!("minute: {e}"))?;
         let hours = field(parts[1], 0, 23, &[], 0).map_err(|e| format!("hour: {e}"))?;
-        let days = field(parts[2], 1, 31, &[], 0).map_err(|e| format!("day: {e}"))?;
         let months = field(parts[3], 1, 12, &MONTHS, 1).map_err(|e| format!("month: {e}"))?;
-        let mut weekdays = field(parts[4], 0, 7, &DAYS, 0).map_err(|e| format!("weekday: {e}"))?;
+
+        // Day of month: `L` and `LW` beside the classic entries.
+        let (mut last_day, mut last_workday) = (false, false);
+        let mut plain = Vec::new();
+        for part in parts[2].split(',') {
+            match part.to_ascii_uppercase().as_str() {
+                "L" => last_day = true,
+                "LW" => last_workday = true,
+                _ => plain.push(part),
+            }
+        }
+        let days = if plain.is_empty() {
+            vec![false; 32]
+        } else {
+            field(&plain.join(","), 1, 31, &[], 0).map_err(|e| format!("day: {e}"))?
+        };
+
+        // Day of week: `mon#1` and `friL` beside the classic entries.
+        let (mut nth, mut last_weekdays) = (Vec::new(), Vec::new());
+        let mut plain = Vec::new();
+        for part in parts[4].split(',') {
+            if let Some((day, n)) = part.split_once('#') {
+                let day = value(day, &DAYS, 0).map_err(|e| format!("weekday: {e}"))?;
+                let n: u32 = n
+                    .parse()
+                    .map_err(|_| format!("weekday: \"{part}\" is not a weekday#number"))?;
+                if day > 7 || !(1..=5).contains(&n) {
+                    return Err(format!(
+                        "weekday: \"{part}\" is a weekday and 1 to 5, such as mon#1"
+                    ));
+                }
+                nth.push((day % 7, n));
+            } else if part.len() > 1 && part.ends_with(['L', 'l']) && part != "*" {
+                let day = value(&part[..part.len() - 1], &DAYS, 0)
+                    .map_err(|e| format!("weekday: {e}"))?;
+                if day > 7 {
+                    return Err(format!("weekday: \"{part}\" is outside 0 to 7"));
+                }
+                last_weekdays.push(day % 7);
+            } else {
+                plain.push(part);
+            }
+        }
+        let mut weekdays = if plain.is_empty() {
+            vec![false; 8]
+        } else {
+            field(&plain.join(","), 0, 7, &DAYS, 0).map_err(|e| format!("weekday: {e}"))?
+        };
         if weekdays[7] {
             weekdays[0] = true;
         }
@@ -112,15 +171,43 @@ impl Cron {
             // As in classic cron, `*/2` counts as unrestricted too.
             days_any: parts[2].starts_with('*'),
             weekdays_any: parts[4].starts_with('*'),
+            last_day,
+            last_workday,
+            nth,
+            last_weekdays,
         })
+    }
+
+    /// Whether the system's cron understands this schedule too (no `L`,
+    /// `LW`, `#`).
+    pub fn classic(&self) -> bool {
+        !self.last_day && !self.last_workday && self.nth.is_empty() && self.last_weekdays.is_empty()
     }
 
     fn day_matches<T: Datelike>(&self, t: &T) -> bool {
         if !self.months[t.month() as usize] {
             return false;
         }
-        let dom = self.days[t.day() as usize];
-        let dow = self.weekdays[t.weekday().num_days_from_sunday() as usize];
+        let (day, weekday) = (t.day(), t.weekday().num_days_from_sunday());
+        let last = last_day_of_month(t.year(), t.month());
+        // The last day from Monday to Friday: back from a weekend.
+        let last_workday = {
+            let last_weekday = (weekday + (last - day)) % 7;
+            match last_weekday {
+                6 => last - 1,
+                0 => last - 2,
+                _ => last,
+            }
+        };
+        let dom = self.days[day as usize]
+            || (self.last_day && day == last)
+            || (self.last_workday && day == last_workday);
+        let dow = self.weekdays[weekday as usize]
+            || self
+                .nth
+                .iter()
+                .any(|(d, n)| *d == weekday && (day - 1) / 7 + 1 == *n)
+            || (self.last_weekdays.contains(&weekday) && day + 7 > last);
         // Classic cron: when either field starts with `*`, both must match
         // (a plain `*` matches every day anyway); otherwise either one.
         if self.days_any || self.weekdays_any {
@@ -179,6 +266,18 @@ impl Cron {
     }
 }
 
+fn last_day_of_month(year: i32, month: u32) -> u32 {
+    let (y, m) = if month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    };
+    chrono::NaiveDate::from_ymd_opt(y, m, 1)
+        .and_then(|d| d.pred_opt())
+        .map(|d| d.day())
+        .unwrap_or(28)
+}
+
 fn single(spec: &str) -> Option<u32> {
     spec.parse().ok()
 }
@@ -192,6 +291,25 @@ fn days_phrase(dom: &str, month: &str, dow: &str) -> Option<String> {
         return None;
     }
     let lower = dow.to_ascii_lowercase();
+    let day_name = |d: &str| Some(DAY_NAMES[(value(d, &DAYS, 0).ok()? % 7) as usize]);
+    // "First Monday of the month", "Last Friday of the month".
+    if dom == "*" && !lower.contains(',') {
+        if let Some((d, n)) = lower.split_once('#') {
+            let which = ["First", "Second", "Third", "Fourth", "Fifth"]
+                .get(n.parse::<usize>().ok()?.checked_sub(1)?)?;
+            return Some(format!("{which} {} of the month", day_name(d)?));
+        }
+        if let Some(d) = lower.strip_suffix('l').filter(|d| !d.is_empty()) {
+            return Some(format!("Last {} of the month", day_name(d)?));
+        }
+    }
+    if lower == "*" {
+        match dom.to_ascii_uppercase().as_str() {
+            "L" => return Some("Monthly on the last day".into()),
+            "LW" => return Some("Monthly on the last working day".into()),
+            _ => {}
+        }
+    }
     let by_week = match lower.as_str() {
         "*" => None,
         "1-5" | "mon-fri" => Some("Weekdays".to_string()),
@@ -400,5 +518,62 @@ mod tests {
         assert_eq!(d("0 * * * 1-5"), "Weekdays, every hour at :00");
         assert_eq!(d("0 8 1 * *"), "Monthly on the 1st at 08:00");
         assert_eq!(d("0 8 * 1 *"), "Cron 0 8 * 1 *");
+        assert_eq!(d("0 17 L * *"), "Monthly on the last day at 17:00");
+        assert_eq!(d("0 17 LW * *"), "Monthly on the last working day at 17:00");
+        assert_eq!(d("0 9 * * mon#1"), "First Monday of the month at 09:00");
+        assert_eq!(d("0 9 * * 5L"), "Last Friday of the month at 09:00");
+        assert_eq!(d("0 9 1,15 * *"), "Monthly on the 1st and 15th at 09:00");
+    }
+
+    #[test]
+    fn last_days_and_numbered_weekdays() {
+        let next = |s: &str, from: &str| Cron::parse(s).unwrap().next_after(&at(from)).unwrap();
+        // The last day: 30 Nov, then 31 Dec, and 28 Feb in 2027.
+        assert_eq!(
+            next("0 17 L * *", "2026-11-09T10:00:00+01:00"),
+            at("2026-11-30T17:00:00+01:00")
+        );
+        assert_eq!(
+            next("0 17 L * *", "2026-11-30T17:00:00+01:00"),
+            at("2026-12-31T17:00:00+01:00")
+        );
+        assert_eq!(
+            next("0 17 L 2 *", "2026-11-09T10:00:00+01:00"),
+            at("2027-02-28T17:00:00+01:00")
+        );
+        // The last working day: 31 Jan 2027 is a Sunday, so Friday the 29th;
+        // 31 Oct 2026 is a Saturday, so Friday the 30th.
+        assert_eq!(
+            next("0 17 LW * *", "2027-01-05T10:00:00+01:00"),
+            at("2027-01-29T17:00:00+01:00")
+        );
+        assert_eq!(
+            next("0 17 LW * *", "2026-10-05T10:00:00+02:00"),
+            at("2026-10-30T17:00:00+02:00")
+        );
+        // The first Monday: 7 Dec 2026 after 2 Nov has passed.
+        assert_eq!(
+            next("0 9 * * mon#1", "2026-11-09T10:00:00+01:00"),
+            at("2026-12-07T09:00:00+01:00")
+        );
+        assert_eq!(
+            next("0 9 * * 1#3", "2026-11-09T10:00:00+01:00"),
+            at("2026-11-16T09:00:00+01:00")
+        );
+        // The last Friday: 27 Nov 2026.
+        assert_eq!(
+            next("0 9 * * friL", "2026-11-09T10:00:00+01:00"),
+            at("2026-11-27T09:00:00+01:00")
+        );
+        // With a plain entry beside it: the 15th or the last day.
+        assert_eq!(
+            next("0 9 15,L * *", "2026-11-09T10:00:00+01:00"),
+            at("2026-11-15T09:00:00+01:00")
+        );
+        assert!(Cron::parse("0 9 * * mon#6").is_err());
+        assert!(Cron::parse("0 9 * * xL").is_err());
+        assert!(Cron::parse("0 9 * * mon#1").is_ok_and(|c| !c.classic()));
+        assert!(Cron::parse("0 9 L * *").is_ok_and(|c| !c.classic()));
+        assert!(Cron::parse("0 9 1 * 1-5").is_ok_and(|c| c.classic()));
     }
 }
