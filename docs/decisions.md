@@ -1055,3 +1055,28 @@ command's process group and writes the record itself.
 
 Why: the only way to end a run was to find its tab and close it by hand,
 which then counted as a run that went wrong.
+
+## 2026-11-11: Chat about a run gets the run as files, and asks first
+
+`t` on a run that ended opens a tab with Claude Code, like "Describe it to
+Claude" (same helper, `open_claude_tab`). Its first message names the
+run's record, its output and the routine's files by path and tells Claude
+to read them; nothing a run printed, and neither its message nor its
+result, is part of that message. The routine's name is, cut to one short
+line without quotes. The session runs in permission mode `manual` (it
+asks before every change and command), with the routine's and the run's
+folders added so it can read them wherever it starts. It starts in the
+folder the approved routine works in and with the approved routine's
+Multiaccount account; a routine that waits for approval decides neither.
+A change Claude makes there is a change from outside the list: it waits
+for `a`. A run that is still going is not offered: its own tab is the
+place to talk to it. It is always Claude Code, also for a run of another
+agent, as "Describe it to Claude" is.
+
+Why: a run's output is the most likely place for text from outside (a
+mail, a web page) to reach an agent. In "Describe it to Claude" the
+session reads nothing of that kind and runs in Auto; here it reads
+exactly that, so it gets paths and a warning instead of the text, and
+does nothing without the owner's yes. Starting a new session with the
+files (not resuming the run's own session) works the same for every
+agent kind, for shell commands and after the run's tab is closed.

@@ -71,6 +71,10 @@ each run in its own tab. What it does and how users install it:
   `crontab` tools, are started through `shell.rs` (own process group,
   time limit); `herdr` only through `herdr.rs`. Text that came back from
   a run goes into a prompt through `runner::as_data`.
+- A tab with Claude that the list opens (`open_claude_tab`: "Describe it
+  to Claude", chat about a run) gets a brief that names files by path.
+  Nothing a run wrote is part of the brief, and a session that reads a
+  run's output starts in permission mode `manual`.
 - Every way a run ends goes through `runner::ended`, once; alerts about
   an ending are sent only there.
 - Herdr calls about a run's agent use `Run::agent_target`; calls about its

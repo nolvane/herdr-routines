@@ -2414,6 +2414,8 @@ fn footer_keys(app: &App) -> Vec<FootKey> {
                 v.push(foot("l", "whole output", hit('l'), 2));
                 if run.status.active() {
                     v.push(foot("x", "stop", hit('x'), 1));
+                } else {
+                    v.push(foot("t", "chat about it", hit('t'), 1));
                 }
                 if app.routines.iter().any(|r| r.id == run.routine_id) {
                     v.push(foot("r", "run again", hit('r'), 3));
@@ -2581,8 +2583,11 @@ fn list_keys(app: &App) -> Vec<FootKey> {
             if run.is_some_and(|run| run.status.active()) {
                 v.push(foot("x", "stop its run", hit('x'), 3));
             }
-            if run.is_some() {
+            if let Some(run) = run {
                 v.push(foot("l", "output", hit('l'), 3));
+                if !run.status.active() {
+                    v.push(foot("t", "chat about its run", hit('t'), 4));
+                }
                 v.push(foot("h", "its runs", hit('h'), 4));
             }
             v.push(foot(
@@ -2621,6 +2626,8 @@ fn list_keys(app: &App) -> Vec<FootKey> {
                 v.push(foot("l", "output", hit('l'), 2));
                 if run.status.active() {
                     v.push(foot("x", "stop", hit('x'), 2));
+                } else {
+                    v.push(foot("t", "chat about it", hit('t'), 2));
                 }
             }
             if app.runs_filtered() {
@@ -3675,6 +3682,10 @@ const HELP: [(&str, &[(&str, &str)]); 7] = [
             ("o", "go to the tab of its last run"),
             ("l", "output of its last run"),
             ("x", "stop its run that is going (asks first)"),
+            (
+                "t",
+                "chat about its last run: a tab with Claude that reads the run and answers, or changes the routine",
+            ),
             ("h", "its runs (or click \"n runs ›\"); Esc comes back"),
             (
                 "Line on top",
@@ -3699,6 +3710,10 @@ const HELP: [(&str, &[(&str, &str)]); 7] = [
             ("f", "open the output file"),
             ("r", "run its routine again (asks first)"),
             ("x", "stop the run while it is going (asks first)"),
+            (
+                "t",
+                "chat about the run once it ended: a tab with Claude that reads its record and output, answers your questions and changes the routine when you ask (a change waits for a)",
+            ),
             ("h", "only its runs; again for all runs"),
             ("p", "only runs that went wrong or need you; again for all"),
             ("/", "search: the routine's name, the message or the result"),

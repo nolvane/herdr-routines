@@ -42,6 +42,10 @@ All notable changes to this plugin. The format follows
   output and what can be done with it. `o` goes to the run's tab.
 - With the Multiaccount plugin installed, a Claude Code routine can name
   the account it runs with.
+- Chat about a run (`t` on a run that ended, or on a routine for its last
+  run): a tab with Claude Code that has the run's record and output and
+  the routine's files to read, says what happened, answers questions and
+  changes the routine when asked. A change waits for approval in the list.
 - `routines` (JSON) also prints the new settings and how many runs went
   wrong in a row; `runs` says whether a run counts as a problem.
 

@@ -117,6 +117,15 @@ always stays).
 - **Create with Claude:** `n`, then "Describe it to Claude", opens a tab
   where Claude asks what the routine should do, writes it and checks that
   it loads. You then approve it in the list with `a`.
+- **Chat about a run:** `t` on a run that ended (in Runs, on its page, or
+  on a routine for its last run) opens a tab with Claude Code that reads
+  the run's record and output and the routine's files, tells you what the
+  run did and why it ended as it did, and answers your questions. When you
+  ask for it, it changes the routine; such a change waits for your `a` in
+  the list like any change from outside. Reading the run needs no answer
+  from you; before it changes a file or runs a command it asks (Claude
+  Code's `manual` mode; rules in your own Claude Code settings still
+  apply). It uses the routine's account when it names one.
 - **Your approval:** a routine runs only as you saved it in the list or
   approved it there. When anything else creates or changes its files (an
   agent, an editor outside the list), it waits, marked `◐` and "New, not
@@ -324,6 +333,7 @@ their runs.
 | `o` | Go to the tab of the last run (in Runs: of the run, or its output once the tab is closed) |
 | `l` | Output of the last run |
 | `x` | Stop the run that is going (asks first) |
+| `t` | Chat about the run that ended (on a routine: its last run): a tab with Claude that has the run to look at |
 | `h` | The routine's runs (`Esc` comes back to it); in Runs: only this routine's runs, again for all |
 | `s` | Sort by what needs you first, or by name; the list remembers it |
 | `p` `/` | In Runs: only runs that went wrong or need you; search the runs |
