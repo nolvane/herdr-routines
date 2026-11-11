@@ -245,8 +245,10 @@ always stays).
 - **Awake while a run is going:** the computer does not go to sleep in the
   middle of a run (`caffeinate` on macOS, `systemd-inhibit` on Linux). The
   "awake" switch at the top chooses between during runs, always while
-  Herdr runs (so no time is missed for sleep) and off. A closed laptop lid
-  still sleeps; time slept does not count towards a run's time limit.
+  Herdr runs (so no time is missed for sleep) and off. Only the computer
+  is kept awake: the screen still goes dark as its settings say, and runs
+  go on behind it. A closed laptop lid still sleeps; time slept does not
+  count towards a run's time limit.
 - **Accounts:** with the
   [Multiaccount](https://github.com/nolvane/herdr-multiaccount) plugin
   installed, a Claude Code routine can name the account it runs with;

@@ -91,6 +91,19 @@ impl Icons {
     }
 }
 
+/// Stands before and after a key in a text of the list's own, so the key
+/// is drawn bold and in the accent colour wherever the text ends up (see
+/// `keys`). It has no width: wrapping and measuring a text do not see it.
+pub const KEY_MARK: char = '\u{2060}';
+
+/// Marks the keys in a text of the list's own: they are written between
+/// backticks, as in "`a` shows it for approval". Only for texts written
+/// here, never for a name, an error or anything else that came from
+/// outside, which may hold backticks of its own.
+pub fn keys(text: &str) -> String {
+    text.replace('`', "\u{2060}")
+}
+
 /// Text colour that reads on a coloured background.
 pub fn on(bg: Color) -> Color {
     match bg {

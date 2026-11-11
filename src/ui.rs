@@ -26,8 +26,8 @@ use crate::routine::Routine;
 use crate::schedule::Schedule;
 use crate::store::{Run, Status};
 use crate::theme::{
-    self, Icons, Mark, ACCENT, BAR_BG, BLUE, BORDER, FAINT, GREEN, HOVER_BG, MARK_BG, MUTED, RED,
-    SELECTED_BG, TEXT, YELLOW,
+    self, keys, Icons, Mark, ACCENT, BAR_BG, BLUE, BORDER, FAINT, GREEN, HOVER_BG, MARK_BG, MUTED,
+    RED, SELECTED_BG, TEXT, YELLOW,
 };
 use chrono::{DateTime, Local};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -108,6 +108,30 @@ fn plain(text: impl Into<String>, color: Color) -> Span<'static> {
 
 fn faint(t: impl Into<String>) -> Line<'static> {
     Line::from(plain(t, FAINT))
+}
+
+/// How a key looks, everywhere: bold and in the accent colour. What it
+/// does stands beside it in a quieter colour.
+fn key_style() -> Style {
+    bold(ACCENT)
+}
+
+/// A text with its keys (marked by `theme::keys`) in the look of a key
+/// and the rest in `style`. A text without marks comes back as it is.
+fn with_keys(text: impl AsRef<str>, style: Style) -> Vec<Span<'static>> {
+    // A key keeps the background of the text it stands in (a button).
+    let key = style.patch(key_style());
+    text.as_ref()
+        .split(theme::KEY_MARK)
+        .enumerate()
+        .filter(|(_, part)| !part.is_empty())
+        .map(|(i, part)| Span::styled(part.to_string(), if i % 2 == 1 { key } else { style }))
+        .collect()
+}
+
+/// `with_keys` for a text in one colour.
+fn keyed(text: impl AsRef<str>, color: Color) -> Vec<Span<'static>> {
+    with_keys(text, Style::new().fg(color))
 }
 
 // ---- header ----------------------------------------------------------------
@@ -470,7 +494,7 @@ fn empty_note(frame: &mut Frame, area: Rect, lines: &[(String, Color)]) {
             text.push(Line::from(""));
         }
         for l in wrap(t, width) {
-            text.push(Line::from(plain(l, *c)));
+            text.push(Line::from(keyed(l, *c)));
         }
     }
     frame.render_widget(
@@ -669,7 +693,10 @@ fn routine_about(app: &App, r: &Routine) -> (Line<'static>, bool) {
             "New, not approved yet"
         };
         return (
-            Line::from(plain(format!("{why} · a shows it for approval"), YELLOW)),
+            Line::from(keyed(
+                keys(&format!("{why} · `a` shows it for approval")),
+                YELLOW,
+            )),
             true,
         );
     }
@@ -850,7 +877,7 @@ fn job_row(job: &crate::crontab::CronJob, now: &DateTime<Local>) -> RoutineRow {
         next,
         last: [
             Line::from(plain("only in your crontab", MUTED)),
-            faint("⏎ takes it over"),
+            Line::from(keyed(keys("`⏎` takes it over"), FAINT)),
         ],
         link: None,
         brief: Some(Line::from(plain("only in your crontab", MUTED))),
@@ -990,7 +1017,7 @@ fn draw_routines(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
                 ("No cron jobs.".into(), TEXT),
                 (String::new(), TEXT),
                 (
-                    "n, then \"Cron job\", creates one: a command that cron runs, also when Herdr is closed.".into(),
+                    keys("`n`, then \"Cron job\", creates one: a command that cron runs, also when Herdr is closed."),
                     MUTED,
                 ),
                 (
@@ -1003,7 +1030,7 @@ fn draw_routines(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
                 ("No routines yet.".into(), TEXT),
                 (String::new(), TEXT),
                 (
-                    "n creates one: fill in a short form, or describe it to Claude.".into(),
+                    keys("`n` creates one: fill in a short form, or describe it to Claude."),
                     MUTED,
                 ),
                 (format!("Routines are plain files in {path}."), FAINT),
@@ -1266,7 +1293,7 @@ fn draw_job_details(frame: &mut Frame, job: &crate::crontab::CronJob, area: Rect
         lines.push(detail_row("Note", vec![plain(note.clone(), YELLOW)], w));
     }
     let note = wrap(
-        "Only in your crontab: cron runs it, and this list does not see its runs. ⏎ takes it over, as a cron job or as a Herdr routine, with its output and failures in Runs.",
+        &keys("Only in your crontab: cron runs it, and this list does not see its runs. `⏎` takes it over, as a cron job or as a Herdr routine, with its output and failures in Runs."),
         w.saturating_sub(2),
     );
     // The gap above the note goes first when the rows are short.
@@ -1274,7 +1301,7 @@ fn draw_job_details(frame: &mut Frame, job: &crate::crontab::CronJob, area: Rect
         lines.push(Line::from(""));
     }
     for l in note {
-        lines.push(Line::from(plain(format!(" {l}"), MUTED)));
+        lines.push(Line::from(keyed(format!(" {l}"), MUTED)));
     }
     frame.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
@@ -1332,10 +1359,10 @@ fn draw_details(frame: &mut Frame, app: &App, icons: &Icons, r: &Routine, area: 
         ));
         lines.push(Line::from(""));
         for l in wrap(
-            "Its routine.toml cannot be read, so it never runs. ⏎ opens the file to fix it; d deletes the routine.",
+            &keys("Its routine.toml cannot be read, so it never runs. `⏎` opens the file to fix it; `d` deletes the routine."),
             w.saturating_sub(2),
         ) {
-            lines.push(Line::from(plain(format!(" {l}"), FAINT)));
+            lines.push(Line::from(keyed(format!(" {l}"), FAINT)));
         }
         frame.render_widget(Paragraph::new(Text::from(lines)), inner);
         return;
@@ -1363,10 +1390,10 @@ fn draw_details(frame: &mut Frame, app: &App, icons: &Icons, r: &Routine, area: 
         };
         lines.push(detail_row(
             "Approval",
-            vec![plain(
-                format!("{why}{what} · a shows it for approval"),
+            keyed(
+                keys(&format!("{why}{what} · `a` shows it for approval")),
                 YELLOW,
-            )],
+            ),
             w,
         ));
     }
@@ -1567,12 +1594,12 @@ fn draw_runs(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
         let search = app.runs_search.trim().to_string();
         // Esc goes back to the routine the filter came from; without one
         // it shows all runs, which `h` always does.
-        let mut buttons: Vec<(&str, char)> = match (app.filter_from, &name) {
+        let mut buttons: Vec<(String, char)> = match (app.filter_from, &name) {
             (Some(_), Some(_)) => vec![
-                (" Esc back to the routine ", '\u{1b}'),
-                (" h all runs ", 'h'),
+                (keys(" `Esc` back to the routine "), '\u{1b}'),
+                (keys(" `h` all runs "), 'h'),
             ],
-            _ => vec![(" Esc all runs ", '\u{1b}')],
+            _ => vec![(keys(" `Esc` all runs "), '\u{1b}')],
         };
         if app.runs.is_empty() {
             // `h` needs a run to stand on.
@@ -1602,7 +1629,7 @@ fn draw_runs(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
             }
             v
         };
-        let width = |lead: &str, c: &[(String, RunFilter)], b: &[(&str, char)]| {
+        let width = |lead: &str, c: &[(String, RunFilter)], b: &[(String, char)]| {
             lead.width()
                 + c.iter().map(|(t, _)| t.width() + 1).sum::<usize>()
                 + tail.width()
@@ -1658,7 +1685,7 @@ fn draw_runs(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
                 app.hits.push((Rect::new(x, bar.y, w, 1), Hit::Key(key)));
             }
             x += w + 1;
-            spans.push(Span::styled(text, Style::new().fg(TEXT).bg(BORDER)));
+            spans.extend(with_keys(text, Style::new().fg(TEXT).bg(BORDER)));
             spans.push(Span::raw(" "));
         }
         frame.render_widget(Paragraph::new(clip_line(Line::from(spans), room)), bar);
@@ -1674,14 +1701,16 @@ fn draw_runs(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
             vec![
                 ("No run matches.".into(), TEXT),
                 (String::new(), TEXT),
-                ("Esc shows all runs again.".into(), MUTED),
+                (keys("`Esc` shows all runs again."), MUTED),
             ]
         } else {
             vec![
                 ("No runs yet.".into(), TEXT),
                 (String::new(), TEXT),
                 (
-                    "Runs show up here when a routine is due, or when you start one with r.".into(),
+                    keys(
+                        "Runs show up here when a routine is due, or when you start one with `r`.",
+                    ),
                     MUTED,
                 ),
             ]
@@ -1944,17 +1973,21 @@ fn field_value(
     }
 }
 
-fn button(label: &str, on: bool) -> Span<'static> {
+/// A button in the form; its key is written between backticks.
+fn button(label: &str, on: bool) -> Vec<Span<'static>> {
+    let label = keys(&format!(" {label} "));
     if on {
-        Span::styled(
-            format!(" {label} "),
+        // The marked button is one block in the accent colour, so its key
+        // cannot have that colour too: all of it is bold instead.
+        vec![Span::styled(
+            label.replace(theme::KEY_MARK, ""),
             Style::new()
                 .fg(theme::on(ACCENT))
                 .bg(ACCENT)
                 .add_modifier(Modifier::BOLD),
-        )
+        )]
     } else {
-        Span::styled(format!(" {label} "), Style::new().fg(TEXT).bg(BORDER))
+        with_keys(label, Style::new().fg(TEXT).bg(BORDER))
     }
 }
 
@@ -2074,7 +2107,7 @@ fn draw_form(frame: &mut Frame, app: &mut App, area: Rect) {
     // Below the fields: what the current field means, set off by an accent
     // bar like a tooltip. Four lines, or more (up to eight) where the
     // fields still keep six rows.
-    let mut hint = wrap(form.hint(current), width.saturating_sub(4));
+    let mut hint = wrap(&keys(form.hint(current)), width.saturating_sub(4));
     let show_hint = inner.height >= 12;
     let most = (inner.height as usize).saturating_sub(10).clamp(4, 8);
     if hint.len() > most {
@@ -2232,7 +2265,7 @@ fn draw_form(frame: &mut Frame, app: &mut App, area: Rect) {
         let mut spans = vec![Span::styled(label, label_style)];
         if f == Field::Prompt {
             if preview.is_empty() {
-                spans.push(plain("empty · ⏎ writes it", YELLOW));
+                spans.extend(keyed(keys("empty · `⏎` writes it"), YELLOW));
             } else {
                 spans.extend(preview_line(0));
             }
@@ -2287,10 +2320,11 @@ fn draw_form(frame: &mut Frame, app: &mut App, area: Rect) {
     );
     // The save button, always in sight, and whether it can be saved.
     let on_save = save_at == Some(form.field);
-    let save = button("⏎ save", on_save);
-    let back = button("Esc back", false);
+    let save = button("`⏎` save", on_save);
+    let back = button("`Esc` back", false);
     let x = inner.x + 1;
-    let (save_w, back_w) = (save.width() as u16, back.width() as u16);
+    let wide = |b: &[Span]| b.iter().map(Span::width).sum::<usize>() as u16;
+    let (save_w, back_w) = (wide(&save), wide(&back));
     if let Some(i) = save_at {
         app.hits
             .push((Rect::new(x, y + 1, save_w, 1), Hit::Field(i)));
@@ -2304,7 +2338,10 @@ fn draw_form(frame: &mut Frame, app: &mut App, area: Rect) {
         Err(e) => plain(format!("not ready: {e}"), YELLOW),
     };
     let beside = width.saturating_sub((save_w + back_w) as usize + 7);
-    let mut buttons = vec![Span::raw(" "), save, Span::raw("  "), back];
+    let mut buttons = vec![Span::raw(" ")];
+    buttons.extend(save);
+    buttons.push(Span::raw("  "));
+    buttons.extend(back);
     if status.width() <= beside {
         buttons.push(Span::raw("   "));
         buttons.push(status);
@@ -2328,10 +2365,11 @@ fn draw_form(frame: &mut Frame, app: &mut App, area: Rect) {
         bar(),
         Span::styled(form.label(current), bold(TEXT)),
     ])];
-    lines.extend(
-        hint.into_iter()
-            .map(|l| Line::from(vec![bar(), plain(l, MUTED)])),
-    );
+    lines.extend(hint.into_iter().map(|l| {
+        let mut spans = vec![bar()];
+        spans.extend(keyed(l, MUTED));
+        Line::from(spans)
+    }));
     frame.render_widget(
         Paragraph::new(Text::from(lines)),
         Rect::new(
@@ -2784,7 +2822,7 @@ fn draw_footer(frame: &mut Frame, app: &mut App, area: Rect) {
         };
         let (yes, no) = (" y close ", " n stay ");
         let x = area.x + question.width() as u16;
-        let line = Line::from(vec![
+        let mut spans = vec![
             Span::styled(question, bold(TEXT)),
             Span::styled(
                 yes,
@@ -2794,8 +2832,12 @@ fn draw_footer(frame: &mut Frame, app: &mut App, area: Rect) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" "),
-            Span::styled(no, Style::new().fg(TEXT).bg(BORDER)),
-        ]);
+        ];
+        spans.extend(with_keys(
+            keys(" `n` stay "),
+            Style::new().fg(TEXT).bg(BORDER),
+        ));
+        let line = Line::from(spans);
         app.hits
             .push((Rect::new(x, area.y, yes.width() as u16, 1), Hit::Key('y')));
         app.hits.push((
@@ -2820,14 +2862,14 @@ fn draw_footer(frame: &mut Frame, app: &mut App, area: Rect) {
             }
             let text: Vec<Line> = lines
                 .into_iter()
-                .map(|l| Line::from(plain(format!(" {l}"), flash.color)))
+                .map(|l| Line::from(keyed(format!(" {l}"), flash.color)))
                 .collect();
             frame.render_widget(Paragraph::new(Text::from(text)), area);
             return;
         }
         right_w = flash.text.width() + 3;
         frame.render_widget(
-            Paragraph::new(plain(format!("{} ", flash.text), flash.color))
+            Paragraph::new(Line::from(keyed(format!("{} ", flash.text), flash.color)))
                 .alignment(Alignment::Right),
             area,
         );
@@ -2858,7 +2900,7 @@ fn draw_footer(frame: &mut Frame, app: &mut App, area: Rect) {
             app.hits.push((Rect::new(x, area.y, w - 2, 1), hit));
         }
         x += w;
-        spans.push(Span::styled(k.key, bold(TEXT)));
+        spans.push(Span::styled(k.key, key_style()));
         spans.push(plain(text, MUTED));
     }
     frame.render_widget(
@@ -2981,7 +3023,7 @@ fn draw_menu(frame: &mut Frame, app: &mut App, stage: Rect, m: &crate::app::Menu
                 },
             ),
             Span::raw(" ".repeat(gap)),
-            plain(format!("{} ", item.key), MUTED),
+            Span::styled(format!("{} ", item.key), key_style()),
         ]);
         frame.render_widget(Paragraph::new(line), row);
         app.hits.push((row, Hit::MenuRow(i)));
@@ -3232,7 +3274,7 @@ fn draw_confirm(frame: &mut Frame, app: &mut App, stage: Rect, c: &crate::app::C
         buttons.push((" r delete with its runs ".into(), 'r', strong(RED)));
     }
     buttons.push((
-        format!(" n {} ", c.no()),
+        keys(&format!(" `n` {} ", c.no())),
         'n',
         Style::new().fg(TEXT).bg(BORDER),
     ));
@@ -3244,7 +3286,7 @@ fn draw_confirm(frame: &mut Frame, app: &mut App, stage: Rect, c: &crate::app::C
             app.hits.push((Rect::new(x, y, w, 1), Hit::Key(key)));
         }
         x += w + 1;
-        spans.push(Span::styled(text, style));
+        spans.extend(with_keys(text, style));
         spans.push(Span::raw(" "));
     }
     frame.render_widget(
@@ -3263,7 +3305,7 @@ fn draw_message(frame: &mut Frame, app: &mut App, stage: Rect, title: &str, text
         }
         let color = if i == 0 { TEXT } else { MUTED };
         for l in wrap(t, width.saturating_sub(6) as usize) {
-            lines.push(Line::from(plain(l, color)));
+            lines.push(Line::from(keyed(l, color)));
         }
     }
     let area = centered(stage, width, lines.len() as u16 + 5);
@@ -3290,15 +3332,15 @@ fn draw_message(frame: &mut Frame, app: &mut App, stage: Rect, title: &str, text
             .add_modifier(Modifier::BOLD),
     )];
     if app.help_max > 0 {
-        spans.push(plain(
-            if app.help_scroll >= app.help_max {
-                "  ↑ ↓ scroll · end".to_string()
+        spans.extend(keyed(
+            keys(&if app.help_scroll >= app.help_max {
+                "  `↑ ↓` scroll · end".to_string()
             } else {
                 format!(
-                    "  ↑ ↓ scroll · {} more lines",
+                    "  `↑ ↓` scroll · {} more lines",
                     app.help_max - app.help_scroll
                 )
-            },
+            }),
             MUTED,
         ));
     }
@@ -3449,6 +3491,13 @@ fn log_row(row: LogRow, mark: Option<&Diff>, gutter: bool) -> Line<'static> {
     if gutter {
         spans.push(sign);
     }
+    // A line that did not change may be one of the view's own, with a key
+    // in it. Text from a file never has a key's mark (`visible_text`), and
+    // a row holds a key whole, since rows break at spaces.
+    if ranges.is_empty() {
+        spans.extend(with_keys(row.text, base));
+        return Line::from(spans);
+    }
     let marked = |at: usize| ranges.iter().any(|(a, b)| (*a..*b).contains(&at));
     let (mut piece, mut piece_marked) = (String::new(), false);
     for (k, c) in row.text.chars().enumerate() {
@@ -3557,7 +3606,7 @@ fn draw_log(frame: &mut Frame, app: &mut App, stage: Rect, mut log: LogView) {
             app.hits
                 .push((Rect::new(inner.x, y, text.width() as u16, 1), Hit::Key('y')));
         } else {
-            foot.push(Span::styled("↓", bold(TEXT)));
+            foot.push(Span::styled("↓", key_style()));
             foot.push(plain(" read to the end to approve", MUTED));
         }
     }
@@ -3710,25 +3759,26 @@ fn draw_run_page(frame: &mut Frame, app: &mut App, icons: &Icons, stage: Rect, p
         let fit = left - 2;
         let more = page.cut || rows.len() > fit;
         let head = if more { "End of the output" } else { "Output" };
-        let note = if more { " l shows all of it" } else { "" };
+        let note = keys(if more { " `l` shows all of it" } else { "" });
         let rule = w.saturating_sub(head.width() + note.width() + 2);
-        lines.push(Line::from(vec![
+        let mut title = vec![
             Span::styled(head, bold(ACCENT)),
             plain(format!(" {} ", "─".repeat(rule)), BORDER),
-            plain(note, FAINT),
-        ]));
+        ];
+        title.extend(keyed(note, FAINT));
+        lines.push(Line::from(title));
         if rows.is_empty() {
             let open = !run.tab_closed && run.cron_pid == 0 && !run.pane_id.is_empty();
             let why = if skipped {
                 "Nothing ran at this time."
             } else if run.status.active() && open {
-                "Nothing is saved yet: o goes to its tab, where it is at work."
+                "Nothing is saved yet: `o` goes to its tab, where it is at work."
             } else if run.status.active() {
                 "Nothing is saved yet."
             } else {
                 "No output was saved for this run."
             };
-            lines.push(Line::from(plain(why, FAINT)));
+            lines.push(Line::from(keyed(keys(why), FAINT)));
         }
         let skip = rows.len().saturating_sub(fit);
         for l in rows.into_iter().skip(skip) {
@@ -3806,7 +3856,7 @@ const HELP: [(&str, &[(&str, &str)]); 7] = [
         "List",
         &[
             ("↑ ↓  j k", "move"),
-            ("PgUp PgDn  g G", "a page up or down; first, last (also Home, End)"),
+            ("PgUp PgDn  g G", "a page up or down; first, last (also `Home`, `End`)"),
             ("← →  Tab  1 2 3", "routines / cron jobs / runs"),
             (
                 "Mouse",
@@ -3850,7 +3900,7 @@ const HELP: [(&str, &[(&str, &str)]); 7] = [
             ),
             (
                 "a",
-                "approve one that is new or was changed outside the list: shows it, y approves at the end",
+                "approve one that is new or was changed outside the list: shows it, `y` approves at the end",
             ),
             ("Space", "switch on / off"),
             ("c", "duplicate (the copy starts switched off)"),
@@ -3861,7 +3911,7 @@ const HELP: [(&str, &[(&str, &str)]); 7] = [
                 "t",
                 "chat about its last run: a tab with Claude that reads the run and answers, or changes the routine",
             ),
-            ("h", "its runs (or click \"n runs ›\"); Esc comes back"),
+            ("h", "its runs (or click \"n runs ›\"); `Esc` comes back"),
             (
                 "Line on top",
                 "what needs you, what is running and what comes next; a click goes there",
@@ -3869,7 +3919,7 @@ const HELP: [(&str, &[(&str, &str)]); 7] = [
             ("d  Del", "delete (asks: keep its runs, or delete them too)"),
             (
                 "⏎ on ◇",
-                "take over a job that is only in your crontab: k keep as a cron job, m move to Herdr, c copy",
+                "take over a job that is only in your crontab: `k` keep as a cron job, `m` move to Herdr, `c` copy",
             ),
         ],
     ),
@@ -3887,7 +3937,7 @@ const HELP: [(&str, &[(&str, &str)]); 7] = [
             ("x", "stop the run while it is going (asks first)"),
             (
                 "t",
-                "chat about the run once it ended: a tab with Claude that reads its record and output, answers your questions and changes the routine when you ask (a change waits for a)",
+                "chat about the run once it ended: a tab with Claude that reads its record and output, answers your questions and changes the routine when you ask (a change waits for `a`)",
             ),
             ("h", "only its runs; again for all runs"),
             ("p", "only runs that went wrong or need you; again for all"),
@@ -3902,7 +3952,7 @@ const HELP: [(&str, &[(&str, &str)]); 7] = [
     (
         "Form",
         &[
-            ("↑ ↓  Tab", "field (PgUp, PgDn: several)"),
+            ("↑ ↓  Tab", "field (`PgUp`, `PgDn`: several)"),
             (
                 "⏎  Space",
                 "choose from the list, write the prompt, switch a weekday, show or hide More settings, save",
@@ -3913,7 +3963,7 @@ const HELP: [(&str, &[(&str, &str)]); 7] = [
             ),
             (
                 "1–7",
-                "on the weekdays: switch Monday (1) to Sunday (7)",
+                "on the weekdays: switch Monday (`1`) to Sunday (`7`)",
             ),
             (
                 "Home  End",
@@ -3934,10 +3984,13 @@ const HELP: [(&str, &[(&str, &str)]); 7] = [
             ),
             ("Ctrl+D", "discard what you wrote (asks first)"),
             ("Ctrl+Z  Ctrl+Y", "undo / redo"),
-            ("arrows", "move; with Ctrl or Alt by word; ⏎ starts a new line"),
+            (
+                "arrows",
+                "move; with `Ctrl` or `Alt` by word; `⏎` starts a new line",
+            ),
             (
                 "Home  End",
-                "start / end of the line (Ctrl+E: end); with Ctrl of the text",
+                "start / end of the line (`Ctrl+E`: end); with `Ctrl` of the text",
             ),
             ("PgUp  PgDn", "a page up or down"),
             ("Shift+arrows", "mark text; or drag with the mouse"),
@@ -3953,7 +4006,7 @@ const HELP: [(&str, &[(&str, &str)]); 7] = [
         &[
             (
                 "↑ ↓  PgUp PgDn",
-                "scroll (Space: a page down; g, G: start, end)",
+                "scroll (`Space`: a page down; `g`, `G`: start, end)",
             ),
             ("f", "open the output file"),
             ("y", "approve, once read to the end"),
@@ -3972,7 +4025,7 @@ const HELP: [(&str, &[(&str, &str)]); 7] = [
             ("typing", "narrows a long list (such as the agents)"),
             (
                 "y",
-                "yes; ⏎ too where nothing is lost. Deleting, discarding, stopping a run and running by hand need y",
+                "yes; `⏎` too where nothing is lost. Deleting, discarding, stopping a run and running by hand need `y`",
             ),
             ("r", "when deleting a routine: delete its runs too"),
             ("any other key", "no"),
@@ -3988,18 +4041,18 @@ const HELP_KEYS: usize = 17;
 fn help_lines(width: usize) -> Vec<Line<'static>> {
     let room = width.saturating_sub(HELP_KEYS).max(10);
     let mut lines: Vec<Line> = Vec::new();
-    for (gi, (title, keys)) in HELP.iter().enumerate() {
+    for (gi, (title, group)) in HELP.iter().enumerate() {
         if gi > 0 {
             lines.push(Line::from(""));
         }
-        lines.push(Line::from(Span::styled(*title, bold(ACCENT))));
-        for (k, what) in keys.iter() {
-            for (n, part) in wrap(what, room).into_iter().enumerate() {
+        // The headings are white, so that only keys have the accent colour.
+        lines.push(Line::from(Span::styled(*title, bold(TEXT))));
+        for (k, what) in group.iter() {
+            for (n, part) in wrap(&keys(what), room).into_iter().enumerate() {
                 let key = if n == 0 { *k } else { "" };
-                lines.push(Line::from(vec![
-                    Span::styled(format!("{key:<HELP_KEYS$}"), bold(TEXT)),
-                    plain(part, MUTED),
-                ]));
+                let mut spans = vec![Span::styled(format!("{key:<HELP_KEYS$}"), key_style())];
+                spans.extend(keyed(part, MUTED));
+                lines.push(Line::from(spans));
             }
         }
     }
@@ -4008,13 +4061,13 @@ fn help_lines(width: usize) -> Vec<Line<'static>> {
 
 fn draw_help(frame: &mut Frame, app: &mut App, stage: Rect) {
     let how = |width: usize| -> Vec<Line<'static>> {
-        let mut out = vec![Line::from(Span::styled("How it works", bold(ACCENT)))];
+        let mut out = vec![Line::from(Span::styled("How it works", bold(TEXT)))];
         for (i, p) in INTRO.iter().enumerate() {
             if i > 0 {
                 out.push(Line::from(""));
             }
-            for l in wrap(p, width) {
-                out.push(Line::from(plain(l, MUTED)));
+            for l in wrap(&keys(p), width) {
+                out.push(Line::from(keyed(l, MUTED)));
             }
         }
         out
@@ -4099,12 +4152,15 @@ fn draw_help(frame: &mut Frame, app: &mut App, stage: Rect) {
     }
     if overflow {
         let hint = if app.help_scroll >= app.help_max {
-            "↑ ↓ scroll · end".to_string()
+            "`↑ ↓` scroll · end".to_string()
         } else {
-            format!("↑ ↓ scroll · {} more lines", app.help_max - app.help_scroll)
+            format!(
+                "`↑ ↓` scroll · {} more lines",
+                app.help_max - app.help_scroll
+            )
         };
         frame.render_widget(
-            Paragraph::new(plain(hint, MUTED)),
+            Paragraph::new(Line::from(keyed(keys(&hint), MUTED))),
             Rect::new(inner.x, inner.y + visible, inner.width, 1),
         );
     }
@@ -4117,6 +4173,51 @@ mod tests {
     #[test]
     fn wrap_keeps_words_whole() {
         assert_eq!(wrap("a bb ccc dddd", 10), vec!["a bb ccc", "dddd"]);
+    }
+
+    #[test]
+    fn a_marked_key_is_drawn_as_a_key_and_takes_no_room() {
+        let marked = keys("Fix it first (`⏎` edits it); `Ctrl+S` saves");
+        // The marks have no width, so a text wraps and is measured as
+        // without them, and a key stays whole on its row.
+        assert_eq!(
+            marked.width(),
+            "Fix it first (⏎ edits it); Ctrl+S saves".width()
+        );
+        let rows = wrap(&marked, 16);
+        assert_eq!(
+            rows.len(),
+            wrap("Fix it first (⏎ edits it); Ctrl+S saves", 16).len()
+        );
+        for row in &rows {
+            assert_eq!(row.matches(theme::KEY_MARK).count() % 2, 0, "{row:?}");
+        }
+        let spans = keyed(&marked, MUTED);
+        assert_eq!(
+            spans.iter().map(|s| s.content.as_ref()).collect::<String>(),
+            "Fix it first (⏎ edits it); Ctrl+S saves"
+        );
+        let looks: Vec<(&str, bool)> = spans
+            .iter()
+            .map(|s| (s.content.as_ref(), s.style == key_style()))
+            .collect();
+        assert_eq!(
+            looks,
+            [
+                ("Fix it first (", false),
+                ("⏎", true),
+                (" edits it); ", false),
+                ("Ctrl+S", true),
+                (" saves", false),
+            ]
+        );
+        // On a button the key keeps the button's background.
+        let on_button = with_keys(keys(" `n` no "), Style::new().fg(TEXT).bg(BORDER));
+        assert_eq!(on_button[1].style.bg, Some(BORDER));
+        assert_eq!(on_button[1].style.fg, Some(ACCENT));
+        // A text without a mark is one piece, and backticks from outside
+        // (an error's text) stay what they are.
+        assert_eq!(keyed("missing field `name`", RED).len(), 1);
     }
 
     #[test]

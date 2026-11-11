@@ -76,6 +76,11 @@ each run in its own tab. What it does and how users install it:
   to Claude", chat about a run) gets a brief that names files by path.
   Nothing a run wrote is part of the brief, and a session that reads a
   run's output starts in permission mode `manual`.
+- A key the list names is bold and in the accent colour (`key_style`),
+  and nothing else in a text has that look. Inside a sentence, write the
+  key between backticks and pass the text through `theme::keys`
+  ("`a` shows it"); draw it with `keyed` or `with_keys`. Only texts
+  written in the code go through `theme::keys`, never text from outside.
 - Every way a run ends goes through `runner::ended`, once; alerts about
   an ending are sent only there.
 - Herdr calls about a run's agent use `Run::agent_target`; calls about its

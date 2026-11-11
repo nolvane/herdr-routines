@@ -11,7 +11,7 @@ use crate::routine::{self, Routine, Settings};
 use crate::runner;
 use crate::scheduler;
 use crate::store::{self, Run};
-use crate::theme::{Icons, ACCENT, BLUE, GREEN, MUTED, RED, YELLOW};
+use crate::theme::{keys, Icons, ACCENT, BLUE, GREEN, MUTED, RED, YELLOW};
 use crate::ui;
 use chrono::{DateTime, Local};
 use ratatui::crossterm::event::{
@@ -454,8 +454,8 @@ pub const INTRO: [&str; 5] = [
     "A routine runs on a schedule, in its own tab in the workspace Routines: a coding agent that gets your prompt, or a shell command without AI, like a cron job. You can watch each run and step in when it asks something.",
     "Routines run while Herdr runs, also with no window open. When Herdr or the computer was off at the time, a routine runs once afterwards or skips that time, as you choose.",
     "The permission mode decides what the agent may do without asking. Auto suits most routines; with Ask every time, a run waits for you.",
-    "The tab of a finished run closes after an hour. Runs lists every run, and l shows what it wrote.",
-    "? shows all keys and this note again.",
+    "The tab of a finished run closes after an hour. Runs lists every run, and `l` shows what it wrote.",
+    "`?` shows all keys and this note again.",
 ];
 
 pub fn ago(t: &DateTime<Local>, now: &DateTime<Local>) -> String {
@@ -1207,7 +1207,10 @@ impl App {
         // read again, and only one that can still run starts.
         if !Routine::load(&self.paths, id).is_ok_and(|r| r.can_run()) {
             self.reload();
-            return self.flash("Not started: it changed meanwhile (a shows it)", YELLOW);
+            return self.flash(
+                keys("Not started: it changed meanwhile (`a` shows it)"),
+                YELLOW,
+            );
         }
         if let Some(r) = self.routines.iter().find(|r| r.id == id && r.is_cron()) {
             let started = crate::crontab::run_now(&self.paths, r);
@@ -1231,7 +1234,9 @@ impl App {
             .spawn();
         match spawned {
             Ok(_) if self.scheduler.is_none() => self.flash(
-                "Starting; routines are off, so the run is not followed (S switches them on)",
+                keys(
+                    "Starting; routines are off, so the run is not followed (`S` switches them on)",
+                ),
                 YELLOW,
             ),
             Ok(_) => self.flash("Starting, its tab opens in the background", GREEN),
@@ -1248,7 +1253,7 @@ impl App {
         // the list was read, and what is saved must be what is approved.
         let mut r = match Routine::load(&self.paths, &id) {
             Ok(r) if r.problem.is_none() || r.file.enabled => r,
-            _ => return self.flash("Fix the routine first (⏎ edits it)", YELLOW),
+            _ => return self.flash(keys("Fix the routine first (`⏎` edits it)"), YELLOW),
         };
         r.file.enabled = !r.file.enabled;
         // Switching keeps a routine that waits for approval waiting: only
@@ -1408,7 +1413,7 @@ impl App {
     /// `d` on a run: deletes it, after asking.
     fn ask_delete_run(&mut self, run: Run) {
         if run.status.active() {
-            return self.flash("It is still running (x stops it)", MUTED);
+            return self.flash(keys("It is still running (`x` stops it)"), MUTED);
         }
         self.mode = Mode::Confirm(Confirm {
             question: format!("Delete this run of {}?", run.routine_name),
@@ -1515,7 +1520,7 @@ impl App {
             .unwrap_or(0);
         let mut picker = Picker::new("Keep the computer awake".into(), items, sel, PickFor::Awake);
         picker.hint =
-            "A laptop with its lid closed still goes to sleep, whatever is chosen here.".into();
+            "Only the computer is kept awake: the screen still goes dark after a while, and runs go on behind it. A laptop with its lid closed goes to sleep, whatever is chosen here.".into();
         self.mode = Mode::Pick(picker);
     }
 
@@ -1577,7 +1582,7 @@ impl App {
         if cut {
             lines.insert(
                 0,
-                "(the output is long: this is its end, f opens the whole file)".into(),
+                keys("(the output is long: this is its end, `f` opens the whole file)"),
             );
         }
         while lines.last().is_some_and(|l| l.trim().is_empty()) {
@@ -1593,7 +1598,7 @@ impl App {
                 "Result"
             };
             let mut top = vec![heading.to_string()];
-            top.extend(run.result.lines().map(|l| format!("  {l}")));
+            top.extend(run.result.lines().map(|l| format!("  {}", visible_text(l))));
             top.push(String::new());
             if !lines.is_empty() {
                 top.push("Output".to_string());
@@ -1603,11 +1608,11 @@ impl App {
         }
         if lines.is_empty() {
             let why = if run.status.active() {
-                "The run is still going: o goes to its tab."
+                "The run is still going: `o` goes to its tab."
             } else {
                 "No output was saved for this run."
             };
-            lines.push(why.into());
+            lines.push(keys(why));
         }
         // How it went and why, always in sight above the output.
         let how = if run.attempt > 0 {
@@ -1712,7 +1717,7 @@ impl App {
         };
         if run.status.active() {
             return self.flash(
-                "It is still going: o goes to its tab, where you can talk to it",
+                keys("It is still going: `o` goes to its tab, where you can talk to it"),
                 MUTED,
             );
         }
@@ -1967,7 +1972,7 @@ impl App {
         }
         if !r.approved {
             return self.flash(
-                "It changed outside the list: a shows it for approval",
+                keys("It changed outside the list: `a` shows it for approval"),
                 YELLOW,
             );
         }
@@ -2032,7 +2037,7 @@ impl App {
             return self.flash("It is approved: it runs as saved", MUTED);
         }
         if r.unreadable {
-            return self.flash("Fix the routine first (⏎ edits it)", YELLOW);
+            return self.flash(keys("Fix the routine first (`⏎` edits it)"), YELLOW);
         }
         let files = crate::approval::snapshot(&self.paths, &r.id);
         let approvals = crate::approval::Approvals::load(&self.paths);
@@ -2067,7 +2072,7 @@ impl App {
         self.mode = Mode::Normal;
         if crate::approval::snapshot(&self.paths, &id) != files {
             self.reload();
-            return self.flash("It changed meanwhile; a shows it again", YELLOW);
+            return self.flash(keys("It changed meanwhile; `a` shows it again"), YELLOW);
         }
         match crate::approval::approve(&self.paths, &id, files) {
             Ok(()) => self.flash("Approved: it runs as shown", GREEN),
@@ -2472,7 +2477,7 @@ impl App {
     /// A key that needs a routine, on a job that is only in the crontab.
     fn only_in_crontab(&mut self) {
         self.flash(
-            "This job is only in your crontab: ⏎ takes it over first",
+            keys("This job is only in your crontab: `⏎` takes it over first"),
             MUTED,
         );
     }
@@ -3350,7 +3355,7 @@ impl App {
         if paths::write_atomic(&seen, b"").is_ok() {
             self.mode = Mode::Message {
                 title: "How routines work".into(),
-                lines: INTRO.iter().map(|l| l.to_string()).collect(),
+                lines: INTRO.iter().map(|l| keys(l)).collect(),
             };
             // Closing the note asks next.
             self.autostart_after_intro = true;
@@ -3612,8 +3617,11 @@ fn approval_lines(paths: &Paths, r: &Routine) -> Vec<String> {
         lines.push(format!("It cannot run yet: {p}"));
     }
     lines.push(String::new());
-    lines.push("y approves exactly this. Esc leaves it waiting.".into());
-    lines.iter().map(|l| visible_text(l)).collect()
+    let mut lines: Vec<String> = lines.iter().map(|l| visible_text(l)).collect();
+    // After `visible_text`, which takes the marks of a key away: only a
+    // line written here can have one.
+    lines.push(keys("`y` approves exactly this. `Esc` leaves it waiting."));
+    lines
 }
 
 /// The approval view of a routine, and for one that was approved before
@@ -3648,7 +3656,7 @@ fn approval_view(
     let what = match places {
         0 => "Its files were changed outside the list (by an agent or an editor) since you approved it, but nothing of what is shown here differs from what you approved: only spacing or comments in a file did.".to_string(),
         n => format!(
-            "It was changed outside the list (by an agent or an editor) since you approved it, in {n} {}. ▌ and yellow: new or changed.{} n goes to the next change.",
+            "It was changed outside the list (by an agent or an editor) since you approved it, in {n} {}. ▌ and yellow: new or changed.{} `n` goes to the next change.",
             if n == 1 { "place" } else { "places" },
             if gone {
                 " − and grey: what was there before and is gone."
@@ -3660,8 +3668,9 @@ fn approval_view(
     // The first line is the same sentence for every routine: this one
     // says more.
     if marks.first() == Some(&Diff::Same) {
-        lines[0] =
-            format!("{what} It runs on schedule only once you approve exactly what follows.");
+        lines[0] = keys(&format!(
+            "{what} It runs on schedule only once you approve exactly what follows."
+        ));
     }
     (lines, marks)
 }
@@ -4000,9 +4009,74 @@ mod tests {
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
         t.draw(|f| ui::draw(f, a)).unwrap();
         let buf = t.backend().buffer().clone();
-        (0..h)
+        let rows: Vec<String> = (0..h)
             .map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect())
-            .collect()
+            .collect();
+        // The mark around a key is for drawing only: it never shows.
+        for row in &rows {
+            assert!(!row.contains(crate::theme::KEY_MARK), "{row}");
+        }
+        rows
+    }
+
+    /// The style of the cell where `text` starts on the screen.
+    fn style_at(a: &mut App, w: u16, h: u16, text: &str) -> ratatui::style::Style {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| ui::draw(f, a)).unwrap();
+        let buf = t.backend().buffer().clone();
+        for y in 0..h {
+            for x in 0..w {
+                let from: String = (x..w).map(|i| buf[(i, y)].symbol()).collect();
+                if from.starts_with(text) {
+                    return buf[(x, y)].style();
+                }
+            }
+        }
+        panic!("{text:?} is not on the screen");
+    }
+
+    #[test]
+    fn a_key_is_bold_and_in_the_accent_colour_wherever_it_stands() {
+        use ratatui::style::Modifier;
+        let is_key = |s: ratatui::style::Style| {
+            s.fg == Some(ACCENT) && s.add_modifier.contains(Modifier::BOLD)
+        };
+        let mut a = app("keylook");
+        // In the footer, with what it does in a quieter colour.
+        assert!(is_key(style_at(&mut a, 160, 40, "n new")));
+        assert_eq!(style_at(&mut a, 160, 40, "new  ").fg, Some(MUTED));
+        // Inside a sentence, in a row of the list and in the details.
+        a.select_id("weekly-cleanup");
+        assert!(is_key(style_at(&mut a, 160, 40, "a shows it for approval")));
+        assert_eq!(
+            style_at(&mut a, 160, 40, "shows it for approval").fg,
+            Some(YELLOW)
+        );
+        // In a message.
+        a.flash(keys("It is still running (`x` stops it)"), MUTED);
+        assert!(is_key(style_at(&mut a, 160, 40, "x stops it")));
+        assert_eq!(style_at(&mut a, 160, 40, "stops it").fg, Some(MUTED));
+        a.flash = None;
+        // In the approval view: its own lines, and the footer.
+        press(&mut a, KeyCode::Char('a'));
+        assert!(matches!(a.mode, Mode::Log(_)), "{:?}", a.mode);
+        press(&mut a, KeyCode::End);
+        assert!(is_key(style_at(&mut a, 160, 40, "y approves exactly this")));
+        assert!(is_key(style_at(&mut a, 160, 40, "Esc leaves it waiting")));
+        press(&mut a, KeyCode::Esc);
+        // In the help, where the headings are not in the keys' colour.
+        press(&mut a, KeyCode::Char('?'));
+        assert!(is_key(style_at(&mut a, 160, 60, "PgUp PgDn  g G")));
+        assert!(is_key(style_at(&mut a, 160, 60, "Home, End)")));
+        assert!(!is_key(style_at(&mut a, 160, 60, "Routines and cron jobs")));
+        press(&mut a, KeyCode::Esc);
+        // In a right-click menu and on a grey button.
+        press(&mut a, KeyCode::Char('q'));
+        assert!(is_key(style_at(&mut a, 160, 40, "n stay")));
+        assert_eq!(
+            style_at(&mut a, 160, 40, "stay").fg,
+            Some(crate::theme::TEXT)
+        );
     }
 
     fn press(a: &mut App, code: KeyCode) {
@@ -5885,8 +5959,14 @@ mod tests {
         for (w, h) in [(160, 50), (80, 24), (60, 20)] {
             let all = screen(&mut a, w, h).join("\n");
             assert!(all.contains("Keep the computer awake"), "{all}");
-            assert!(all.contains("No idle sleep while a run is going"), "{all}");
-            assert!(all.contains("lid closed still goes to sleep"), "{all}");
+            assert!(
+                all.contains("The computer stays awake while a run is going"),
+                "{all}"
+            );
+            // The screen is not kept on, and the note under the choices
+            // says so (it wraps, so only its words are looked for).
+            assert!(p.hint.contains("the screen still goes dark"), "{}", p.hint);
+            assert!(all.contains("dark") && all.contains("lid"), "{all}");
         }
         press(&mut a, KeyCode::Down);
         press(&mut a, KeyCode::Enter);

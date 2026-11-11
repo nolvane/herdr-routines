@@ -421,7 +421,7 @@ impl Field {
                 "The name shown in the list, such as \"Weekly dependency check\"."
             }
             Field::Prompt => {
-                "What the agent should do, written as you would type it to the agent yourself. ⏎ opens the editor."
+                "What the agent should do, written as you would type it to the agent yourself. `⏎` opens the editor."
             }
             Field::Agent => "The coding agent Herdr starts for each run.",
             Field::Mode => {
@@ -442,7 +442,7 @@ impl Field {
             Field::Every => "How long between two runs.",
             Field::Minute => "The minute of the hour it runs at, from 0 to 59, such as 15 for a quarter past.",
             Field::Days => {
-                "The days of the week it runs on. ← → move, Space switches a day on or off; 1 to 7 switch Monday to Sunday."
+                "The days of the week it runs on. `← →` move, `Space` switches a day on or off; `1` to `7` switch Monday to Sunday."
             }
             Field::MonthOn => {
                 "Which day of the month: a day by its number, the last day, the last working day (Monday to Friday), or the first, second, third, fourth or last of a weekday."
@@ -499,12 +499,12 @@ impl Field {
                 "For experts, leave empty if unsure: options added to the agent's start command, such as --add-dir ~/other to let it work in a second folder too."
             }
             Field::Enabled => {
-                "On: it runs on its schedule. Off: the routine is kept but never runs by itself; r in the list still runs it by hand."
+                "On: it runs on its schedule. Off: the routine is kept but never runs by itself; `r` in the list still runs it by hand."
             }
             Field::More => {
-                "Permission mode, model, missed times, time limit, retries, alerts, a command after the run, run history and more. They start with values that suit most routines; ⏎ shows or hides them."
+                "Permission mode, model, missed times, time limit, retries, alerts, a command after the run, run history and more. They start with values that suit most routines; `⏎` shows or hides them."
             }
-            Field::Save => "Saves the routine (Ctrl+S anywhere in the form).",
+            Field::Save => "Saves the routine (`Ctrl+S` anywhere in the form).",
         }
     }
 }
@@ -699,10 +699,10 @@ impl Form {
     pub fn hint(&self, f: Field) -> &'static str {
         match f {
             Field::Prompt if self.is_cron() => {
-                "The crontab line's command, one line, such as ~/bin/backup.sh >> ~/backup.log. It starts in your home folder; for more steps, call a script. ⏎ opens the editor."
+                "The crontab line's command, one line, such as ~/bin/backup.sh >> ~/backup.log. It starts in your home folder; for more steps, call a script. `⏎` opens the editor."
             }
             Field::Prompt if self.is_shell() => {
-                "The command or script to run in the folder, such as ./backup.sh. Several lines run one after the other. ⏎ opens the editor."
+                "The command or script to run in the folder, such as ./backup.sh. Several lines run one after the other. `⏎` opens the editor."
             }
             Field::Repeat if self.is_cron() => {
                 "How often it runs: every few minutes or hours, every day, on weekdays or the days you choose, every week, every month on a day, once on a date, each time the computer starts, or Custom for any other schedule cron knows. The next times show below."

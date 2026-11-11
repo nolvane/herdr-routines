@@ -1,6 +1,8 @@
 //! Keeps the computer awake so a run is not cut off by idle sleep:
 //! `caffeinate -i` on macOS, `systemd-inhibit` on Linux. Closing a laptop's
 //! lid still puts it to sleep; nothing a program may do changes that.
+//! Only the computer is kept awake: the screen goes dark as its settings
+//! say (`caffeinate -d` would hold it on), and runs go on behind it.
 //!
 //! The helper watches the process that started it (`-w <pid>`), so it ends
 //! with that process however it ends, and nothing is left holding the
@@ -52,8 +54,8 @@ impl Mode {
     pub fn detail(self) -> &'static str {
         match self {
             Mode::Off => "The computer sleeps as its own settings say, also in the middle of a run",
-            Mode::Runs => "No idle sleep while a run is going",
-            Mode::Always => "No idle sleep while Herdr runs, so no time is missed",
+            Mode::Runs => "The computer stays awake while a run is going",
+            Mode::Always => "The computer stays awake while Herdr runs, so no time is missed",
         }
     }
 }

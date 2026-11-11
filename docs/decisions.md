@@ -1102,3 +1102,26 @@ this size and avoids a dependency. The old line is shown and not only the
 new one, since a change that only removes words ("never delete" to
 "delete") would otherwise leave nothing to mark. A sign stands beside the
 colour so the marks also read without it.
+
+## 2026-11-11: A key has one look, also inside a sentence
+
+Every key the list names is bold and in the accent colour (`key_style`
+in `ui.rs`): in the footer, the help's key column, the right-click menus,
+on grey buttons and inside a sentence. What a key does stands beside it
+in a quieter colour, and the headings in the help are white, so the
+accent colour in a text means a key and nothing else. Buttons that are a
+coloured block (the yes button, the marked save button) stay one block.
+
+A key inside a sentence is written between backticks in the source
+("`a` shows it for approval"); `theme::keys` turns each backtick into
+U+2060 (word joiner), and `with_keys` draws what stands between two of
+them as a key. Only texts written in the code go through `theme::keys`,
+never a name or an error's text, which may hold backticks of their own.
+
+Why: the keys were bold in the text colour in the footer and plain
+inside sentences, where a single letter such as "a" could not be told
+from a word. A mark without width means every place that wraps, cuts or
+measures a text works as before, with no second kind of text to pass
+around. U+2060 is among the characters `visible_text` takes out of
+anything read from a file, so a prompt or an output cannot make part of
+itself look like a key in the output and approval views.

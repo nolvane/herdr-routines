@@ -128,6 +128,12 @@ All notable changes to this plugin. The format follows
 
 ### Changed
 
+- A key looks the same everywhere, bold and in the accent colour: in the
+  footer, in the help, in menus, on grey buttons and inside a sentence
+  ("Changed outside the list · a shows it for approval"). The headings in
+  the help are white, so only keys have that colour.
+- The choice behind "awake" says that only the computer is kept awake:
+  the screen still goes dark as its settings say, and runs go on.
 - The form starts with what a routine needs: name, what it runs with, the
   prompt (up to eight lines, with "…" when it goes on), when and where.
   Everything else is under "More settings", with the same defaults as
