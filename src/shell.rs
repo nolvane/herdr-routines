@@ -171,9 +171,15 @@ fn kill_group(pid: u32) {
     // so its pid is the group's id and no other process is in it.
     if let Ok(pid) = libc::pid_t::try_from(pid) {
         if pid > 1 {
-            // SAFETY: `killpg` takes plain integers and touches no memory.
-            unsafe {
-                libc::killpg(pid, libc::SIGKILL);
+            // More than once: a process the group was just starting when
+            // the signal went out can be missed by it, and would then run
+            // on alone. The group is still there for the next round.
+            for pause in [0, 50, 200] {
+                std::thread::sleep(Duration::from_millis(pause));
+                // SAFETY: `killpg` takes plain integers and touches no memory.
+                unsafe {
+                    libc::killpg(pid, libc::SIGKILL);
+                }
             }
         }
     }

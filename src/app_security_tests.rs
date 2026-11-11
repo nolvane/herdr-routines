@@ -368,7 +368,7 @@ fn the_approval_view_says_what_really_happens() {
     let (a, _tab) = with_cron_job("view");
     let r = Routine::load(&a.paths, "say-hi").unwrap();
     let text = approval_lines(&a.paths, &r).join("\n");
-    assert!(text.contains("as a classic cron job"), "{text}");
+    assert!(text.contains("as a cron job"), "{text}");
     assert!(text.contains("writes its line into your crontab"));
     assert!(text.contains("also when Herdr is closed"));
     assert!(text.contains("in your home folder"));

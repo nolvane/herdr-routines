@@ -3493,7 +3493,7 @@ fn approval_lines(paths: &Paths, r: &Routine) -> Vec<String> {
         ));
     }
     if r.is_cron() {
-        lines.push("Runs: a shell command, as you, without asking, as a classic cron job".into());
+        lines.push("Runs: a shell command, as you, without asking, as a cron job".into());
         lines.push(
             "Approving writes its line into your crontab. The system's cron then starts it, also when Herdr is closed, in your home folder (not in the folder above).".into(),
         );

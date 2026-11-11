@@ -51,10 +51,11 @@ impl Every {
 
     /// The text for `routine.toml`.
     pub fn text(&self) -> String {
-        let span = if self.days.is_multiple_of(7) {
-            format!("{} weeks", self.days / 7)
-        } else {
-            format!("{} days", self.days)
+        let span = match (self.days.is_multiple_of(7), self.days) {
+            (true, 7) => "1 week".to_string(),
+            (true, days) => format!("{} weeks", days / 7),
+            (false, 1) => "1 day".to_string(),
+            (false, days) => format!("{days} days"),
         };
         format!("{EVERY} {span} from {}", self.start.format(DATE_TIME))
     }

@@ -51,7 +51,10 @@ always stays).
 ## What it does
 
 - **List of routines** with their schedule in words, the next time and the
-  last run. Switch a routine on or off with one key, run it now, edit it,
+  last run. What needs you comes first: a line at the top says how many
+  runs need you, went wrong or are running and what runs next, and the
+  list is sorted the same way (`s` sorts by name instead). Switch a
+  routine on or off with one key, run it now, edit it,
   write its prompt, duplicate it (the copy starts switched off), or create
   and delete routines. The form starts with what a routine needs: its name,
   what it runs with, the prompt (its first lines show), when and where.
@@ -145,10 +148,14 @@ always stays).
 - **Runs** of all routines, newest first: status, how it was started (on
   time, catch-up, retry or by hand), how long it took, what it came to and,
   when it failed, why. "n runs ›" next to a routine (or `h`) shows only its
-  runs, and `Esc` comes back to the routine. `⏎` goes to the run's tab, `l`
-  shows its result and output, also after the tab is closed (of a very
-  long output its end), with the reason of a failure kept above the
-  output, and `f` opens the output file.
+  runs, and `Esc` comes back to the routine. `p` shows only the runs that
+  went wrong or need you, and `/` searches name, reason and result. `⏎`
+  opens a run's page: status and reason, when and how it was started, how
+  long it took, its result and the end of its output, with the keys that
+  apply (go to its tab, the whole output, stop, run again, open the file,
+  delete). `l` shows the result and output directly, also after the tab is
+  closed (of a very long output its end), with the reason of a failure kept
+  above the output, and `f` opens the output file.
 - **Output kept:** a shell command's whole output goes into a file; an
   agent's tab is saved every minute while it is open, so closing the tab by
   hand loses nothing.
@@ -307,21 +314,25 @@ their runs.
 | Key | Does |
 | --- | --- |
 | `↑` `↓` | Move (`PgUp` `PgDn` a page, `g` `G` first and last) |
-| `⏎` | Edit the routine (in Runs: go to the run's tab, or its output once the tab is closed) |
+| `⏎` | Edit the routine (in Runs: open the run's page) |
 | `n` | New: a Herdr routine, a cron job, or describe it to Claude |
 | `p` | Write the prompt or command |
 | `r` | Run now (asks first) |
 | `a` | Approve a routine that is new or was changed outside the list (shows it first) |
 | `space` | Switch on or off |
 | `c` | Duplicate the routine; the copy starts switched off |
-| `o` | Go to the tab of the last run |
+| `o` | Go to the tab of the last run (in Runs: of the run, or its output once the tab is closed) |
 | `l` | Output of the last run |
+| `x` | Stop the run that is going (asks first) |
 | `h` | The routine's runs (`Esc` comes back to it); in Runs: only this routine's runs, again for all |
+| `s` | Sort by what needs you first, or by name; the list remembers it |
+| `p` `/` | In Runs: only runs that went wrong or need you; search the runs |
 | `f` | In Runs: open the output file |
 | `d` | Delete; asks whether its runs stay in Runs or go too (in Runs: delete the run) |
 | `←` `→` `1` `2` `3` | Switch between routines, cron jobs and runs |
 | `S` | All routines and cron jobs on or off (asks first) |
 | `A` | Autostart: Herdr starts at login, or not any more (asks first) |
+| `W` | Awake: keep the computer awake during runs, always, or not |
 | `C` | Take over your crontab's other jobs: keep them as cron jobs, move or copy them |
 | `i` | Nerd Font icons or plain symbols |
 | `q` | Close the list (asks first); routines keep running |
@@ -499,7 +510,7 @@ herdr-routines status        # whether the scheduler runs
 herdr-routines release-cron  # hand managed cron jobs back to cron (see Uninstall)
 ```
 
-`fire` on a classic cron job does what `r` in the list does: it starts the
+`fire` on a cron job does what `r` in the list does: it starts the
 job in the background, as cron would run it, and returns at once;
 `runs <id>` shows how it went. For a routine Herdr runs, it waits until
 the agent is up.

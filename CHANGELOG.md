@@ -31,7 +31,15 @@ All notable changes to this plugin. The format follows
   working day of the month, the first Monday; with the next three times
   shown. In the file also `L`, `LW`, `mon#1`, `friL`,
   `@every 2 weeks from …` and cron's `@daily` and the like.
-- Stop a run from the list.
+- Stop a run from the list (`x`, asks first).
+- The Routines tab starts with what needs you: a line with how many runs
+  need you, went wrong or are running and what runs next, and the list
+  sorted the same way (`s` sorts by name; the choice is remembered). A
+  routine that waits for a free place or went wrong several times in a row
+  says so.
+- Runs: `p` shows only runs that went wrong or need you, `/` searches, and
+  `⏎` opens a run's own page with its reason, result, the end of its
+  output and what can be done with it. `o` goes to the run's tab.
 - With the Multiaccount plugin installed, a Claude Code routine can name
   the account it runs with.
 - `routines` (JSON) also prints the new settings and how many runs went
@@ -166,7 +174,7 @@ All notable changes to this plugin. The format follows
   newer dependency versions at install time. Building needs Rust 1.89 or
   newer.
 - Long lines in the output view wrap instead of being cut off.
-- `fire <id>` on a classic cron job starts it in the background as cron
+- `fire <id>` on a cron job starts it in the background as cron
   would run it (as `r` in the list does) instead of opening a tab.
 - A routine's numbers have bounds: at most 3 retries at least a minute
   apart, a time limit of at most a year, at most 100,000 runs and 36,500
