@@ -348,7 +348,7 @@ pub fn right_clicks_to_me(mine: bool) -> bool {
 }
 
 pub fn notify(title: &str, body: &str, sound: &str) {
-    let _ = call(&[
+    let shown = call(&[
         "notification",
         "show",
         title,
@@ -357,6 +357,52 @@ pub fn notify(title: &str, body: &str, sound: &str) {
         "--sound",
         sound,
     ]);
+    // Herdr is closed (a cron job runs without it): the system's own
+    // notification, so a failed job still tells someone.
+    if shown.is_err() {
+        system_notify(title, body);
+    }
+}
+
+/// Text inside the double quotes of an AppleScript string, on one line.
+fn applescript_text(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+}
+
+/// The command that shows a notification without Herdr: `osascript` on
+/// macOS, `notify-send` where a Linux desktop has it. None where neither is.
+fn system_notifier(title: &str, body: &str) -> Option<std::process::Command> {
+    let osascript = std::path::Path::new("/usr/bin/osascript");
+    if cfg!(target_os = "macos") && osascript.exists() {
+        let mut c = std::process::Command::new(osascript);
+        c.arg("-e").arg(format!(
+            "display notification \"{}\" with title \"{}\"",
+            applescript_text(body),
+            applescript_text(title)
+        ));
+        return Some(c);
+    }
+    let send = ["/usr/bin/notify-send", "/usr/local/bin/notify-send"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists())?;
+    let mut c = std::process::Command::new(send);
+    // After `--` nothing is read as an option.
+    c.args(["--app-name=herdr-routines", "--", title, body]);
+    Some(c)
+}
+
+fn system_notify(title: &str, body: &str) {
+    // Tests show nothing on the developer's screen.
+    if cfg!(test) {
+        return;
+    }
+    if let Some(command) = system_notifier(title, body) {
+        let _ = crate::shell::tool(command, Duration::from_secs(10));
+    }
 }
 
 #[cfg(test)]

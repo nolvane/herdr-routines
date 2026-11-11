@@ -222,7 +222,35 @@ pub struct RoutineFile {
     /// ...and none older than this many days (0: no limit).
     #[serde(default = "default_keep_days")]
     pub keep_days: u32,
+    #[serde(flatten)]
+    pub more: More,
 }
+
+/// Further settings of `routine.toml`, all optional. Together in one part
+/// so that code which builds a file names them once.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct More {
+    /// A missed time is caught up only when it is at most this many hours
+    /// late (0: however late, within a week). Counts for `missed = "run-once"`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub late_hours: u32,
+    /// A shell command run after a run ended, in the routine's folder, with
+    /// the run's status and result in `HERDR_ROUTINES_…` variables...
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub after_command: String,
+    /// ...after every run instead of only one that went wrong.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub after_always: bool,
+    /// Switch the routine off after this many runs in a row that went
+    /// wrong (0: never).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub off_after_failures: u32,
+}
+
+/// The most hours a missed time may be late: the week missed times are
+/// looked for.
+pub const MAX_LATE_HOURS: u32 = 168;
+pub const MAX_OFF_AFTER: u32 = 100;
 
 pub const KEEP_RUNS: u32 = 30;
 pub const KEEP_DAYS: u32 = 90;
@@ -345,6 +373,7 @@ impl Routine {
             ("folder", file.folder.as_str()),
             ("model", file.model.as_str()),
             ("check command", file.check_command.as_str()),
+            ("command after the run", file.more.after_command.as_str()),
         ];
         for (what, text) in fields {
             if has_hidden(text, false) {
@@ -422,6 +451,29 @@ impl Routine {
             return Some(format!(
                 "runs are kept for at most {MAX_KEEP_DAYS} days (0 keeps them without limit)"
             ));
+        }
+        if file.more.late_hours > MAX_LATE_HOURS {
+            return Some(format!(
+                "a missed time is caught up at most {MAX_LATE_HOURS} hours (a week) late"
+            ));
+        }
+        if file.more.off_after_failures > MAX_OFF_AFTER {
+            return Some(format!(
+                "switching off after failed runs takes 1 to {MAX_OFF_AFTER} (0: never)"
+            ));
+        }
+        if file.more.after_command.contains('\n') {
+            return Some("the command after the run is one line (for more, call a script)".into());
+        }
+        // The system's cron knows five plain fields: no last day of the
+        // month, no "every two weeks".
+        if file.runs_in == RunsIn::Cron
+            && Schedule::parse(&file.schedule).is_ok_and(|s| !s.classic())
+        {
+            return Some(
+                "a cron job takes a schedule cron itself knows (not the last day, a numbered weekday or every N weeks)"
+                    .into(),
+            );
         }
         // Cron starts its jobs in the home folder, whatever the file says:
         // a different folder here would show a place the command never
@@ -624,6 +676,7 @@ pub fn load_all(paths: &Paths) -> Vec<Routine> {
                     runs_in: RunsIn::default(),
                     keep_runs: KEEP_RUNS,
                     keep_days: KEEP_DAYS,
+                    more: More::default(),
                 },
                 prompt: String::new(),
                 problem: Some(e),
@@ -680,6 +733,10 @@ pub struct Settings {
     pub placement: String,
     /// The side of a split: `down`, `up`, `left` or `right`.
     pub split_direction: String,
+    /// How many runs Herdr starts side by side; further ones wait for a
+    /// free place (0 = no limit). Runs started by hand and cron jobs do not
+    /// count.
+    pub max_parallel: u32,
 }
 
 impl Default for Settings {
@@ -691,6 +748,7 @@ impl Default for Settings {
             icons: "nerd".into(),
             placement: "overlay".into(),
             split_direction: "down".into(),
+            max_parallel: 3,
         }
     }
 }
@@ -741,6 +799,7 @@ mod tests {
             runs_in: RunsIn::Herdr,
             keep_runs: KEEP_RUNS,
             keep_days: KEEP_DAYS,
+            more: More::default(),
         }
     }
 

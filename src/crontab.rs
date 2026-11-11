@@ -383,6 +383,7 @@ fn cron_file(name: String, schedule: String, enabled: bool) -> RoutineFile {
         runs_in: RunsIn::Herdr,
         keep_runs: crate::routine::KEEP_RUNS,
         keep_days: crate::routine::KEEP_DAYS,
+        more: Default::default(),
     }
 }
 
@@ -1134,6 +1135,13 @@ pub fn wrapper_main(me: &Path, cmd: impl AsRef<OsStr>) -> i32 {
     };
     let mut attempt = 0;
     let mut code;
+    // "Stop" in the list asks this process to end: the command is stopped
+    // and the run is written down as stopped.
+    crate::shell::stop_on_term();
+    // No idle sleep in the middle of the job, unless switched off.
+    let mut awake = crate::awake::Awake::default();
+    awake.hold(crate::awake::mode(&paths) != crate::awake::Mode::Off);
+    let settings = crate::routine::Settings::load(&paths);
     loop {
         let run = crate::scheduler::with_lock(&paths, &id, || {
             if crate::scheduler::busy(&paths, &id) {
@@ -1168,18 +1176,25 @@ pub fn wrapper_main(me: &Path, cmd: impl AsRef<OsStr>) -> i32 {
         } else {
             std::process::Stdio::null()
         };
-        let (tail, ended) =
+        let (tail, ended, stopped) =
             match crate::shell::run_as_cron(&shell, cmd, limit, input, Some(Box::new(tee()))) {
-                Some(e) => (e.tail, e.code),
+                Some(e) => (e.tail, e.code, e.stopped),
                 None => {
                     let text = format!("Could not start {shell}.\n");
                     let _ = std::fs::write(run.file(&paths, "out"), &text);
                     print!("{text}");
-                    (text, Some(127))
+                    (text, Some(127), false)
                 }
             };
         run.result = crate::runner::last_line(&tail);
         let failed = match ended {
+            // Stopped by its owner: nobody is told and nothing follows.
+            None if stopped => {
+                run.stopped_by_hand = true;
+                run.finish(Status::Closed, "Stopped in the list");
+                let _ = run.save(&paths);
+                return 143;
+            }
             Some(0) => {
                 run.finish(Status::Finished, "");
                 code = 0;
@@ -1207,29 +1222,9 @@ pub fn wrapper_main(me: &Path, cmd: impl AsRef<OsStr>) -> i32 {
         let _ = run.save(&paths);
         crate::store::prune(&paths, &id, routine.file.keep_runs, routine.file.keep_days);
         let retry = failed && run.status == Status::Failed && attempt < retries;
-        if failed && !retry {
-            crate::alert::tell(
-                &paths,
-                &run,
-                true,
-                &format!("{} failed", run.routine_name),
-                &format!(
-                    "The cron job: {}. l on the run in herdr-routines shows its output.",
-                    run.message.to_lowercase()
-                ),
-                true,
-            );
-        } else if !failed {
-            let settings = crate::routine::Settings::load(&paths);
-            crate::alert::tell(
-                &paths,
-                &run,
-                false,
-                &format!("{} finished", run.routine_name),
-                "The cron job ended without an error. Its output is in herdr-routines.",
-                settings.notify_finished,
-            );
-        }
+        // Tells the owner, counts a row of failed runs, starts the command
+        // after the run (and knows that a retry follows).
+        crate::runner::ended(&paths, &settings, &run, Some(&routine));
         if retry {
             std::thread::sleep(std::time::Duration::from_secs(u64::from(retry_delay) * 60));
             attempt += 1;
@@ -1253,6 +1248,8 @@ pub fn wrapper_main(me: &Path, cmd: impl AsRef<OsStr>) -> i32 {
             let _ = switch(&paths, &id, false);
         }
     }
+    crate::runner::wait_for_after();
+    drop(awake);
     code
 }
 

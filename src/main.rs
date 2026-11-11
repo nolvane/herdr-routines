@@ -125,6 +125,8 @@ fn fire(paths: &Paths, id: &str) -> Result<String, String> {
     })
     .ok_or_else(|| format!("{id} is already running"))?;
     let run = runner::launch(paths, &settings, &routine, run);
+    // A run that did not get going may have started its command after a run.
+    runner::wait_for_after();
     paths::log(
         paths,
         &format!(

@@ -54,6 +54,9 @@ pub enum Status {
     Closed,
     /// The check command found nothing to do, so the agent did not start.
     NothingToDo,
+    /// The agent's turn ended without the summary it was asked for: it may
+    /// have hit a usage limit or given up.
+    NoResult,
 }
 
 impl Status {
@@ -68,7 +71,24 @@ impl Status {
             Status::Skipped => "Skipped",
             Status::Closed => "Closed early",
             Status::NothingToDo => "Nothing to do",
+            Status::NoResult => "No result",
         }
+    }
+
+    /// As scripts and the command after a run get it: `needs-you`.
+    pub fn word(self) -> String {
+        serde_json::to_value(self)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_default()
+    }
+
+    /// A run that ended in a way its owner should look at.
+    pub fn problem(self) -> bool {
+        matches!(
+            self,
+            Status::Failed | Status::TimedOut | Status::Closed | Status::NoResult
+        )
     }
 
     /// Whether the run still has a live agent the scheduler watches.
@@ -154,6 +174,20 @@ pub struct Run {
     /// process (`scheduler::alive_since`).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub cron_started: String,
+    /// Seconds the computer slept while the run was going. They do not
+    /// count towards its time limit.
+    #[serde(default, skip_serializing_if = "is_zero_64")]
+    pub asleep_secs: u64,
+    /// The owner ended the run in the list: no alert, nothing after it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub stopped_by_hand: bool,
+}
+
+fn is_zero_64(n: &u64) -> bool {
+    *n == 0
+}
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -200,7 +234,17 @@ impl Run {
             attempt: 0,
             cron_pid: 0,
             cron_started: String::new(),
+            asleep_secs: 0,
+            stopped_by_hand: false,
         }
+    }
+
+    /// How long the run has been going at `now`, without the time the
+    /// computer slept.
+    pub fn awake_for(&self, now: DateTime<Local>) -> chrono::Duration {
+        let asleep = chrono::Duration::try_seconds(i64::try_from(self.asleep_secs).unwrap_or(0))
+            .unwrap_or_default();
+        (now - self.started - asleep).max(chrono::Duration::zero())
     }
 
     pub fn save(&self, paths: &Paths) -> std::io::Result<()> {
@@ -273,6 +317,17 @@ pub fn runs_of(paths: &Paths, routine_id: &str) -> Vec<Run> {
 }
 
 /// Every run of every routine, newest first.
+/// One run's record as it is on disk now.
+pub fn load(paths: &Paths, routine_id: &str, run_id: &str) -> Option<Run> {
+    if !crate::routine::valid_id(routine_id) || !valid_run_id(run_id) {
+        return None;
+    }
+    let path = paths.runs_dir(routine_id).join(format!("{run_id}.json"));
+    let bytes = paths::read_limited(&path, paths::FILE_LIMIT).ok()?;
+    let run: Run = serde_json::from_slice(&bytes).ok()?;
+    (run.routine_id == routine_id && run.id == run_id).then_some(run)
+}
+
 pub fn all_runs(paths: &Paths) -> Vec<Run> {
     let mut out = Vec::new();
     for entry in std::fs::read_dir(paths.all_runs_dir())

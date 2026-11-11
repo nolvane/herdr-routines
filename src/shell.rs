@@ -45,11 +45,54 @@ pub struct Ended {
     pub output: String,
     /// The end of the output (the same text when it is short).
     pub tail: String,
+    /// Stopped because this process was asked to end (see [`stop_on_term`]),
+    /// not for the time limit.
+    pub stopped: bool,
+}
+
+/// Set once this process got a request to end.
+static STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn note_stop(_signal: libc::c_int) {
+    STOP.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// From now on, a request to end this process (SIGTERM, as "stop" in the
+/// list sends a cron job's wrapper) stops the command it runs, with all it
+/// started, and lets the process write down how the run ended.
+pub fn stop_on_term() {
+    // SAFETY: the handler only stores into an atomic, which is allowed in
+    // a signal handler; `signal` itself takes plain values.
+    unsafe {
+        libc::signal(
+            libc::SIGTERM,
+            note_stop as extern "C" fn(libc::c_int) as libc::sighandler_t,
+        );
+    }
+}
+
+/// Asks the process `pid` to end. False when the system refused.
+pub fn ask_to_end(pid: u32) -> bool {
+    match libc::pid_t::try_from(pid) {
+        // SAFETY: `kill` takes plain integers and touches no memory.
+        Ok(pid) if pid > 1 => unsafe { libc::kill(pid, libc::SIGTERM) == 0 },
+        _ => false,
+    }
 }
 
 /// Like `run`, but keeps the output of a command stopped at the limit.
 /// None only when it could not start.
 pub fn run_full(cmd: &str, cwd: Option<&Path>, limit: Duration) -> Option<Ended> {
+    run_with(cmd, cwd, limit, &[])
+}
+
+/// [`run_full`] with further environment variables for the command.
+pub fn run_with(
+    cmd: &str,
+    cwd: Option<&Path>,
+    limit: Duration,
+    env: &[(String, String)],
+) -> Option<Ended> {
     let shell = std::env::var("SHELL")
         .ok()
         .filter(|s| !s.trim().is_empty())
@@ -61,6 +104,7 @@ pub fn run_full(cmd: &str, cwd: Option<&Path>, limit: Duration) -> Option<Ended>
         limit,
         Stdio::null(),
         None,
+        env,
     )
 }
 
@@ -75,7 +119,15 @@ pub fn run_as_cron(
     stdin: Stdio,
     sink: Option<Box<dyn Write + Send>>,
 ) -> Option<Ended> {
-    run_program(shell, &[OsStr::new("-c"), cmd], None, limit, stdin, sink)
+    run_program(
+        shell,
+        &[OsStr::new("-c"), cmd],
+        None,
+        limit,
+        stdin,
+        sink,
+        &[],
+    )
 }
 
 /// The start and the end of what a command printed.
@@ -134,11 +186,13 @@ fn run_program(
     limit: Duration,
     stdin: Stdio,
     mut sink: Option<Box<dyn Write + Send>>,
+    env: &[(String, String)],
 ) -> Option<Ended> {
     let (mut reader, writer) = std::io::pipe().ok()?;
     let mut command = Command::new(program);
     command
         .args(args)
+        .envs(env.iter().map(|(k, v)| (k, v)))
         .stdin(stdin)
         .stdout(writer.try_clone().ok()?)
         .stderr(writer)
@@ -175,11 +229,17 @@ fn run_program(
         }
     });
     let start = Instant::now();
+    let mut stopped = false;
     let code = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status.code().unwrap_or(-1)),
-            Ok(None) if start.elapsed() < limit => std::thread::sleep(Duration::from_millis(100)),
+            Ok(None)
+                if start.elapsed() < limit && !STOP.load(std::sync::atomic::Ordering::SeqCst) =>
+            {
+                std::thread::sleep(Duration::from_millis(100))
+            }
             _ => {
+                stopped = STOP.load(std::sync::atomic::Ordering::SeqCst);
                 kill_group(child.id());
                 let _ = child.kill();
                 let _ = child.wait();
@@ -194,7 +254,12 @@ fn run_program(
         std::thread::sleep(Duration::from_millis(20));
     }
     let (output, tail) = capture.lock().unwrap_or_else(|e| e.into_inner()).texts();
-    Some(Ended { code, output, tail })
+    Some(Ended {
+        code,
+        output,
+        tail,
+        stopped,
+    })
 }
 
 /// What a called tool answered.

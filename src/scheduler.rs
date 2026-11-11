@@ -52,10 +52,74 @@ pub fn due(routine: &Routine, last_checked: DateTime<Local>, now: DateTime<Local
         None => Due::Not,
         Some(slot) if now - slot <= Duration::minutes(ON_TIME) => Due::Now(slot),
         Some(slot) => match routine.file.missed {
-            Missed::RunOnce => Due::Missed(slot),
-            Missed::Skip => Due::SkipMissed(slot),
+            // Caught up, unless it is later than the routine allows: a
+            // morning briefing is no use in the evening.
+            Missed::RunOnce if !too_late(routine, slot, now) => Due::Missed(slot),
+            _ => Due::SkipMissed(slot),
         },
     }
+}
+
+/// Whether a missed time is further back than the routine catches up for.
+fn too_late(routine: &Routine, slot: DateTime<Local>, now: DateTime<Local>) -> bool {
+    let hours = routine.file.more.late_hours;
+    hours > 0 && now - slot > Duration::hours(i64::from(hours))
+}
+
+/// Routines whose time has come but that wait for a free place, because as
+/// many runs as `max_parallel` allows are going: the time they run for and
+/// how they were triggered. Kept in a file, so a restarted scheduler still
+/// knows them.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+struct Queue(std::collections::BTreeMap<String, Queued>);
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct Queued {
+    slot: DateTime<Local>,
+    trigger: Trigger,
+}
+
+impl Queue {
+    fn file(paths: &Paths) -> std::path::PathBuf {
+        paths.state.join("queue.json")
+    }
+
+    fn load(paths: &Paths) -> Queue {
+        paths::read_limited(&Queue::file(paths), paths::FILE_LIMIT)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default()
+    }
+
+    fn save(&self, paths: &Paths) {
+        if let Ok(text) = serde_json::to_vec_pretty(self) {
+            let _ = paths::write_atomic(&Queue::file(paths), &text);
+        }
+    }
+}
+
+/// The routines that wait for a free place, with the time they run for.
+pub fn waiting_for_a_place(paths: &Paths) -> std::collections::BTreeMap<String, DateTime<Local>> {
+    Queue::load(paths)
+        .0
+        .into_iter()
+        .map(|(id, q)| (id, q.slot))
+        .collect()
+}
+
+/// Names for a notification: the first few, then how many more.
+fn some_names(names: &[String]) -> String {
+    const SHOWN: usize = 4;
+    let mut text = names
+        .iter()
+        .take(SHOWN)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if names.len() > SHOWN {
+        text.push_str(&format!(" and {} more", names.len() - SHOWN));
+    }
+    text
 }
 
 /// Runs `f` while holding the routine's lock file, so the scheduler, a
@@ -98,7 +162,7 @@ fn fire_attempt(
     let prepared = with_lock(paths, &routine.id, || {
         if busy(paths, &routine.id) {
             if let Some(slot) = slot {
-                runner::skip(paths, routine, trigger, slot);
+                runner::skip(paths, routine, trigger, slot, runner::STILL_GOING);
             }
             return None;
         }
@@ -162,11 +226,17 @@ impl Waiting {
 }
 
 /// One round: start what is due, follow active runs, close old tabs.
+///
+/// `going` is how many runs were starting or running after the last round
+/// and is set anew; `asleep` is how many seconds the computer slept since
+/// the last round that went through.
 fn tick(
     paths: &Paths,
     checked: &mut Checked,
     launches: &mut Vec<JoinHandle<()>>,
     round: u64,
+    going: &mut usize,
+    asleep: u64,
 ) -> Result<(), herdr::Error> {
     let settings = Settings::load(paths);
     // Reachability first, so a gone server ends the loop and nothing is
@@ -180,6 +250,17 @@ fn tick(
 
     let server = paths.server_id();
     let mut started = Started::load(paths);
+    let mut queue = Queue::load(paths);
+    let queue_before = queue.clone();
+    // Runs begun in this round; with those going they must stay within
+    // `max_parallel`.
+    let mut begun = 0usize;
+    let limit = settings.max_parallel as usize;
+    let was_going = *going;
+    let free = |begun: usize| limit == 0 || was_going + begun < limit;
+    // What happened to times missed while Herdr or the computer was off,
+    // told in one notification.
+    let (mut caught_up, mut skipped): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
     for r in &routines {
         // Cron jobs: the crontab starts them (`crontab::wrapper_main`).
         if r.is_cron() {
@@ -214,27 +295,45 @@ fn tick(
         // Off, broken or changed outside the list without the owner's
         // approval: no run, and no catch-up for the times passed meanwhile.
         if !r.file.enabled || !r.can_run() {
+            queue.0.remove(&r.id);
             continue;
         }
         if at_start {
             // Once per Herdr server, not per scheduler (it restarts on
-            // updates).
-            if started.0.get(&r.id) != Some(&server) {
+            // updates). Without a free place it waits for the next round.
+            if started.0.get(&r.id) != Some(&server) && free(begun) {
                 started.0.insert(r.id.clone(), server.clone());
-                launches.extend(fire(paths, &settings, r, Trigger::Start, None));
+                let launch = fire(paths, &settings, r, Trigger::Start, None);
+                begun += usize::from(launch.is_some());
+                launches.extend(launch);
             }
             continue;
         }
-        if let Some(launch) = retry(paths, &settings, r, now) {
-            launches.push(launch);
-            continue;
+        if free(begun) {
+            if let Some(launch) = retry(paths, &settings, r, now) {
+                begun += 1;
+                launches.push(launch);
+                continue;
+            }
         }
         let once = matches!(r.schedule(), Some(Schedule::Once(_)));
-        let launch = match due(r, last, now) {
-            Due::Not => None,
-            Due::Now(slot) => fire(paths, &settings, r, Trigger::Scheduled, Some(slot)),
-            Due::Missed(slot) => fire(paths, &settings, r, Trigger::Missed, Some(slot)),
+        let name = crate::app::visible_text(&r.file.name);
+        // What should start now: a time that just came, a missed one that
+        // is caught up, or one that has been waiting for a free place.
+        let waiting_place = queue.0.get(&r.id).map(|q| (q.trigger, q.slot));
+        let wanted = match due(r, last, now) {
+            Due::Not => waiting_place,
+            Due::Now(slot) => Some((Trigger::Scheduled, slot)),
+            Due::Missed(slot) => Some((Trigger::Missed, slot)),
             Due::SkipMissed(slot) => {
+                let why = if r.file.missed == Missed::Skip {
+                    "Missed while Herdr or the computer was off; skipped as set".to_string()
+                } else {
+                    format!(
+                        "Missed by more than {} hours; skipped as set",
+                        r.file.more.late_hours
+                    )
+                };
                 paths::log(
                     paths,
                     &format!(
@@ -243,9 +342,37 @@ fn tick(
                         slot.format("%Y-%m-%d %H:%M")
                     ),
                 );
+                // A row in Runs, so the gap shows there.
+                runner::skip(paths, r, Trigger::Missed, slot, &why);
+                skipped.push(name.clone());
+                waiting_place
+            }
+        };
+        let launch = match wanted {
+            None => None,
+            Some((trigger, slot)) if free(begun) => {
+                queue.0.remove(&r.id);
+                let launch = fire(paths, &settings, r, trigger, Some(slot));
+                if trigger == Trigger::Missed && launch.is_some() {
+                    caught_up.push(name.clone());
+                }
+                launch
+            }
+            Some((trigger, slot)) => {
+                if queue
+                    .0
+                    .insert(r.id.clone(), Queued { slot, trigger })
+                    .is_none()
+                {
+                    paths::log(
+                        paths,
+                        &format!("{}: waits for a free place ({limit} runs at once)", r.id),
+                    );
+                }
                 None
             }
         };
+        begun += usize::from(launch.is_some());
         if once && launch.is_some() {
             // A single run switches its routine off once it started. It
             // ran approved, so it stays approved (off), as `space` would.
@@ -264,6 +391,24 @@ fn tick(
         .0
         .retain(|id, _| routines.iter().any(|r| &r.id == id));
     started.save(paths);
+    queue.0.retain(|id, _| routines.iter().any(|r| &r.id == id));
+    if queue != queue_before {
+        queue.save(paths);
+    }
+    if !caught_up.is_empty() || !skipped.is_empty() {
+        let mut parts = Vec::new();
+        if !caught_up.is_empty() {
+            parts.push(format!("Caught up now: {}.", some_names(&caught_up)));
+        }
+        if !skipped.is_empty() {
+            parts.push(format!("Skipped as set: {}.", some_names(&skipped)));
+        }
+        herdr::notify(
+            "Routines missed their time while Herdr or the computer was off",
+            &parts.join(" "),
+            "none",
+        );
+    }
     // Approved or gone: the next wait is announced again.
     waiting.retain(|id| routines.iter().any(|r| &r.id == id && !r.approved));
     if waiting != waiting_before {
@@ -274,12 +419,17 @@ fn tick(
     // Routines with a run that ended in this round: their history is
     // pruned right away.
     let mut ended: BTreeSet<String> = BTreeSet::new();
+    let mut now_going = 0usize;
+    // The routine as approved, for what follows a run's end.
+    let approved = |id: &str| routines.iter().find(|r| r.id == id && r.can_run());
     for mut run in store::all_runs(paths) {
         if run.cron_pid != 0 {
             // A cron job's run belongs to its process; only one that ended
             // without finishing the record is closed here.
             if run.status.active() && !alive_since(run.cron_pid, &run.cron_started) {
                 run.finish(Status::Closed, "The cron run ended before it finished");
+                let routine = approved(&run.routine_id);
+                runner::ended(paths, &settings, &run, routine);
                 let _ = run.save(paths);
             }
             continue;
@@ -290,6 +440,8 @@ fn tick(
             if !paths::server_alive(&run.server) && (run.status.active() || !run.tab_closed) {
                 if run.status.active() {
                     run.finish(Status::Closed, "Its Herdr session ended before it finished");
+                    let routine = approved(&run.routine_id);
+                    runner::ended(paths, &settings, &run, routine);
                 }
                 run.tab_closed = true;
                 let _ = run.save(paths);
@@ -297,6 +449,11 @@ fn tick(
             continue;
         }
         if run.status.active() {
+            // Time the computer slept is not the run's.
+            if asleep > 0 {
+                run.asleep_secs = run.asleep_secs.saturating_add(asleep);
+                let _ = run.save(paths);
+            }
             let routine = routines.iter().find(|r| r.id == run.routine_id);
             if runner::watch(paths, &settings, &mut run, routine) {
                 paths::log(
@@ -307,11 +464,16 @@ fn tick(
                     ended.insert(run.routine_id.clone());
                 }
             }
+            // A run that waits for its owner takes no place.
+            if matches!(run.status, Status::Starting | Status::Running) {
+                now_going += 1;
+            }
         } else {
             runner::tidy(paths, &settings, &mut run, in_view);
         }
     }
     prune(paths, &routines, &ended, round);
+    *going = now_going;
     Ok(())
 }
 
@@ -609,7 +771,27 @@ pub fn run(paths: &Paths) -> i32 {
     let mut pause = 0u32;
     // The server this scheduler serves went away (its socket is gone).
     let mut server_gone = false;
+    // Runs starting or running after the last round.
+    let mut going = 0usize;
+    let mut awake = crate::awake::Awake::default();
+    // The wall clock goes on while the computer sleeps, the steady clock
+    // does not: what the first is ahead by is the time slept. It is kept
+    // until a round goes through.
+    let mut clocks = (std::time::SystemTime::now(), std::time::Instant::now());
+    let mut asleep = 0u64;
     loop {
+        let now = (std::time::SystemTime::now(), std::time::Instant::now());
+        let wall = now.0.duration_since(clocks.0).unwrap_or_default();
+        let slept = wall.saturating_sub(now.1.duration_since(clocks.1));
+        clocks = now;
+        // Less is the clock being set, not sleep.
+        if slept.as_secs() >= 30 {
+            paths::log(
+                paths,
+                &format!("the computer slept for about {} min", slept.as_secs() / 60),
+            );
+            asleep = asleep.saturating_add(slept.as_secs());
+        }
         if read_pid(paths).map(|(p, _, _)| p) != Some(me) {
             paths::log(
                 paths,
@@ -628,12 +810,27 @@ pub fn run(paths: &Paths) -> i32 {
             sleep(TICK);
             continue;
         }
-        match tick(paths, &mut checked, &mut launches, round) {
+        match tick(
+            paths,
+            &mut checked,
+            &mut launches,
+            round,
+            &mut going,
+            asleep,
+        ) {
             Ok(()) => {
                 if failures >= MAX_FAILURES {
                     paths::log(paths, "Herdr answers again");
                 }
                 failures = 0;
+                asleep = 0;
+                // No idle sleep in the middle of a run, or at all while
+                // Herdr runs, as chosen in the list.
+                awake.hold(match crate::awake::mode(paths) {
+                    crate::awake::Mode::Always => true,
+                    crate::awake::Mode::Runs => going > 0,
+                    crate::awake::Mode::Off => false,
+                });
             }
             Err(e) => {
                 failures += 1;
@@ -676,6 +873,8 @@ pub fn run(paths: &Paths) -> i32 {
     for handle in launches {
         let _ = handle.join();
     }
+    runner::wait_for_after();
+    drop(awake);
     if read_pid(paths).map(|(p, _, _)| p) == Some(me) {
         let _ = std::fs::remove_file(paths.pid_file());
         // Another Herdr server was left without a scheduler because this
@@ -726,6 +925,7 @@ mod tests {
                 runs_in: Default::default(),
                 keep_runs: crate::routine::KEEP_RUNS,
                 keep_days: crate::routine::KEEP_DAYS,
+                more: Default::default(),
             },
             prompt: "go".into(),
             problem: None,
@@ -856,5 +1056,145 @@ mod tests {
         }
         prune(&p, &all(&p), &BTreeSet::new(), 0);
         assert_eq!(store::runs_of(&p, "other").len(), 3);
+    }
+
+    #[test]
+    fn a_missed_time_is_caught_up_only_within_its_window() {
+        let mut r = routine("0 8 * * *", Missed::RunOnce);
+        // However late, as before.
+        assert_eq!(due(&r, t(7, 0), t(12, 30)), Due::Missed(t(8, 0)));
+        r.file.more.late_hours = 2;
+        assert_eq!(due(&r, t(7, 0), t(9, 30)), Due::Missed(t(8, 0)));
+        assert_eq!(due(&r, t(7, 0), t(12, 30)), Due::SkipMissed(t(8, 0)));
+        // On time is on time.
+        assert_eq!(due(&r, t(7, 0), t(8, 2)), Due::Now(t(8, 0)));
+    }
+
+    /// A stand-in for `herdr` that answers every call with an empty object,
+    /// for this thread: the round goes through, and what it launches (in
+    /// other threads, which have no Herdr) fails to open a tab.
+    fn fake_herdr(p: &Paths) {
+        use std::os::unix::fs::PermissionsExt;
+        let script = p.state.join("fake-herdr");
+        std::fs::write(&script, "#!/bin/sh\necho '{}'\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        herdr::use_fake(Some(&script));
+    }
+
+    fn shell_routine(p: &Paths, id: &str, schedule: &str, missed: Missed) {
+        let mut r = routine(schedule, missed);
+        r.id = id.into();
+        r.file.name = id.to_uppercase();
+        r.file.agent = "shell".into();
+        r.prompt = "true".into();
+        r.save_approved(p).unwrap();
+    }
+
+    #[test]
+    fn runs_wait_for_a_free_place_and_start_when_one_is_free() {
+        let p = temp_paths("queue");
+        std::fs::create_dir_all(&p.config).unwrap();
+        std::fs::write(p.settings_file(), "max_parallel = 1\n").unwrap();
+        fake_herdr(&p);
+        // Three single runs, all due this minute.
+        let now = Local::now();
+        let slot = now.format("%Y-%m-%d %H:%M").to_string();
+        let mut checked = Checked::default();
+        for id in ["a", "b", "c"] {
+            shell_routine(&p, id, &format!("@once {slot}"), Missed::RunOnce);
+            checked.0.insert(id.into(), now - Duration::minutes(2));
+        }
+        let (mut launches, mut going) = (Vec::new(), 0usize);
+        tick(&p, &mut checked, &mut launches, 1, &mut going, 0).unwrap();
+        let waiting: Vec<String> = waiting_for_a_place(&p).into_keys().collect();
+        assert_eq!(waiting, ["b", "c"]);
+        for h in launches.drain(..) {
+            h.join().unwrap();
+        }
+        assert_eq!(store::runs_of(&p, "a").len(), 1);
+        assert!(store::runs_of(&p, "b").is_empty());
+        // The place is taken: nothing more starts.
+        going = 1;
+        tick(&p, &mut checked, &mut launches, 2, &mut going, 0).unwrap();
+        assert!(store::runs_of(&p, "b").is_empty());
+        assert_eq!(waiting_for_a_place(&p).len(), 2);
+        // It is free again: the next one in line runs for its own time.
+        going = 0;
+        tick(&p, &mut checked, &mut launches, 3, &mut going, 0).unwrap();
+        for h in launches.drain(..) {
+            h.join().unwrap();
+        }
+        let waiting: Vec<String> = waiting_for_a_place(&p).into_keys().collect();
+        assert_eq!(waiting, ["c"]);
+        let b = store::runs_of(&p, "b");
+        assert_eq!(b.len(), 1);
+        assert_eq!(
+            b[0].slot.map(|s| s.format("%Y-%m-%d %H:%M").to_string()),
+            Some(slot)
+        );
+        // No limit: the last one goes at once, whatever is going.
+        std::fs::write(p.settings_file(), "max_parallel = 0\n").unwrap();
+        going = 5;
+        tick(&p, &mut checked, &mut launches, 4, &mut going, 0).unwrap();
+        for h in launches.drain(..) {
+            h.join().unwrap();
+        }
+        assert!(waiting_for_a_place(&p).is_empty());
+        runner::wait_for_after();
+        herdr::use_fake(None);
+    }
+
+    #[test]
+    fn a_skipped_missed_time_shows_in_the_runs_and_sleep_is_not_run_time() {
+        let p = temp_paths("skipnote");
+        fake_herdr(&p);
+        // Daily at the time it was two hours ago, last looked at five hours
+        // ago: one missed time, and the routine skips those.
+        let now = Local::now();
+        let missed = now - Duration::hours(2);
+        shell_routine(
+            &p,
+            "s",
+            &missed.format("%-M %-H * * *").to_string(),
+            Missed::Skip,
+        );
+        let mut checked = Checked::default();
+        checked.0.insert("s".into(), now - Duration::hours(5));
+        // A run that was going while the computer slept for ten minutes.
+        let mut going_run = Run::new("s", "S", "shell", Trigger::Manual, None);
+        going_run.status = Status::Running;
+        going_run.server = p.server_id();
+        going_run.save(&p).unwrap();
+        let (mut launches, mut going) = (Vec::new(), 0usize);
+        tick(&p, &mut checked, &mut launches, 1, &mut going, 600).unwrap();
+        for h in launches.drain(..) {
+            h.join().unwrap();
+        }
+        let notes: Vec<Run> = store::runs_of(&p, "s")
+            .into_iter()
+            .filter(|r| r.status == Status::Skipped)
+            .collect();
+        assert_eq!(notes.len(), 1);
+        assert!(
+            notes[0].message.starts_with("Missed while"),
+            "{}",
+            notes[0].message
+        );
+        assert_eq!(notes[0].trigger, Trigger::Missed);
+        // Told once: the next round has nothing new to say.
+        tick(&p, &mut checked, &mut launches, 2, &mut going, 0).unwrap();
+        let skipped = |id: &str| {
+            store::runs_of(&p, id)
+                .iter()
+                .filter(|r| r.status == Status::Skipped)
+                .count()
+        };
+        assert_eq!(skipped("s"), 1);
+        // The sleep was added to the run that was going, once.
+        let kept = store::load(&p, "s", &going_run.id).unwrap();
+        assert_eq!(kept.asleep_secs, 600);
+        let hour = Duration::hours(1);
+        assert!(kept.awake_for(kept.started + hour) <= hour - Duration::minutes(10));
+        herdr::use_fake(None);
     }
 }
