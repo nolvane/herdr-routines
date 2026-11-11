@@ -16,6 +16,13 @@ done
 step() { printf '\n==> %s\n' "$1"; }
 
 step "Secret scan";  gitleaks git --redact --no-banner
+# Known vulnerabilities in the dependencies, where cargo-audit is installed
+# (`cargo install cargo-audit`); the checks never install tools themselves.
+if cargo audit --version >/dev/null 2>&1; then
+  step "Dependency audit"; cargo audit
+else
+  step "Dependency audit"; echo "skipped: cargo-audit is not installed"
+fi
 step "Format";       cargo fmt --check
 step "Lint";         cargo clippy --all-targets --locked -- -D warnings
 step "Unit tests";   cargo test --locked
