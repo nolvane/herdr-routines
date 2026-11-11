@@ -799,3 +799,121 @@ so when it is not.
 Why: the default features also bring the macros crate and the calendar
 widget, which the list does not use; fewer dependencies are less to
 audit. The checks never install tools themselves.
+
+## 2026-11-11: The footer and the mouse belong to what is open
+
+`ui::draw` draws the page (list, form or editor), then clears the click
+areas when a dialog is open, then draws the dialog and last the footer. So
+under a dialog only the dialog's own areas and its keys in the footer can be
+clicked. The footer's keys come from one place (`footer_keys`), by what is
+open: the list (by tab and by what the row can do), the form (by the kind of
+field), the editor, or the dialog. Every dialog is drawn through `dialog()`,
+which records its place, and a click beside it closes it like Esc. Dialogs
+stay between the header and the footer and scroll or drop their gaps when
+the window is smaller than they are.
+
+Why: the footer kept the list's keys under a dialog. With the delete
+question open, a click where "r run now" was sent `r`, which there means
+"delete with all its runs".
+
+## 2026-11-11: Lists keep a scroll offset, and the cursor its item
+
+Each list (routines, cron jobs, runs) has its own offset in `App::tops`.
+Drawing moves it only when a key moved the cursor out of the window
+(`App::follow`); the wheel changes the offset and leaves the cursor, and a
+click never changes it. A reload puts each cursor back on the routine, cron
+job or run it was on (by id, not by row number), and a scrolled list moves
+its offset along with rows that came in above. Lists, lists to choose from,
+the form, the help and the output view say which part shows.
+
+Why: the offset was worked out from the cursor on every draw, so a click in
+a scrolled list moved the rows under the mouse and the second click of a
+double click landed on another row. A new run on top moved the cursor to
+another run.
+
+## 2026-11-11: One mouse rule, no double click
+
+A click marks a row or a field; a click on what is marked opens it. What
+does only one thing acts on the first click: tabs, header chips, footer
+keys, buttons, `‹` `›`, the entries of a list to choose from, "More
+settings", the prompt row and the "n runs ›" text (only the text, not its
+cell). The row under the mouse is lit. There is no timing: the second click
+may come at any time.
+
+Why: rows needed a double click, lists to choose from a click and then
+Enter, some cells acted on one click and others not. A rule without timing
+also works over slow connections.
+
+## 2026-11-11: A short form, the rest under "More settings"
+
+The form shows name, "Runs with", the prompt, when and where (for a shell
+command also "Runs in"), then one row "More settings" that shows or hides
+everything else: permission mode, model, effort, check, earlier results,
+extra options, on or off, missed times, time limit, retries, alerts and run
+history. The hidden fields keep the defaults they had, for new routines and
+when editing; the row sums up in a few words what is set there. The
+save button is outside the scrolling fields, so it always shows. Text
+fields have a cursor (`Form::cursor`, counted in characters).
+
+Why: a new routine needs four things, and the form asked for twenty. The
+schedule fields and their logic are unchanged.
+
+## 2026-11-11: The list takes the shape that fits
+
+`routine_shape` picks one of three shapes by width: all columns (from 80
+columns), the last run in the routine's second line, or the routine alone
+with last run and next time in its second line. Column widths come from
+what the rows hold, within limits; when room is short the schedule gives
+way first, down to a floor, and the name takes the rest.
+Every cell is cut with "…" (`clip_line`), never at the edge. The details
+show whenever rows are free below the list, not only in a tall window.
+
+Why: below 94 columns the "Last run" column was dropped, so a failed run
+was invisible in a split pane, where the list is used most.
+
+## 2026-11-11: The header is a list of chips with a defined order
+
+`chips()` returns the header's chips left to right, each with a long and a
+short label, a style, its key and whether it is a warning (`keep`).
+`plans()` lists the ways to fit them, tried in order: all long, without the
+title, the chips that are no warning short, those dropped one by one from
+the left, the tabs without counts, the tabs with short names, and at last
+the warning short. A tab is never cut and a warning never goes. A new chip
+is one more entry in `chips()`.
+
+Why: the header cut the last tab in a narrow window and dropped "routines
+off", the one thing that must be seen, before the title.
+
+## 2026-11-11: Problems stay in the footer until the next key
+
+A message takes the room beside the keys when it is short and the whole
+footer, over up to three rows, when it is long. Red and yellow messages
+stay until the next key or click; the others go after five seconds as
+before. One that is longer than three rows ends in "…".
+
+Why: messages were cut at the footer's width without a sign, and an error
+went away after five seconds whether it was read or not.
+
+## 2026-11-11: Which questions Enter answers
+
+`y` always answers yes and has a button named after what it does. Enter
+answers yes only where the same key undoes it: all routines on or off,
+autostart, taking over cron jobs. Deleting, discarding (form or editor) and
+running by hand need `y` itself, as the project's rules ask. Keeping or
+moving cron jobs now asks first, since both change the crontab; copying
+does not.
+
+Why: some questions took Enter and others not, with nothing on screen to
+tell them apart, and `C` then `m` changed the crontab without asking.
+
+## 2026-11-11: One name per thing
+
+The list, the form, the details, the menu, the help and the README use one
+word each: "cron job" (not "classic cron job"), "Runs with" (the agent or
+shell command), "Extra options", "Alerts", "Run history", "Switched" on or
+off, "duplicate", "take over" (a job that is "only in your crontab"),
+"autostart", "output" of a run. File keys (`args`, `keep_runs`, `alert`)
+keep their names.
+
+Why: the same thing had up to three names in different places, so the help
+did not match the form and the README matched neither.
