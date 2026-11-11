@@ -367,7 +367,7 @@ fn running_by_hand_checks_the_routine_again() {
 fn the_approval_view_says_what_really_happens() {
     let (a, _tab) = with_cron_job("view");
     let r = Routine::load(&a.paths, "say-hi").unwrap();
-    let text = approval_lines(&r).join("\n");
+    let text = approval_lines(&a.paths, &r).join("\n");
     assert!(text.contains("as a classic cron job"), "{text}");
     assert!(text.contains("writes its line into your crontab"));
     assert!(text.contains("also when Herdr is closed"));
@@ -376,9 +376,9 @@ fn the_approval_view_says_what_really_happens() {
     assert!(!text.contains("Warning"));
     // Extra arguments are called out, whatever they are.
     let mut r = Routine::load(&a.paths, "morning-report").unwrap();
-    assert!(!approval_lines(&r).join("\n").contains("Warning"));
+    assert!(!approval_lines(&a.paths, &r).join("\n").contains("Warning"));
     r.file.args = vec!["--verbose".into()];
-    let text = approval_lines(&r).join("\n");
+    let text = approval_lines(&a.paths, &r).join("\n");
     assert!(
         text.contains("Warning: it has extra arguments (--verbose)"),
         "{text}"

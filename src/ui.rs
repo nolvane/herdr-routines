@@ -1232,6 +1232,50 @@ fn draw_details(frame: &mut Frame, app: &App, icons: &Icons, r: &Routine, area: 
             w,
         ));
     }
+    if f.missed == crate::routine::Missed::RunOnce && f.more.late_hours > 0 {
+        lines.push(detail_row(
+            "If missed",
+            text(
+                crate::form::late_text(f.more.late_hours)
+                    .0
+                    .to_lowercase()
+                    .replacen("run once", "runs once", 1),
+            ),
+            w,
+        ));
+    }
+    if f.more.off_after_failures > 0 {
+        lines.push(detail_row(
+            "Switches off",
+            text(format!(
+                "after {}",
+                crate::form::off_after_text(f.more.off_after_failures).0
+            )),
+            w,
+        ));
+    }
+    if !f.more.after_command.trim().is_empty() {
+        let when = if f.more.after_always {
+            "after every run"
+        } else {
+            "after a run that went wrong"
+        };
+        lines.push(detail_row(
+            "After the run",
+            vec![
+                plain(f.more.after_command.trim().to_string(), TEXT),
+                plain(format!(" · {when}"), FAINT),
+            ],
+            w,
+        ));
+    }
+    if !f.more.account.is_empty() && !r.is_shell() {
+        lines.push(detail_row(
+            "Account",
+            text(app.account_name(&f.more.account)),
+            w,
+        ));
+    }
     if f.alert != crate::routine::Alert::Notification {
         lines.push(detail_row(
             "Alerts",
@@ -1621,6 +1665,7 @@ fn field_value(
                     Field::Name => "required",
                     Field::Args => "none",
                     Field::Check => "none, always runs",
+                    Field::After => "nothing",
                     _ => "",
                 };
                 vec![plain(empty, FAINT)]
@@ -1658,6 +1703,8 @@ fn button(label: &str, on: bool) -> Span<'static> {
 /// place in `Form::fields`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum FormRow {
+    /// The next times the schedule comes to, under the fields of "When".
+    Next,
     Head(&'static str),
     Blank,
     Field(usize),
@@ -1665,32 +1712,84 @@ enum FormRow {
     More(usize),
 }
 
-/// The schedule in words for the When heading, such as "runs weekdays at
-/// 09:00 · next Wed 09:00", or what is wrong with it.
+/// The schedule in words for the When heading, such as "Weekdays at
+/// 09:00", or what is wrong with it.
 fn schedule_summary(form: &Form) -> Span<'static> {
-    let now = Local::now();
     match form.schedule() {
-        Ok(c) => {
-            let schedule = Schedule::parse(&c).expect("checked");
-            let next = schedule
-                .next_after(&now)
-                .map(|t| format!(" · next {}", short_time(&t, &now)))
-                .unwrap_or_default();
-            // "Weekdays at 09:00" reads "runs weekdays at 09:00"; the name
-            // of a day keeps its capital.
-            let words = schedule.describe();
-            let day = crate::form::WEEKDAYS
-                .iter()
-                .any(|d| words.starts_with(&d[..3]));
-            let mut chars = words.chars();
-            let words = match chars.next() {
-                Some(first) if !day => first.to_lowercase().chain(chars).collect::<String>(),
-                _ => words,
-            };
-            plain(format!("runs {words}{next}"), GREEN)
-        }
+        // In the schedule's own words, as the list shows it.
+        Ok(c) => plain(Schedule::parse(&c).expect("checked").describe(), GREEN),
         Err(e) => plain(e, RED),
     }
+}
+
+/// The next times the form's schedule comes to, so its owner sees that it
+/// is the one they mean; or why there are none.
+fn next_times(form: &Form, room: usize) -> Vec<Span<'static>> {
+    let none = |why: &str, color: Color| vec![plain(why.to_string(), color)];
+    match form.upcoming(3) {
+        Ok(times) if !times.is_empty() => {
+            // Whole times only: as many of the three as fit.
+            let mut v = Vec::new();
+            let mut used = 0;
+            for (i, t) in times.iter().enumerate() {
+                let text = t.format("%a %-d %b %H:%M").to_string();
+                let sep = if i > 0 { 3 } else { 0 };
+                if i > 0 && used + sep + text.width() > room {
+                    break;
+                }
+                if i > 0 {
+                    v.push(plain(" · ", FAINT));
+                }
+                used += sep + text.width();
+                v.push(plain(text, TEXT));
+            }
+            v
+        }
+        Ok(_) if form.repeat == crate::form::Repeat::AtStart && form.is_cron() => {
+            none("each time the computer starts", MUTED)
+        }
+        Ok(_) if form.repeat == crate::form::Repeat::AtStart => {
+            none("each time Herdr starts", MUTED)
+        }
+        Ok(_) => none("never: that time has passed", YELLOW),
+        Err(_) => none("–", FAINT),
+    }
+}
+
+/// The weekday switches: a sign and the day's name each, as wide as the
+/// room allows. Returns where each day is, for the mouse.
+fn day_switches(form: &Form, selected: bool, room: usize) -> (Vec<Span<'static>>, Vec<(u16, u16)>) {
+    // Long names, then closer together, then two letters.
+    let (letters, sign_gap, gap) = if room >= 47 {
+        (3, " ", "  ")
+    } else if room >= 41 {
+        (3, " ", " ")
+    } else {
+        (2, "", " ")
+    };
+    let mut spans = Vec::new();
+    let mut places = Vec::new();
+    let mut x = 0u16;
+    for (i, name) in crate::form::WEEKDAYS.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw(gap));
+            x += gap.width() as u16;
+        }
+        let on = form.days[i];
+        let sign = if on { "●" } else { "○" };
+        let text = format!("{sign}{sign_gap}{}", &name[..letters]);
+        let mut style = Style::new().fg(if on { GREEN } else { MUTED });
+        if selected && form.day_cursor == i {
+            style = style
+                .fg(if on { GREEN } else { TEXT })
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+        }
+        let w = text.width() as u16;
+        places.push((x, w));
+        x += w;
+        spans.push(Span::styled(text, style));
+    }
+    (spans, places)
 }
 
 /// The form: what the routine does, when and where it runs, then "More
@@ -1746,6 +1845,14 @@ fn draw_form(frame: &mut Frame, app: &mut App, area: Rect) {
                 last = s;
             }
             rows.push(FormRow::Field(i));
+            // The part "When" ends with the times it comes to.
+            let last_of_when = s == "When"
+                && fields
+                    .get(i + 1)
+                    .is_none_or(|next| form.section(*next) != "When");
+            if last_of_when {
+                rows.push(FormRow::Next);
+            }
         }
         rows
     };
@@ -1807,11 +1914,18 @@ fn draw_form(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 
     let schedule_words = schedule_summary(&form);
+    let upcoming = next_times(&form, value_w);
     for (r, layout_row) in rows.iter().enumerate().skip(top).take(list_h) {
         let y = inner.y + (r - top) as u16;
         let row = Rect::new(inner.x, y, inner.width, 1);
         let i = match layout_row {
             FormRow::Blank => continue,
+            FormRow::Next => {
+                let mut spans = vec![plain(format!(" {:<w$}", "Next times", w = LABEL_W), FAINT)];
+                spans.extend(upcoming.clone());
+                frame.render_widget(Paragraph::new(clip_line(Line::from(spans), width)), row);
+                continue;
+            }
             FormRow::Head(name) => {
                 let mut spans = vec![Span::styled(format!(" {name}"), bold(ACCENT))];
                 if *name == "When" {
@@ -1858,6 +1972,14 @@ fn draw_form(frame: &mut Frame, app: &mut App, area: Rect) {
                 spans.push(plain("empty · ⏎ writes it", YELLOW));
             } else {
                 spans.extend(preview_line(0));
+            }
+        } else if f == Field::Days {
+            let (value, places) = day_switches(&form, selected, value_w);
+            spans.extend(value);
+            // A click on a day switches it.
+            for (day, (dx, w)) in places.into_iter().enumerate() {
+                app.hits
+                    .push((Rect::new(value_x + dx, y, w, 1), Hit::Day(day)));
             }
         } else {
             let (value, arrows) = field_value(&form, f, selected, value_w);
@@ -2204,10 +2326,15 @@ fn form_keys(form: &Form) -> Vec<FootKey> {
         Field::Save => "save",
         Field::More if form.more => "hide",
         Field::More => "show",
+        Field::Days => "switch the day",
         f if f.is_choice() => "choose",
         _ => "next",
     };
     let mut v = vec![foot("⏎", enter, ENTER, 0)];
+    if f == Field::Days {
+        v.push(foot("← →", "day", None, 2));
+        v.push(foot("1-7", "Mon to Sun", None, 4));
+    }
     if f.is_choice() {
         v.push(foot("← →", "change", None, 2));
     }

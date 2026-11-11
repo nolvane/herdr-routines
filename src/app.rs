@@ -83,6 +83,8 @@ pub enum Hit {
     Cycle(usize, i8),
     /// A way to take over cron jobs, in the dialog that offers them.
     Take(usize),
+    /// A weekday switch in the form (Monday is 0).
+    Day(usize),
 }
 
 /// Runs the system's opener (first argument) on a web link, true when it
@@ -446,6 +448,8 @@ pub struct App {
     /// then, and whether they were the approved ones. Saving approves what
     /// it writes only when both still hold (`opened_approved`).
     opened: Option<(String, crate::approval::Snapshot, bool)>,
+    /// The accounts of the Multiaccount plugin, when it is installed.
+    pub accounts: Option<Vec<crate::accounts::Account>>,
 }
 
 impl App {
@@ -490,6 +494,7 @@ impl App {
             clip: String::new(),
             autostart_after_intro: false,
             opened: None,
+            accounts: None,
         };
         app.reload();
         app
@@ -534,6 +539,7 @@ impl App {
             None => self.all_runs.clone(),
         };
         self.scheduler = scheduler::running(&self.paths);
+        self.accounts = crate::accounts::list(&self.paths);
         if crontab_due {
             self.crontab_jobs = crate::crontab::read()
                 .map(|t| crate::crontab::parse(&t))
@@ -645,6 +651,16 @@ impl App {
             }
         }
         form.more_models = more;
+    }
+
+    /// An account of the Multiaccount plugin as the list names it.
+    pub fn account_name(&self, id: &str) -> String {
+        self.accounts
+            .iter()
+            .flatten()
+            .find(|a| a.id == id)
+            .map(|a| a.name.clone())
+            .unwrap_or_else(|| format!("{id} (not in Multiaccount any more)"))
     }
 
     /// Says something in the footer. What went wrong (red or yellow)
@@ -1172,7 +1188,9 @@ impl App {
         } else {
             paths::shorten(&cwd)
         };
-        self.form = Some(Box::new(Form::new(&folder)));
+        let mut form = Form::new(&folder);
+        form.accounts = self.accounts.clone();
+        self.form = Some(Box::new(form));
     }
 
     /// The form for a classic cron job: a shell command run by cron.
@@ -1206,7 +1224,9 @@ impl App {
                 YELLOW,
             );
         } else {
-            self.form = Some(Box::new(Form::edit(&r)));
+            let mut form = Form::edit(&r);
+            form.accounts = self.accounts.clone();
+            self.form = Some(Box::new(form));
         }
     }
 
@@ -1431,7 +1451,7 @@ impl App {
         }
         self.mode = Mode::Log(LogView {
             title: visible_text(&format!("Approve {}?", now.file.name)),
-            lines: approval_lines(&now),
+            lines: approval_lines(&self.paths, &now),
             scroll: 0,
             // Unknown until drawn, so `y` cannot approve unseen text.
             max: u16::MAX,
@@ -1795,6 +1815,7 @@ impl App {
             }
             Field::Save => self.try_save(),
             Field::More => form.toggle_more(),
+            Field::Days => form.toggle_day(form.day_cursor),
             f if f.is_choice() => self.open_picker(),
             _ => form.move_by(1),
         }
@@ -2129,6 +2150,13 @@ impl App {
             KeyCode::Right if field.is_text() => form.cursor_by(1),
             KeyCode::Home if field.is_text() => form.cursor_home(),
             KeyCode::End if field.is_text() => form.cursor_end(),
+            // On the weekday switches they move from day to day, and the
+            // digits switch Monday (1) to Sunday (7).
+            KeyCode::Left if field == Field::Days => form.day_by(-1),
+            KeyCode::Right if field == Field::Days => form.day_by(1),
+            KeyCode::Char(c @ '1'..='7') if field == Field::Days => {
+                form.toggle_day(c as usize - '1' as usize)
+            }
             KeyCode::Home => form.go(0),
             KeyCode::End => form.move_by(99),
             KeyCode::Left => form.cycle(-1),
@@ -2524,6 +2552,12 @@ impl App {
                     self.ask_import(jobs, take.1);
                 }
             }
+            Hit::Day(day) => {
+                if let (true, Some(form)) = (normal, self.form.as_mut()) {
+                    form.select(Field::Days);
+                    form.toggle_day(day);
+                }
+            }
             // From the footer: a click is never typed into a field.
             Hit::Key('?') if normal => {
                 self.help_scroll = 0;
@@ -2814,7 +2848,7 @@ pub fn visible_text(s: &str) -> String {
 
 /// The approval view: every setting of the routine and its whole prompt
 /// or command, as shown text.
-fn approval_lines(r: &Routine) -> Vec<String> {
+fn approval_lines(paths: &Paths, r: &Routine) -> Vec<String> {
     let f = &r.file;
     let mut lines = vec![
         "It was created or changed outside the list (by an agent or an editor). It runs on schedule only once you approve exactly what follows.".to_string(),
@@ -2825,7 +2859,7 @@ fn approval_lines(r: &Routine) -> Vec<String> {
             r.schedule_text(),
             if f.enabled { "" } else { " (switched off)" }
         ),
-        format!("When a time is missed: {}", f.missed.detail()),
+        format!("When a time is missed: {}", missed_words(f)),
         format!("Folder: {}", f.folder),
         format!(
             "Time limit: {} minutes{}",
@@ -2842,10 +2876,27 @@ fn approval_lines(r: &Routine) -> Vec<String> {
             f.retries, f.retry_delay_minutes
         ));
     }
+    if f.more.off_after_failures > 0 {
+        lines.push(format!(
+            "Switches itself off: after {} runs in a row that went wrong",
+            f.more.off_after_failures
+        ));
+    }
     lines.push(format!(
         "Keeps: {}",
         crate::form::keep_text(f.keep_runs, f.keep_days).1
     ));
+    if !f.more.after_command.trim().is_empty() {
+        lines.push(format!(
+            "After {} (a shell command, as you, without asking, in the folder above): {}",
+            if f.more.after_always {
+                "every run"
+            } else {
+                "a run that went wrong"
+            },
+            f.more.after_command.trim()
+        ));
+    }
     if r.is_cron() {
         lines.push("Runs: a shell command, as you, without asking, as a classic cron job".into());
         lines.push(
@@ -2869,6 +2920,13 @@ fn approval_lines(r: &Routine) -> Vec<String> {
             agent::label(agent::modes(&f.agent), &f.permission_mode)
         };
         lines.push(format!("Agent: {} · {mode}", f.agent));
+        if !f.more.account.is_empty() {
+            lines.push(format!(
+                "Account: {} (Multiaccount id {}), used also when it is at its limit",
+                crate::accounts::name_of(paths, &f.more.account),
+                f.more.account
+            ));
+        }
         let flags = agent::flags(f);
         if !flags.is_empty() {
             lines.push(format!("Options: {}", flags.join(" ")));
@@ -2896,6 +2954,15 @@ fn approval_lines(r: &Routine) -> Vec<String> {
     lines.iter().map(|l| visible_text(l)).collect()
 }
 
+/// What happens with a missed time, with the hours a catch-up run may be
+/// late.
+pub fn missed_words(f: &routine::RoutineFile) -> String {
+    match f.missed {
+        routine::Missed::RunOnce => crate::form::late_text(f.more.late_hours).1,
+        missed => missed.detail().to_string(),
+    }
+}
+
 /// What Claude is told when it creates a routine with the person.
 pub fn agent_brief(paths: &Paths) -> String {
     let dir = paths::shorten(&paths.routines_dir());
@@ -2918,18 +2985,23 @@ effort = "medium"                 # optional, claude only: low, medium, high, xh
 args = []                         # extra command line options for the agent, usually empty; never for shell
 folder = "~/code/app"             # where it runs
 missed = "run-once"               # when the computer was off at the time: "run-once" or "skip"
+late_hours = 0                    # with run-once: catch up only when less than this many hours late (0: however late, up to a week)
 time_limit_minutes = 120
 stop_at_limit = false             # true: close the run's tab at the time limit
 retries = 0                       # try a failed run again this many times (0-3)...
 retry_delay_minutes = 10          # ...this many minutes apart
+off_after_failures = 0            # switch the routine off after this many runs in a row that went wrong (0: never)
+after_command = ""                # optional: one line of shell run after a run that went wrong, in the routine's folder, at most 5 minutes. It gets HERDR_ROUTINES_STATUS (finished, failed, timed-out, closed, no-result), _NAME, _ID, _RUN, _MESSAGE, _RESULT, _OUTPUT and _STARTED. Example: "~/bin/tell-me.sh"
+after_always = false              # true: run after_command after every run, not only one that went wrong
 check_command = ""                # agents only: a shell command run first; the agent starts only if it exits 0, and gets its output
 remember = false                  # agents only: each run gets the results of the last ten runs
+account = ""                      # claude only, and only if I use the Multiaccount plugin and ask for it: the id of the account there; empty lets Multiaccount decide
 runs_in = "herdr"                 # shell only: "herdr" (a tab, while Herdr runs) or "cron" (a cron job in my crontab, also when Herdr is closed; command.sh is then one line, run in my home folder; the list writes the crontab line once I approve it)
 keep_runs = 30                    # runs kept in the history (0: no limit)...
 keep_days = 90                    # ...and none older than this many days (0: no limit)
 alert = "notification"            # "notification", "popup-on-problems" (a popup that stays until OK when a run fails, runs too long or needs me) or "popup" (also when it finishes)
 
-Instead of cron, schedule can be "@once YYYY-MM-DD HH:MM" (runs once, then the routine switches off) or "@start" (each time Herdr starts).
+Other forms of schedule: "@once YYYY-MM-DD HH:MM" (runs once, then the routine switches off); "@start" (each time Herdr starts); "@every 2 weeks from YYYY-MM-DD HH:MM" or "@every 3 days from YYYY-MM-DD HH:MM" (every N weeks or days, counted from that first time); "@hourly", "@daily", "@weekly", "@monthly", "@yearly". In cron, the day of the month can be "L" (the last day) or "LW" (the last working day), and the weekday can be "mon#1" to "mon#5" (the first to fifth Monday of the month) or "friL" (the last Friday). A cron job (runs_in = "cron") takes only plain 5-field cron.
 
 What to do:
 1. Ask me what the routine should do, how often and when, and in which folder, unless I already said it. Ask everything you need in one short message. Suggest sensible choices (a cheaper model for simple jobs, "auto" so nobody has to approve steps, a plain shell command when no AI is needed).
@@ -3869,7 +3941,10 @@ mod tests {
             let lines = screen(&mut a, w, h);
             let all = lines.join("\n");
             assert!(all.contains("⏎ save"), "{all}");
-            assert!(all.contains("more below"), "{all}");
+            assert!(
+                all.contains("more below") || all.contains(" below"),
+                "{all}"
+            );
         }
         a.form.as_mut().unwrap().select(Field::Keep);
         let all = screen(&mut a, 80, 24).join("\n");
@@ -4833,5 +4908,186 @@ mod tests {
     fn screen_at_top(a: &mut App, w: u16, h: u16) -> String {
         a.help_scroll = 0;
         screen(a, w, h).join("\n")
+    }
+
+    /// Made-up accounts of the Multiaccount plugin, beside the config.
+    fn add_accounts(a: &mut App) {
+        let dir = a.paths.config.parent().unwrap().join("multiaccount");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("accounts.json"),
+            r#"{"accounts":[{"id":"main","name":"Main","kind":"main"},{"id":"work-2","name":"Work","kind":"subscription"}]}"#,
+        )
+        .unwrap();
+        a.reload();
+    }
+
+    #[test]
+    fn the_form_has_weekday_switches_and_shows_the_next_times() {
+        let mut a = app("days");
+        press(&mut a, KeyCode::Char('n'));
+        press(&mut a, KeyCode::Enter);
+        let form = a.form.as_mut().unwrap();
+        form.choose(Field::Repeat, crate::form::Repeat::Days.label());
+        form.select(Field::Days);
+        for (w, h) in [(100, 30), (80, 24), (60, 20)] {
+            let all = screen(&mut a, w, h).join("\n");
+            assert!(all.contains("When  Mon, Wed, Fri at 09:00"), "{all}");
+            assert!(all.contains(" Next times "), "{all}");
+            // Three times, each on a day that is switched on.
+            let next = all.lines().find(|l| l.contains(" Next times ")).unwrap();
+            assert!(
+                ["Mon ", "Wed ", "Fri "].iter().any(|d| next.contains(d)),
+                "{next}"
+            );
+            let row = all
+                .lines()
+                .find(|l| l.contains(" On ") && l.contains("●"))
+                .unwrap_or_else(|| panic!("{all}"));
+            assert!(row.contains("Mo") && row.contains("○"), "{row}");
+            // Only whole times: one less where three do not fit.
+            assert!(!next.contains('…'), "{next}");
+            assert!(all.contains("⏎ switch the day"), "{all}");
+        }
+        // → moves to Tuesday and ⏎ (or space) switches it; 7 is Sunday.
+        press(&mut a, KeyCode::Right);
+        press(&mut a, KeyCode::Enter);
+        press(&mut a, KeyCode::Char('7'));
+        let form = a.form.as_ref().unwrap();
+        assert_eq!(form.days, [true, true, true, false, true, false, true]);
+        assert_eq!(form.schedule().unwrap(), "0 9 * * 0,1,2,3,5");
+        // A click switches the day under it.
+        screen(&mut a, 100, 30);
+        let fri = hit_rect(&a, Hit::Day(4));
+        mouse(
+            &mut a,
+            MouseEventKind::Down(MouseButton::Left),
+            fri.x + 1,
+            fri.y,
+        );
+        assert!(!a.form.as_ref().unwrap().days[4]);
+        // With no day left, the heading says what is missing.
+        let form = a.form.as_mut().unwrap();
+        form.days = [false; 7];
+        let all = screen(&mut a, 100, 30).join("\n");
+        assert!(all.contains("switch on at least one day"), "{all}");
+        // Every month: on a day, the last day, the first Monday.
+        let form = a.form.as_mut().unwrap();
+        form.choose(Field::Repeat, crate::form::Repeat::Monthly.label());
+        let all = screen(&mut a, 100, 30).join("\n");
+        assert!(all.contains(" Day of the month "), "{all}");
+        let form = a.form.as_mut().unwrap();
+        form.choose(Field::MonthOn, "nth-1");
+        let all = screen(&mut a, 100, 30).join("\n");
+        assert!(all.contains("The first Monday"), "{all}");
+        assert!(all.contains("‹ Monday ›"), "{all}");
+        assert!(all.contains("First Monday of the month at 09:00"), "{all}");
+        assert!(!all.contains(" Day of the month "), "{all}");
+    }
+
+    #[test]
+    fn a_claude_routine_can_name_its_account() {
+        let mut a = app("account");
+        a.select_id("morning-report");
+        press(&mut a, KeyCode::Enter);
+        // Without the Multiaccount plugin there is no such row.
+        assert!(!a
+            .form
+            .as_ref()
+            .unwrap()
+            .all_fields()
+            .contains(&Field::Account));
+        press(&mut a, KeyCode::Esc);
+        add_accounts(&mut a);
+        press(&mut a, KeyCode::Enter);
+        let form = a.form.as_mut().unwrap();
+        assert!(form.all_fields().contains(&Field::Account));
+        form.select(Field::Account);
+        let all = screen(&mut a, 100, 50).join("\n");
+        assert!(all.contains("Multiaccount decides"), "{all}");
+        press(&mut a, KeyCode::Enter);
+        let Mode::Pick(p) = &a.mode else {
+            panic!("no choice of accounts");
+        };
+        let names: Vec<&str> = p.items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(names, ["Multiaccount decides", "Main", "Work"]);
+        press(&mut a, KeyCode::Down);
+        press(&mut a, KeyCode::Down);
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(a.form.as_ref().unwrap().extra.account, "work-2");
+        // A shell command has no account.
+        let form = a.form.as_mut().unwrap();
+        form.choose(Field::Agent, routine::SHELL);
+        assert!(!form.all_fields().contains(&Field::Account));
+        assert!(form.extra.account.is_empty());
+    }
+
+    #[test]
+    fn further_settings_show_in_the_details_and_the_approval_view() {
+        let mut a = app("further");
+        add_accounts(&mut a);
+        let mut r = Routine::load(&a.paths, "weekly-cleanup").unwrap();
+        r.file.more = routine::More {
+            late_hours: 2,
+            after_command: "~/bin/tell-me.sh".into(),
+            after_always: false,
+            off_after_failures: 3,
+            account: "work-2".into(),
+        };
+        r.save_approved(&a.paths).unwrap();
+        a.reload();
+        a.select_id("weekly-cleanup");
+        let all = screen(&mut a, 120, 44).join("\n");
+        for part in [
+            "If missed       runs once, if less than 2 hours late",
+            "Switches off    after 3 runs in a row that went wrong",
+            "After the run   ~/bin/tell-me.sh · after a run that went wrong",
+            "Account         Work",
+        ] {
+            assert!(all.contains(part), "no {part:?} in\n{all}");
+        }
+        // The approval view names everything that will run.
+        let text = approval_lines(&a.paths, &r).join("\n");
+        for part in [
+            "When a time is missed: A catch-up run only within 2 hours of the missed time",
+            "Switches itself off: after 3 runs in a row that went wrong",
+            "After a run that went wrong (a shell command, as you, without asking, in the folder above): ~/bin/tell-me.sh",
+            "Account: Work (Multiaccount id work-2), used also when it is at its limit",
+        ] {
+            assert!(text.contains(part), "no {part:?} in\n{text}");
+        }
+        r.file.more.after_always = true;
+        r.file.more.account = "gone-1".into();
+        let text = approval_lines(&a.paths, &r).join("\n");
+        assert!(text.contains("After every run (a shell command"), "{text}");
+        assert!(
+            text.contains(
+                "Account: gone-1 (not in Multiaccount any more) (Multiaccount id gone-1)"
+            ),
+            "{text}"
+        );
+        // The form opens and saves them untouched.
+        press(&mut a, KeyCode::Enter);
+        a.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        let saved = Routine::load(&a.paths, "weekly-cleanup").unwrap();
+        assert_eq!(saved.file.more.late_hours, 2);
+        assert_eq!(saved.file.more.after_command, "~/bin/tell-me.sh");
+        assert_eq!(saved.file.more.off_after_failures, 3);
+        assert_eq!(saved.file.more.account, "work-2");
+        // The brief for Claude knows the settings and the schedule forms.
+        let brief = agent_brief(&a.paths);
+        for word in [
+            "late_hours",
+            "after_command",
+            "after_always",
+            "off_after_failures",
+            "account = ",
+            "@every 2 weeks from",
+            "mon#1",
+            "LW",
+            "HERDR_ROUTINES_STATUS",
+        ] {
+            assert!(brief.contains(word), "{word}");
+        }
     }
 }
