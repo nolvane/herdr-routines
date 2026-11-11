@@ -366,7 +366,7 @@ fn tick(
                 {
                     paths::log(
                         paths,
-                        &format!("{}: waits for a free place ({limit} runs at once)", r.id),
+                        &format!("{}: waits for a free place (at most {limit} at once)", r.id),
                     );
                 }
                 None

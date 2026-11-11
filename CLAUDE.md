@@ -115,6 +115,17 @@ pane of the test session (`herdr pane run`, `herdr pane read`), and stop
 everything afterwards with `herdr-routines stop`,
 `herdr session stop rttest` and `herdr session delete rttest`.
 
+Two things are not separate in such a test:
+
+- **The crontab is the real one.** The list reads it, takes a managed job
+  it finds there into the test's config folder, and every cron action
+  (`space`, edit, delete, take over on the Cron jobs tab) would change the
+  real crontab. Leave the Cron jobs tab alone, and remove the test folders
+  with `rm`, not with `d` in the list.
+- **Multiaccount's session files are keyed by pane id**, which a test
+  session hands out again: starting a real Claude Code agent there can
+  overwrite the entry of a pane in your own session.
+
 ## Non-goals
 
 - No headless agent runs: every agent run is an interactive agent in a
