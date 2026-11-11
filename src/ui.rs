@@ -1980,11 +1980,24 @@ fn draw_log(frame: &mut Frame, app: &mut App, mut log: LogView) {
     let inner = dialog(frame, area, &log.title);
     let visible = inner.height.saturating_sub(1);
     // Long lines wrap, so nothing hides past the right edge.
-    let rows: Vec<String> = log
+    let mut rows: Vec<String> = log
         .lines
         .iter()
         .flat_map(|l| hard_wrap(&l.replace('\t', "    "), inner.width as usize))
         .collect();
+    // The view scrolls over at most 65,535 rows; of more, it shows the
+    // end. A routine that long cannot be read in full here, so it cannot
+    // be approved here either: `y` must never approve rows nobody could
+    // scroll to.
+    if rows.len() > u16::MAX as usize && log.approve.take().is_some() {
+        let note = "It is too long to show in full (more than 65,535 rows), so it cannot be approved here. Shorten its prompt or command first.";
+        log.lines.extend([String::new(), note.to_string()]);
+        rows.push(String::new());
+        rows.extend(hard_wrap(note, inner.width as usize));
+        log.scroll = u16::MAX;
+    }
+    let over = rows.len().saturating_sub(u16::MAX as usize);
+    let rows: Vec<String> = rows.into_iter().skip(over).collect();
     let total = rows.len().min(u16::MAX as usize) as u16;
     log.max = total.saturating_sub(visible);
     log.scroll = log.scroll.min(log.max);

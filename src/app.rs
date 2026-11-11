@@ -330,6 +330,10 @@ pub struct App {
     clip: String,
     /// Ask about starting at login once the intro is closed.
     autostart_after_intro: bool,
+    /// The routine the form or editor was opened on: its files as read
+    /// then, and whether they were the approved ones. Saving approves what
+    /// it writes only when both still hold (`opened_approved`).
+    opened: Option<(String, crate::approval::Snapshot, bool)>,
 }
 
 impl App {
@@ -365,6 +369,7 @@ impl App {
             last_click: None,
             clip: String::new(),
             autostart_after_intro: false,
+            opened: None,
         };
         app.reload();
         app
@@ -538,6 +543,12 @@ impl App {
     // ---- actions ----------------------------------------------------------
 
     fn fire(&mut self, id: &str) {
+        // The `y` was for the routine as the list showed it: its files are
+        // read again, and only one that can still run starts.
+        if !Routine::load(&self.paths, id).is_ok_and(|r| r.can_run()) {
+            self.reload();
+            return self.flash("Not started: it changed meanwhile (a shows it)", YELLOW);
+        }
         if let Some(r) = self.routines.iter().find(|r| r.id == id && r.is_cron()) {
             let started = crate::crontab::run_now(&self.paths, r);
             match started {
@@ -595,12 +606,21 @@ impl App {
             }
             Err(e) => self.flash(e, RED),
         }
+        if r.is_cron() && !r.approved {
+            // It waits for approval, so its crontab line stays the approved
+            // one (`write_job` writes nothing); only on or off follows the key.
+            if let Err(e) = crate::crontab::switch(&self.paths, &id, r.file.enabled) {
+                self.flash(format!("Crontab not updated: {e}"), RED);
+            }
+            self.crontab_read = None;
+        }
         self.cron_write(&id);
         self.reload();
     }
 
     /// Writes a cron job's schedule, command and on or off into the
-    /// crontab (nothing for a routine Herdr runs); says so when it fails.
+    /// crontab (nothing for a routine Herdr runs, and nothing for one that
+    /// waits for approval: see `crontab::write_job`); says so when it fails.
     fn cron_write(&mut self, id: &str) {
         let Ok(r) = Routine::load(&self.paths, id) else {
             return;
@@ -693,11 +713,19 @@ impl App {
 
     fn show_log(&mut self, run: &Run) {
         let file = self.output_file(run);
-        let text = file
+        // The end of the file, whatever its size; bytes that are not text
+        // do not hide the rest.
+        let (text, cut) = file
             .as_ref()
-            .and_then(|f| std::fs::read_to_string(f).ok())
+            .and_then(|f| paths::read_tail_lossy(f, 2 * 1024 * 1024))
             .unwrap_or_default();
         let mut lines: Vec<String> = text.lines().map(visible_text).collect();
+        if cut {
+            lines.insert(
+                0,
+                "(the output is long: this is its end, f opens the whole file)".into(),
+            );
+        }
         while lines.last().is_some_and(|l| l.trim().is_empty()) {
             lines.pop();
         }
@@ -875,10 +903,16 @@ impl App {
         let Some(r) = self.selected_routine().cloned() else {
             return;
         };
+        // From the files as they are now, which are remembered: what the
+        // form saves is approved only if they were and still are.
+        let r = self.note_opened(&r.id).unwrap_or(r);
         if r.unreadable {
             // The form would overwrite the file with stand-ins.
-            let text = std::fs::read_to_string(self.paths.routine_dir(&r.id).join("routine.toml"))
-                .unwrap_or_default();
+            let text = paths::read_text_limited(
+                &self.paths.routine_dir(&r.id).join("routine.toml"),
+                paths::FILE_LIMIT,
+            )
+            .unwrap_or_default();
             self.open_editor(&text, EditTarget::File(r.id.clone()), "routine.toml");
             self.flash(
                 r.problem
@@ -909,7 +943,7 @@ impl App {
         let name = file.name.clone();
         // A routine that waits for approval keeps waiting: approving is
         // what `a` does, after showing everything it would run.
-        let waiting = form.id.as_ref().is_some_and(|id| !self.is_approved(id));
+        let waiting = form.id.as_ref().is_some_and(|id| !self.opened_approved(id));
         let r = Routine {
             id: id.clone(),
             file,
@@ -928,8 +962,8 @@ impl App {
         // A cron job's schedule, command and on or off live in the crontab.
         let crontab = if r.is_cron() {
             crate::crontab::write_job(&self.paths, &r)
-        } else if was_cron {
-            // Now run by Herdr: its crontab line goes.
+        } else if was_cron && !waiting {
+            // Now run by Herdr: its crontab line goes (once approved).
             crate::crontab::remove_job(&self.paths, &id, false)
         } else {
             Ok(())
@@ -999,7 +1033,7 @@ impl App {
     /// Writes one file of a routine from the editor. It stays approved when
     /// it was; one that waits for approval keeps waiting.
     fn write_file(&self, id: &str, name: &str, text: &str) -> Result<(), String> {
-        let was = self.is_approved(id);
+        let was = self.opened_approved(id);
         paths::write_atomic(&self.paths.routine_dir(id).join(name), text.as_bytes())
             .map_err(|e| e.to_string())?;
         crate::approval::approve_file(&self.paths, id, was, name, text)
@@ -1057,9 +1091,28 @@ impl App {
         });
     }
 
-    /// Whether the routine's files are the approved ones right now.
-    fn is_approved(&self, id: &str) -> bool {
-        Routine::load(&self.paths, id).is_ok_and(|r| r.approved)
+    /// Reads the routine's files once, remembers them for the form or
+    /// editor that opens on them, and returns the routine they make.
+    fn note_opened(&mut self, id: &str) -> Option<Routine> {
+        let files = crate::approval::snapshot(&self.paths, id);
+        let approvals = crate::approval::Approvals::load(&self.paths);
+        let now = Routine::from_files(id, &files, &approvals).ok();
+        let approved = now.as_ref().is_some_and(|r| r.approved);
+        self.opened = Some((id.to_string(), files, approved));
+        now
+    }
+
+    /// Whether what the form or editor saves for this routine is the
+    /// owner's edit of approved files: they were approved when it opened
+    /// and are unchanged since. Judged against what was opened, not
+    /// against the files at the moment of saving, so text that came from
+    /// a change made elsewhere is never approved by saving it.
+    fn opened_approved(&self, id: &str) -> bool {
+        self.opened
+            .as_ref()
+            .is_some_and(|(opened, files, approved)| {
+                opened == id && *approved && crate::approval::snapshot(&self.paths, id) == *files
+            })
     }
 
     /// `a`: shows everything a routine changed outside the list would run,
@@ -1785,7 +1838,13 @@ impl App {
                     let what = if r.is_shell() { "Command" } else { "Prompt" };
                     let title = format!("{what} of {}", r.file.name);
                     let name = Routine::text_file(&r.file.agent);
-                    let text = std::fs::read_to_string(self.paths.routine_dir(&r.id).join(name))
+                    // The text as it is now, remembered with the other
+                    // files (see `opened_approved`).
+                    self.note_opened(&r.id);
+                    let text = self
+                        .opened
+                        .as_ref()
+                        .and_then(|(_, files, _)| files.get(name).cloned())
                         .unwrap_or_default();
                     self.open_editor(&text, EditTarget::Prompt(r.id, name), &title);
                 }
@@ -2203,7 +2262,11 @@ impl App {
         let Some(text) = self.editor.as_ref().map(|e| e.text.text()) else {
             return Ok(());
         };
-        let file = self.paths.state.join("editing.md");
+        // A file of this list alone: two open lists never share one.
+        let file = self
+            .paths
+            .state
+            .join(format!("editing-{}.md", std::process::id()));
         if let Err(e) = paths::write_atomic(&file, text.as_bytes()) {
             self.flash(format!("Cannot open the editor: {e}"), RED);
             return Ok(());
@@ -2363,7 +2426,16 @@ fn approval_lines(r: &Routine) -> Vec<String> {
             f.retries, f.retry_delay_minutes
         ));
     }
-    if r.is_shell() {
+    lines.push(format!(
+        "Keeps: {}",
+        crate::form::keep_text(f.keep_runs, f.keep_days).1
+    ));
+    if r.is_cron() {
+        lines.push("Runs: a shell command, as you, without asking, as a classic cron job".into());
+        lines.push(
+            "Approving writes its line into your crontab. The system's cron then starts it, also when Herdr is closed, in your home folder (not in the folder above).".into(),
+        );
+    } else if r.is_shell() {
         lines.push("Runs: a shell command, as you, without asking".into());
     } else {
         if !f.check_command.trim().is_empty() {
@@ -2384,6 +2456,13 @@ fn approval_lines(r: &Routine) -> Vec<String> {
         let flags = agent::flags(f);
         if !flags.is_empty() {
             lines.push(format!("Options: {}", flags.join(" ")));
+        }
+        if !f.args.is_empty() {
+            lines.push(format!(
+                "Warning: it has extra arguments ({}). They go to {} as they are and can change what it may do or load (servers, plugins, settings). Approve only if you know each of them.",
+                crate::form::join_args(&f.args),
+                f.agent
+            ));
         }
     }
     lines.push(String::new());
@@ -2443,6 +2522,12 @@ What to do:
 4. Run `{bin} routines` and check that the new routine shows "problem": null; fix the files if not. It shows "approved": false, which is expected: a routine that was not saved in the list runs only after I approve it there. Do not try to change that. Then tell me it is ready and that I approve it in the list (Ctrl+B, U, then a on the routine)."#
     )
 }
+
+/// Regression tests for the approval rules and the crontab, in their own
+/// file (`app_security_tests.rs`).
+#[cfg(test)]
+#[path = "app_security_tests.rs"]
+mod security_tests;
 
 #[cfg(test)]
 mod tests {
