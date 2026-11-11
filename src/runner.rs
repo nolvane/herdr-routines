@@ -236,7 +236,7 @@ pub fn skip(paths: &Paths, routine: &Routine, trigger: Trigger, slot: DateTime<L
 /// agent starts: up to a minute, a bit longer while the new shell gets ready.
 /// A run that does not get going is told like any other run that went wrong.
 pub fn launch(paths: &Paths, settings: &Settings, routine: &Routine, run: Run) -> Run {
-    let mut run = start(paths, settings, routine, run);
+    let run = start(paths, settings, routine, run);
     if !run.status.active() {
         ended(paths, settings, &run, Some(routine).filter(|r| r.can_run()));
     }
@@ -304,10 +304,14 @@ fn start(paths: &Paths, settings: &Settings, routine: &Routine, mut run: Run) ->
         let _ = run.save(paths);
         return run;
     }
+    // A Claude Code routine can name the account it runs with: the tab's
+    // shell gets Multiaccount's variable for it.
+    let env = crate::accounts::env_for(&routine.file.more.account);
     let place = match herdr::open_tab(
         &settings.workspace,
         &folder.to_string_lossy(),
         &tab_label(routine, &run.started),
+        &env,
     ) {
         Ok(p) => p,
         Err(e) => {

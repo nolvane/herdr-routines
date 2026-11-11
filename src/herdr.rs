@@ -156,13 +156,30 @@ pub fn workspace_label_focused(label: &str) -> Result<bool, Error> {
 
 /// A new tab for a run: in the workspace with this label, which is created
 /// (with the run in its first tab) when it does not exist yet.
-pub fn open_tab(workspace_label: &str, cwd: &str, tab_label: &str) -> Result<Place, Error> {
+/// `env` holds `KEY=VALUE` entries for the tab's shell.
+pub fn open_tab(
+    workspace_label: &str,
+    cwd: &str,
+    tab_label: &str,
+    env: &[String],
+) -> Result<Place, Error> {
     // Launches run in threads: one at a time here, so two due routines do
     // not both create the workspace.
     static OPENING: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _guard = OPENING.lock().unwrap_or_else(|e| e.into_inner());
+    let with_env = |args: Vec<&str>| -> Vec<String> {
+        let mut all: Vec<String> = args.into_iter().map(str::to_string).collect();
+        for e in env {
+            all.extend(["--env".to_string(), e.clone()]);
+        }
+        all
+    };
+    let call_owned = |args: Vec<String>| {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        call(&args)
+    };
     if let Some(ws) = find_workspace(workspace_label)? {
-        let v = call(&[
+        let v = call_owned(with_env(vec![
             "tab",
             "create",
             "--workspace",
@@ -172,7 +189,7 @@ pub fn open_tab(workspace_label: &str, cwd: &str, tab_label: &str) -> Result<Pla
             "--label",
             tab_label,
             "--no-focus",
-        ])?;
+        ]))?;
         return Ok(Place {
             workspace_id: ws,
             tab_id: s(&v["result"]["tab"]["tab_id"]),
@@ -180,7 +197,7 @@ pub fn open_tab(workspace_label: &str, cwd: &str, tab_label: &str) -> Result<Pla
             terminal_id: s(&v["result"]["root_pane"]["terminal_id"]),
         });
     }
-    let v = call(&[
+    let v = call_owned(with_env(vec![
         "workspace",
         "create",
         "--cwd",
@@ -188,7 +205,7 @@ pub fn open_tab(workspace_label: &str, cwd: &str, tab_label: &str) -> Result<Pla
         "--label",
         workspace_label,
         "--no-focus",
-    ])?;
+    ]))?;
     let place = Place {
         workspace_id: s(&v["result"]["workspace"]["workspace_id"]),
         tab_id: s(&v["result"]["tab"]["tab_id"]),

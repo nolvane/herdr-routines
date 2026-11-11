@@ -245,6 +245,10 @@ pub struct More {
     /// wrong (0: never).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub off_after_failures: u32,
+    /// The account of the Multiaccount plugin a Claude Code routine runs
+    /// with (its id there); empty leaves the choice to Multiaccount.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub account: String,
 }
 
 /// The most hours a missed time may be late: the week missed times are
@@ -456,6 +460,17 @@ impl Routine {
             return Some(format!(
                 "a missed time is caught up at most {MAX_LATE_HOURS} hours (a week) late"
             ));
+        }
+        if !file.more.account.is_empty() {
+            if file.agent != "claude" {
+                return Some("an account is for Claude Code routines only".into());
+            }
+            if !crate::accounts::valid_id(&file.more.account) {
+                return Some(
+                    "the account is an id from Multiaccount (lower case letters, digits, dashes)"
+                        .into(),
+                );
+            }
         }
         if file.more.off_after_failures > MAX_OFF_AFTER {
             return Some(format!(

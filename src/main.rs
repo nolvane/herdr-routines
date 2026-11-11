@@ -19,6 +19,7 @@
 //! Started as `<state>/bin/cron/<id> -c <command>` (the `SHELL` of a
 //! managed cron job in the crontab), it is that job's wrapper instead.
 
+mod accounts;
 mod agent;
 mod alert;
 mod app;
