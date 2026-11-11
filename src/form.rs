@@ -73,11 +73,22 @@ impl Repeat {
             Repeat::Weekdays => "At a time Monday to Friday",
             Repeat::Days => "At a time on the days you switch on",
             Repeat::Weekly => "At a time on one day of the week",
-            Repeat::TwoWeeks => "Every second week, counted from a first date",
-            Repeat::Monthly => "On a day, the last day or the first Monday of the month",
-            Repeat::Once => "On one date at a time, then it switches itself off",
-            Repeat::AtStart => "Each time the Herdr server starts, such as after a restart",
-            Repeat::Custom => "Any cron schedule, such as 15 8-18 * * 1-5",
+            Repeat::TwoWeeks => "Every second week from a first date",
+            Repeat::Monthly => "A day, the last day or the first Monday",
+            Repeat::Once => "On one date, then it switches itself off",
+            Repeat::AtStart => "Each time the Herdr server starts",
+            Repeat::Custom => "Any schedule, such as 15 8 * * 1-5",
+        }
+    }
+
+    /// The name and meaning of a choice for a cron job, where they differ:
+    /// cron knows a day of the month by its number only, and its "start"
+    /// is the computer's.
+    fn for_cron(self) -> (&'static str, &'static str) {
+        match self {
+            Repeat::Monthly => (self.label(), "At a time on one day of the month"),
+            Repeat::AtStart => ("When the computer starts", "Each time it starts up"),
+            _ => (self.label(), self.detail()),
         }
     }
 
@@ -172,12 +183,12 @@ pub fn late_text(hours: u32) -> (String, String) {
             Missed::RunOnce.detail().into(),
         ),
         1 => (
-            "Run once, if less than 1 hour late".into(),
-            "A catch-up run only within an hour of the missed time".into(),
+            "Run once, if under 1 hour late".into(),
+            "A catch-up run only within an hour of its time".into(),
         ),
         n => (
-            format!("Run once, if less than {n} hours late"),
-            format!("A catch-up run only within {n} hours of the missed time"),
+            format!("Run once, if under {n} hours late"),
+            format!("A catch-up run only within {n} hours of its time"),
         ),
     }
 }
@@ -778,14 +789,12 @@ impl Form {
             if !cron {
                 v.push(Field::AtLimit);
             }
-            v.extend([
-                Field::Retry,
-                Field::OffAfter,
-                Field::Alert,
-                Field::After,
-                Field::AfterWhen,
-                Field::Keep,
-            ]);
+            v.extend([Field::Retry, Field::OffAfter, Field::Alert, Field::After]);
+            // After which runs: only once there is a command.
+            if !self.extra.after_command.trim().is_empty() {
+                v.push(Field::AfterWhen);
+            }
+            v.push(Field::Keep);
         }
         v.push(Field::Save);
         v
@@ -1159,6 +1168,7 @@ impl Form {
             | Field::Keep
             | Field::Remember
             | Field::Enabled
+            | Field::Repeat
             | Field::Every
             | Field::MonthOn
             | Field::Missed
@@ -1222,7 +1232,14 @@ impl Form {
             Field::Repeat => Repeat::ALL
                 .iter()
                 .filter(|r| !self.is_cron() || r.classic())
-                .map(|r| item(r.label(), r.label(), r.detail()))
+                .map(|r| {
+                    let (label, detail) = if self.is_cron() {
+                        r.for_cron()
+                    } else {
+                        (r.label(), r.detail())
+                    };
+                    item(r.label(), label, detail)
+                })
                 .collect(),
             Field::Weekday => WEEKDAYS.iter().map(|d| item(d, d, "")).collect(),
             Field::Every => {
@@ -2184,6 +2201,20 @@ mod tests {
             f.choose(Field::Repeat, r.label());
             assert!(f.build().is_ok(), "{r:?}");
         }
+        // Cron's "start" is the computer's, and the list says so.
+        assert_eq!(f.shown(Field::Repeat), "When the computer starts");
+        assert_eq!(f.detail(Field::Repeat), "Each time it starts up");
+        f.runs_in = RunsIn::Herdr;
+        assert_eq!(f.shown(Field::Repeat), "When Herdr starts");
+        // Every choice and what it means fit one row of a list in a window
+        // of 60 columns (54 inside the list, 2 for the number, 2 between).
+        for cron in [RunsIn::Herdr, RunsIn::Cron] {
+            f.runs_in = cron;
+            for i in f.items(Field::Repeat) {
+                let w = 2 + i.label.chars().count() + 2 + i.detail.chars().count();
+                assert!(w <= 54, "{w}: {} / {}", i.label, i.detail);
+            }
+        }
     }
 
     #[test]
@@ -2193,17 +2224,16 @@ mod tests {
         f.name = "Report".into();
         f.prompt = "Do it".into();
         // Hidden until "More settings" opens; no account without the plugin.
-        for field in [Field::OffAfter, Field::After, Field::AfterWhen] {
+        for field in [Field::OffAfter, Field::After] {
             assert!(!f.fields().contains(&field) && f.all_fields().contains(&field));
         }
+        // After which runs is asked only once there is a command.
+        assert!(!f.all_fields().contains(&Field::AfterWhen));
         assert!(!f.all_fields().contains(&Field::Account));
         // A missed time: however late, within some hours, or skipped.
         assert_eq!(f.shown(Field::Missed), "Run once");
         f.choose(Field::Missed, "once:2");
-        assert_eq!(
-            f.shown(Field::Missed),
-            "Run once, if less than 2 hours late"
-        );
+        assert_eq!(f.shown(Field::Missed), "Run once, if under 2 hours late");
         assert_eq!((f.missed, f.extra.late_hours), (Missed::RunOnce, 2));
         f.choose(Field::Missed, "skip");
         assert_eq!(
@@ -2211,7 +2241,7 @@ mod tests {
             ("Skip", Missed::Skip)
         );
         f.choose(Field::Missed, "once:1");
-        assert_eq!(f.shown(Field::Missed), "Run once, if less than 1 hour late");
+        assert_eq!(f.shown(Field::Missed), "Run once, if under 1 hour late");
         f.choose(Field::OffAfter, "3");
         assert_eq!(f.shown(Field::OffAfter), "3 runs in a row that went wrong");
         f.select(Field::After);
@@ -2274,7 +2304,7 @@ mod tests {
         assert_eq!(back.build().unwrap().0, file);
         assert_eq!(
             back.shown(Field::Missed),
-            "Run once, if less than 36 hours late"
+            "Run once, if under 36 hours late"
         );
         assert_eq!(
             back.shown(Field::OffAfter),

@@ -125,9 +125,17 @@ mod tests {
                 Status::Skipped,
                 Status::Closed,
                 Status::NothingToDo,
+                Status::NoResult,
             ];
             let signs: HashSet<&str> = statuses.iter().map(|s| icons.status(*s).0).collect();
             assert_eq!(signs.len(), statuses.len(), "nerd {nerd}: {signs:?}");
+            // A run without its summary is a warning, not a failure: the
+            // colour of "needs you", with a sign of its own.
+            assert_eq!(icons.status(Status::NoResult).1, YELLOW);
+            assert_ne!(
+                icons.status(Status::NoResult).0,
+                icons.status(Status::NeedsYou).0
+            );
             // On and off, a problem and waiting for approval differ by
             // shape, not only by colour.
             let marks = [Mark::On, Mark::Off, Mark::Problem, Mark::Waiting];

@@ -16,7 +16,9 @@
 //!   message takes the room it needs, up to the whole footer.
 
 use crate::agent;
-use crate::app::{App, EditTarget, Hit, LogView, Mode, View, INTRO, TAKES};
+use crate::app::{
+    App, Attention, EditTarget, Hit, LogView, Mode, RunFilter, RunPage, Sort, View, INTRO, TAKES,
+};
 use crate::cron::short_time;
 use crate::form::{Field, Form};
 use crate::routine::Routine;
@@ -82,6 +84,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     );
     match app.mode.clone() {
         Mode::Help => draw_help(frame, app, stage),
+        Mode::RunPage(p) => draw_run_page(frame, app, &icons, stage, &p),
         Mode::Pick(p) => draw_picker(frame, app, stage, p),
         Mode::Input(i) => draw_input(frame, app, stage, &i),
         Mode::Confirm(c) => draw_confirm(frame, app, stage, &c),
@@ -127,6 +130,18 @@ pub struct Chip {
 /// `keep` go first, from the left.
 pub fn chips(app: &App, icons: &Icons) -> Vec<Chip> {
     let mut v = Vec::new();
+    // When the computer is kept awake (W chooses).
+    if crate::awake::available() {
+        let on = app.awake != crate::awake::Mode::Off;
+        let sign = if on { icons.running() } else { icons.stopped() };
+        v.push(Chip {
+            long: format!("{sign} {}", app.awake.label()),
+            short: format!("{sign} awake"),
+            style: Style::new().fg(if on { GREEN } else { MUTED }),
+            key: Some('W'),
+            keep: false,
+        });
+    }
     // Whether Herdr starts at login (A switches it).
     if crate::autostart::supported() {
         let on = crate::autostart::is_on();
@@ -698,7 +713,7 @@ fn routine_about(app: &App, r: &Routine) -> (Line<'static>, bool) {
 
 /// When a routine runs next, in the words the list and the details share:
 /// "next in 9 min", or why there is no next time.
-fn next_words(r: &Routine, now: &DateTime<Local>) -> Span<'static> {
+fn next_words(app: &App, r: &Routine, now: &DateTime<Local>) -> Span<'static> {
     if r.problem.is_some() {
         return plain("–", FAINT);
     }
@@ -707,6 +722,10 @@ fn next_words(r: &Routine, now: &DateTime<Local>) -> Span<'static> {
     }
     if !r.file.enabled {
         return plain("off", MUTED);
+    }
+    // Its time has come, but as many runs as may go at once are going.
+    if app.waiting.contains_key(&r.id) {
+        return plain("waits for a free place", YELLOW);
     }
     match r.schedule() {
         Some(Schedule::AtStart) if r.is_cron() => plain("next computer start", FAINT),
@@ -750,10 +769,23 @@ fn routine_row(app: &App, icons: &Icons, r: &Routine, now: &DateTime<Local>) -> 
             let link = (status.width() as u16 + 2, runs.width() as u16);
             let (second, short) = if run.status.active() {
                 let t = crate::app::took(run);
-                (format!("{ago} · for {t}"), format!(" for {t}"))
+                (faint(format!("{ago} · for {t}")), format!(" for {t}"))
+            } else if let Some(n) = app.failing.get(&r.id) {
+                // Not the first that went wrong: that says more than how
+                // long it took.
+                (
+                    Line::from(vec![
+                        plain(format!("{ago} · "), FAINT),
+                        plain(format!("{n} times in a row"), RED),
+                    ]),
+                    format!(" {ago} · {n} in a row"),
+                )
+            } else if run.status == Status::Skipped {
+                // Nothing ran at that time.
+                (faint(ago.clone()), format!(" {ago}"))
             } else {
                 (
-                    format!("{ago} · took {}", crate::app::took(run)),
+                    faint(format!("{ago} · took {}", crate::app::took(run))),
                     format!(" {ago}"),
                 )
             };
@@ -764,7 +796,7 @@ fn routine_row(app: &App, icons: &Icons, r: &Routine, now: &DateTime<Local>) -> 
                         Span::raw("  "),
                         plain(runs, ACCENT),
                     ]),
-                    faint(second),
+                    second,
                 ],
                 Some(link),
                 Some(Line::from(vec![plain(status, color), plain(short, FAINT)])),
@@ -781,7 +813,7 @@ fn routine_row(app: &App, icons: &Icons, r: &Routine, now: &DateTime<Local>) -> 
         about,
         blocked,
         when: Line::from(plain(when, if on { TEXT } else { MUTED })),
-        next: Line::from(next_words(r, now)),
+        next: Line::from(next_words(app, r, now)),
         last,
         link,
         brief,
@@ -881,7 +913,68 @@ const DETAILS_FROM: u16 = 24;
 const DETAILS_MIN: u16 = 11;
 const DETAILS_FREE: u16 = 5;
 
+/// The line above the routines: what needs the owner, what is going and
+/// what comes next, each part a link. Returns the room below it.
+fn draw_attention(frame: &mut Frame, app: &mut App, area: Rect) -> Rect {
+    if app.view != View::Routines || area.height < 10 {
+        return area;
+    }
+    let mut parts = app.attention_parts();
+    if parts.is_empty() {
+        return area;
+    }
+    let bar = Rect::new(area.x + 1, area.y, area.width.saturating_sub(2), 1);
+    let room = bar.width as usize;
+    let width = |parts: &[(Attention, String, Color)]| -> usize {
+        1 + parts.iter().map(|p| p.1.width()).sum::<usize>() + 3 * parts.len().saturating_sub(1)
+    };
+    // What comes next gives way first: without the name, then not at all.
+    if width(&parts) > room {
+        if let Some(at) = parts.iter().position(|p| p.0 == Attention::Waiting) {
+            match app.next_up() {
+                Some((_, when)) => parts[at].1 = format!("next {when}"),
+                None => {
+                    parts.remove(at);
+                }
+            }
+            if width(&parts) > room {
+                parts.retain(|p| p.0 != Attention::Waiting);
+            }
+        }
+    }
+    while width(&parts) > room && parts.len() > 1 {
+        parts.pop();
+    }
+    let mut spans = vec![Span::raw(" ")];
+    let mut x = bar.x + 1;
+    for (i, (kind, text, color)) in parts.into_iter().enumerate() {
+        if i > 0 {
+            spans.push(plain(" · ", FAINT));
+            x += 3;
+        }
+        let w = text.width() as u16;
+        if x + w <= bar.right() {
+            app.hits
+                .push((Rect::new(x, bar.y, w, 1), Hit::Attention(kind)));
+        }
+        x += w;
+        let style = match kind {
+            Attention::NeedsYou | Attention::WentWrong => bold(color),
+            _ => Style::new().fg(color),
+        };
+        spans.push(Span::styled(text, style));
+    }
+    frame.render_widget(Paragraph::new(clip_line(Line::from(spans), room)), bar);
+    Rect::new(
+        area.x,
+        area.y + 2,
+        area.width,
+        area.height.saturating_sub(2),
+    )
+}
+
 fn draw_routines(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
+    let area = draw_attention(frame, app, area);
     let cron_view = app.view == View::Cron;
     let routines: Vec<Routine> = app.listed().into_iter().cloned().collect();
     let jobs = if cron_view {
@@ -1181,7 +1274,7 @@ fn draw_details(frame: &mut Frame, app: &App, icons: &Icons, r: &Routine, area: 
     }
     // The schedule, and when it runs next (or why it does not).
     let mut when = vec![plain(r.schedule_text(), TEXT)];
-    let next = next_words(r, &now);
+    let next = next_words(app, r, &now);
     let at_start = matches!(r.schedule(), Some(Schedule::AtStart)) && r.can_run() && f.enabled;
     if !at_start && next.content != "–" {
         when.push(plain(" · ", FAINT));
@@ -1189,7 +1282,14 @@ fn draw_details(frame: &mut Frame, app: &App, icons: &Icons, r: &Routine, area: 
     }
     lines.push(detail_row("Schedule", when, w));
     let last = match app.latest_run(&r.id) {
-        Some(run) => run_words(icons, run, &now),
+        Some(run) => {
+            let mut words = run_words(icons, run, &now);
+            if let Some(n) = app.failing.get(&r.id) {
+                // Right behind the status: it is not the first.
+                words.insert(1, plain(format!(" · went wrong {n} times in a row"), RED));
+            }
+            words
+        }
         None => vec![plain("no run yet", FAINT)],
     };
     lines.push(detail_row("Last run", last, w));
@@ -1344,10 +1444,7 @@ fn run_about(run: &Run) -> Line<'static> {
         .find(|l| !l.trim().is_empty())
         .map(|l| l.trim().to_string());
     let message = run.message.trim();
-    let failed = matches!(
-        run.status,
-        Status::Failed | Status::TimedOut | Status::Closed | Status::Skipped
-    );
+    let failed = run.status.problem() || run.status == Status::Skipped;
     match (failed && !message.is_empty(), result) {
         (true, Some(r)) => Line::from(vec![
             plain(message.to_string(), MUTED),
@@ -1362,52 +1459,112 @@ fn run_about(run: &Run) -> Line<'static> {
 }
 
 fn draw_runs(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
-    // A filter shows as a line on top, with buttons that remove it.
+    // The filters show as a line on top, each with a ✕ that removes it.
     let mut area = area;
-    if let Some(name) = app.filter_name().map(str::to_string) {
+    if app.runs_filtered() {
         let bar = Rect::new(area.x + 1, area.y, area.width.saturating_sub(2), 1);
-        let lead = " Only runs of ";
+        let room = bar.width as usize;
+        let mut lead = " Only";
         let tail = format!("  {} of {}  ", app.runs.len(), app.all_runs.len());
+        let name = app.filter_name().map(str::to_string);
+        let search = app.runs_search.trim().to_string();
         // Esc goes back to the routine the filter came from; without one
         // it shows all runs, which `h` always does.
-        let mut buttons: Vec<(&str, char)> = match app.filter_from {
-            Some(_) => vec![
+        let mut buttons: Vec<(&str, char)> = match (app.filter_from, &name) {
+            (Some(_), Some(_)) => vec![
                 (" Esc back to the routine ", '\u{1b}'),
                 (" h all runs ", 'h'),
             ],
-            None => vec![(" Esc all runs ", '\u{1b}')],
+            _ => vec![(" Esc all runs ", '\u{1b}')],
         };
-        let fixed = |b: &[(&str, char)]| {
-            lead.width() + tail.width() + b.iter().map(|(t, _)| t.width() + 1).sum::<usize>()
-        };
-        while buttons.len() > 1 && (bar.width as usize) < fixed(&buttons) + 12 {
-            buttons.pop();
-        }
         if app.runs.is_empty() {
             // `h` needs a run to stand on.
             buttons.truncate(1);
         }
-        let room = (bar.width as usize).saturating_sub(fixed(&buttons));
-        let name = clip(&name, room.max(4));
-        let mut x = bar.x + (lead.width() + name.width() + tail.width()) as u16;
-        let mut spans = vec![
-            plain(lead, MUTED),
-            Span::styled(name, bold(TEXT)),
-            plain(tail, MUTED),
-        ];
+        let chips = |name_room: usize, short: bool, text_room: usize| {
+            let mut v: Vec<(String, RunFilter)> = Vec::new();
+            if let Some(name) = &name {
+                v.push((
+                    format!(" runs of {} ✕ ", clip(name, name_room)),
+                    RunFilter::Routine,
+                ));
+            }
+            if app.runs_problems {
+                let text = if short {
+                    " problems ✕ "
+                } else {
+                    " problems only ✕ "
+                };
+                v.push((text.to_string(), RunFilter::Problems));
+            }
+            if !search.is_empty() {
+                v.push((
+                    format!(" “{}” ✕ ", clip(&search, text_room)),
+                    RunFilter::Search,
+                ));
+            }
+            v
+        };
+        let width = |lead: &str, c: &[(String, RunFilter)], b: &[(&str, char)]| {
+            lead.width()
+                + c.iter().map(|(t, _)| t.width() + 1).sum::<usize>()
+                + tail.width()
+                + b.iter().map(|(t, _)| t.width() + 1).sum::<usize>()
+        };
+        // When the line is too long: the buttons go (Esc is in the footer
+        // too), then the words get shorter, the word in front goes, and
+        // at last the name and the searched text are cut. The count stays.
+        let mut shown = chips(usize::MAX, false, usize::MAX);
+        while width(lead, &shown, &buttons) > room && !buttons.is_empty() {
+            buttons.pop();
+        }
+        if width(lead, &shown, &buttons) > room {
+            shown = chips(usize::MAX, true, usize::MAX);
+        }
+        if width(lead, &shown, &buttons) > room {
+            lead = "";
+        }
+        if width(lead, &shown, &buttons) > room {
+            let over = width(lead, &shown, &buttons) - room;
+            let name_w = name.as_ref().map_or(0, |n| n.width());
+            let name_room = name_w.saturating_sub(over).max(8);
+            shown = chips(name_room, true, usize::MAX);
+            if width(lead, &shown, &buttons) > room {
+                let over = width(lead, &shown, &buttons) - room;
+                shown = chips(name_room, true, search.width().saturating_sub(over).max(4));
+            }
+        }
+        let mut spans = vec![plain(lead, MUTED)];
+        let mut x = bar.x + lead.width() as u16;
+        for (text, which) in shown {
+            spans.push(Span::raw(" "));
+            x += 1;
+            let w = text.width() as u16;
+            if x + w <= bar.right() {
+                app.hits
+                    .push((Rect::new(x, bar.y, w, 1), Hit::Unfilter(which)));
+            }
+            x += w;
+            spans.push(Span::styled(
+                text,
+                Style::new()
+                    .fg(TEXT)
+                    .bg(SELECTED_BG)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        x += tail.width() as u16;
+        spans.push(plain(tail, MUTED));
         for (text, key) in buttons {
             let w = text.width() as u16;
             if x + w <= bar.right() {
                 app.hits.push((Rect::new(x, bar.y, w, 1), Hit::Key(key)));
             }
             x += w + 1;
-            spans.push(Span::styled(text, Style::new().fg(TEXT).bg(SELECTED_BG)));
+            spans.push(Span::styled(text, Style::new().fg(TEXT).bg(BORDER)));
             spans.push(Span::raw(" "));
         }
-        frame.render_widget(
-            Paragraph::new(clip_line(Line::from(spans), bar.width as usize)),
-            bar,
-        );
+        frame.render_widget(Paragraph::new(clip_line(Line::from(spans), room)), bar);
         area = Rect::new(
             area.x,
             area.y + 2,
@@ -1416,18 +1573,23 @@ fn draw_runs(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
         );
     }
     if app.runs.is_empty() {
-        empty_note(
-            frame,
-            area,
-            &[
+        let lines: Vec<(String, Color)> = if app.runs_filtered() {
+            vec![
+                ("No run matches.".into(), TEXT),
+                (String::new(), TEXT),
+                ("Esc shows all runs again.".into(), MUTED),
+            ]
+        } else {
+            vec![
                 ("No runs yet.".into(), TEXT),
                 (String::new(), TEXT),
                 (
                     "Runs show up here when a routine is due, or when you start one with r.".into(),
                     MUTED,
                 ),
-            ],
-        );
+            ]
+        };
+        empty_note(frame, area, &lines);
         return;
     }
     let now = Local::now();
@@ -1726,6 +1888,12 @@ fn schedule_summary(form: &Form) -> Span<'static> {
 /// is the one they mean; or why there are none.
 fn next_times(form: &Form, room: usize) -> Vec<Span<'static>> {
     let none = |why: &str, color: Color| vec![plain(why.to_string(), color)];
+    // "When Herdr starts", also when it is typed as a custom schedule.
+    let at_start = form
+        .schedule()
+        .ok()
+        .and_then(|text| Schedule::parse(&text).ok())
+        .is_some_and(|s| matches!(s, Schedule::AtStart));
     match form.upcoming(3) {
         Ok(times) if !times.is_empty() => {
             // Whole times only: as many of the three as fit.
@@ -1745,12 +1913,8 @@ fn next_times(form: &Form, room: usize) -> Vec<Span<'static>> {
             }
             v
         }
-        Ok(_) if form.repeat == crate::form::Repeat::AtStart && form.is_cron() => {
-            none("each time the computer starts", MUTED)
-        }
-        Ok(_) if form.repeat == crate::form::Repeat::AtStart => {
-            none("each time Herdr starts", MUTED)
-        }
+        Ok(_) if at_start && form.is_cron() => none("each time the computer starts", MUTED),
+        Ok(_) if at_start => none("each time Herdr starts", MUTED),
         Ok(_) => none("never: that time has passed", YELLOW),
         Err(_) => none("–", FAINT),
     }
@@ -1811,11 +1975,13 @@ fn draw_form(frame: &mut Frame, app: &mut App, area: Rect) {
     let save_at = fields.iter().position(|f| *f == Field::Save);
 
     // Below the fields: what the current field means, set off by an accent
-    // bar like a tooltip. Up to four lines.
+    // bar like a tooltip. Four lines, or more (up to eight) where the
+    // fields still keep six rows.
     let mut hint = wrap(form.hint(current), width.saturating_sub(4));
     let show_hint = inner.height >= 12;
-    if hint.len() > 4 {
-        hint.truncate(4);
+    let most = (inner.height as usize).saturating_sub(10).clamp(4, 8);
+    if hint.len() > most {
+        hint.truncate(most);
         if let Some(last) = hint.last_mut() {
             *last = clip(&format!("{last} …"), width.saturating_sub(4));
         }
@@ -2238,6 +2404,28 @@ fn footer_keys(app: &App) -> Vec<FootKey> {
             foot("Esc", "back", ESC, 0),
         ],
         Mode::Input(_) => vec![foot("⏎", "ok", ENTER, 0), foot("Esc", "cancel", ESC, 0)],
+        Mode::RunPage(page) => {
+            let mut v = Vec::new();
+            if let Some(run) = app.page_run(page) {
+                let open = !run.tab_closed && run.cron_pid == 0 && !run.pane_id.is_empty();
+                if open {
+                    v.push(foot("o", "go to its tab", hit('o'), 1));
+                }
+                v.push(foot("l", "whole output", hit('l'), 2));
+                if run.status.active() {
+                    v.push(foot("x", "stop", hit('x'), 1));
+                }
+                if app.routines.iter().any(|r| r.id == run.routine_id) {
+                    v.push(foot("r", "run again", hit('r'), 3));
+                }
+                v.push(foot("f", "open file", hit('f'), 4));
+                if !run.status.active() {
+                    v.push(foot("d", "delete", hit('d'), 3));
+                }
+            }
+            v.push(foot("Esc", "close", ESC, 0));
+            v
+        }
         Mode::Confirm(c) => {
             let mut v = vec![foot(
                 if c.enter_confirms() { "y ⏎" } else { "y" },
@@ -2390,6 +2578,9 @@ fn list_keys(app: &App) -> Vec<FootKey> {
                     if needs_you { 0 } else { 3 },
                 ));
             }
+            if run.is_some_and(|run| run.status.active()) {
+                v.push(foot("x", "stop its run", hit('x'), 3));
+            }
             if run.is_some() {
                 v.push(foot("l", "output", hit('l'), 3));
                 v.push(foot("h", "its runs", hit('h'), 4));
@@ -2402,6 +2593,16 @@ fn list_keys(app: &App) -> Vec<FootKey> {
             ));
             v.push(foot("c", "duplicate", hit('c'), 6));
             v.push(foot("d", "delete", hit('d'), 6));
+            v.push(foot(
+                "s",
+                if app.sort == Sort::Attention {
+                    "sort by name"
+                } else {
+                    "sort by what needs you"
+                },
+                hit('s'),
+                7,
+            ));
             v.push(help);
             v.push(close);
             v
@@ -2411,21 +2612,38 @@ fn list_keys(app: &App) -> Vec<FootKey> {
             let run = app.runs.get(app.sel_run);
             if let Some(run) = run {
                 let open = !run.tab_closed && run.cron_pid == 0 && !run.pane_id.is_empty();
+                v.push(foot("⏎", "open", ENTER, 0));
+                // The run that waits for the owner: its tab comes first.
                 if open {
-                    v.push(foot("⏎", "go to its tab", ENTER, 0));
-                    v.push(foot("l", "output", hit('l'), 1));
-                } else {
-                    v.push(foot("⏎", "output", ENTER, 0));
+                    let rank = if run.status == Status::NeedsYou { 0 } else { 2 };
+                    v.push(foot("o", "go to its tab", hit('o'), rank));
+                }
+                v.push(foot("l", "output", hit('l'), 2));
+                if run.status.active() {
+                    v.push(foot("x", "stop", hit('x'), 2));
                 }
             }
-            match (app.run_filter.is_some(), app.filter_from) {
-                (true, Some(_)) => v.push(foot("Esc", "back to the routine", ESC, 1)),
-                (true, None) => v.push(foot("Esc", "all runs", ESC, 1)),
-                (false, _) if run.is_some() => v.push(foot("h", "only its runs", hit('h'), 3)),
-                _ => {}
+            if app.runs_filtered() {
+                v.push(match (app.filter_from, &app.run_filter) {
+                    (Some(_), Some(_)) => foot("Esc", "back to the routine", ESC, 1),
+                    _ => foot("Esc", "all runs", ESC, 1),
+                });
+            }
+            if !app.all_runs.is_empty() {
+                // Once it is on, its ✕ and Esc take it off (and `p` too).
+                if !app.runs_problems {
+                    v.push(foot("p", "problems only", hit('p'), 3));
+                }
+                v.push(foot("/", "search", hit('/'), 3));
             }
             if let Some(run) = run {
-                v.push(foot("f", "open file", hit('f'), 4));
+                if app.run_filter.is_none() {
+                    v.push(foot("h", "only its runs", hit('h'), 4));
+                }
+                v.push(foot("f", "open file", hit('f'), 5));
+                if app.routines.iter().any(|r| r.id == run.routine_id) {
+                    v.push(foot("r", "run again", hit('r'), 5));
+                }
                 if !run.status.active() {
                     v.push(foot("d", "delete", hit('d'), 5));
                 }
@@ -2656,13 +2874,54 @@ fn draw_picker(frame: &mut Frame, app: &mut App, stage: Rect, mut p: crate::app:
     // the filter does not change the rows' shape.
     let any = p.all.iter().any(|i| !i.detail.is_empty());
     let two = any && p.all.len() <= 8;
-    let per = if two { 2u16 } else { 1 };
     // Long lists get a filter line on top instead of number keys.
     let filter_h = u16::from(p.filters()) * 2;
-    let want_h = p.all.len() as u16 * per + 2 + filter_h;
+    // A note about all entries goes under them.
+    let hint: Vec<String> = if p.hint.is_empty() {
+        Vec::new()
+    } else {
+        wrap(
+            &p.hint,
+            centered(stage, 72, 1).width.saturating_sub(4) as usize,
+        )
+    };
+    let hint_h = if hint.is_empty() {
+        0
+    } else {
+        hint.len() as u16 + 1
+    };
+    // A detail that is longer than the dialog is wide gets a second or
+    // third row, the same for every entry, where all of them still fit;
+    // in a low window it is cut instead.
+    let detail_w = (centered(stage, 72, 1).width.saturating_sub(6) as usize).max(10);
+    let detail_rows = p
+        .all
+        .iter()
+        .map(|i| wrap(&i.detail, detail_w).len())
+        .max()
+        .unwrap_or(1)
+        .clamp(1, 3) as u16;
+    let mut per = if two { 1 + detail_rows } else { 1 };
+    if per > 2 && p.all.len() as u16 * per + 2 + filter_h + hint_h > stage.height {
+        per = 2;
+    }
+    let want_h = p.all.len() as u16 * per + 2 + filter_h + hint_h;
     let area = centered(stage, 72, want_h);
     let title = p.title.clone();
     let mut inner = dialog(frame, app, area, &title);
+    // The note only where every entry still fits above it.
+    if hint_h > 0 && inner.height >= p.all.len() as u16 * per + filter_h + hint_h {
+        let y = inner.bottom() - hint.len() as u16;
+        frame.render_widget(
+            Paragraph::new(Text::from(
+                hint.iter()
+                    .map(|l| Line::from(plain(l.clone(), FAINT)))
+                    .collect::<Vec<_>>(),
+            )),
+            Rect::new(inner.x, y, inner.width, hint.len() as u16),
+        );
+        inner.height -= hint_h;
+    }
     if p.filters() {
         let line = Line::from(vec![
             plain("Filter ", MUTED),
@@ -2727,10 +2986,18 @@ fn draw_picker(frame: &mut Frame, app: &mut App, stage: Rect, mut p: crate::app:
         }
         let mut lines = vec![clip_line(Line::from(first), width)];
         if two {
-            lines.push(clip_line(
-                Line::from(plain(format!("  {}", item.detail), MUTED)),
-                width,
-            ));
+            let rows = usize::from(per - 1);
+            let mut detail = wrap(&item.detail, detail_w);
+            if detail.len() > rows {
+                // No room for all of it: the last row says it goes on.
+                detail.truncate(rows);
+                if let Some(last) = detail.last_mut() {
+                    *last = clip(&format!("{last} …"), detail_w);
+                }
+            }
+            for l in detail {
+                lines.push(clip_line(Line::from(plain(format!("  {l}"), MUTED)), width));
+            }
         }
         frame.render_widget(Paragraph::new(Text::from(lines)).style(style), r);
         app.hits.push((r, Hit::PickRow(i)));
@@ -3117,6 +3384,165 @@ fn draw_log(frame: &mut Frame, app: &mut App, stage: Rect, mut log: LogView) {
     app.mode = Mode::Log(log);
 }
 
+/// A run on a page of its own: how it went and why, when, how long, what
+/// started it, its result and the end of its output. What can be done
+/// with it is in the footer.
+fn draw_run_page(frame: &mut Frame, app: &mut App, icons: &Icons, stage: Rect, page: &RunPage) {
+    let Some(run) = app.page_run(page).cloned() else {
+        return;
+    };
+    const LABEL: usize = 12;
+    let now = Local::now();
+    // As wide as the output view; as tall as what it shows.
+    let width = centered(stage, stage.width.saturating_sub(4).min(110), 1).width;
+    let w = width.saturating_sub(4) as usize;
+    let height = stage.height.saturating_sub(2) as usize;
+    let title = format!(
+        "{} · {}",
+        run.routine_name,
+        run.started.format("%a %-d %b %H:%M")
+    );
+    let room = w.saturating_sub(LABEL).max(10);
+    let row = |label: &str, value: Vec<Span<'static>>| -> Line<'static> {
+        let mut spans = vec![plain(format!("{label:<LABEL$}"), MUTED)];
+        spans.extend(value);
+        clip_line(Line::from(spans), w)
+    };
+    let (icon, color) = icons.status(run.status);
+    let mut lines: Vec<Line> = vec![row(
+        "Status",
+        vec![Span::styled(
+            format!("{icon} {}", run.status.label()),
+            bold(color),
+        )],
+    )];
+    // Why it ended that way, whole (up to three rows).
+    let message = crate::app::visible_text(run.message.trim());
+    if !message.is_empty() {
+        for (i, l) in wrap(&message, room).into_iter().take(3).enumerate() {
+            lines.push(row(
+                if i == 0 { "Reason" } else { "" },
+                vec![plain(l, TEXT)],
+            ));
+        }
+    }
+    // A skipped time never started: it has a time, but took none.
+    let skipped = run.status == Status::Skipped;
+    let mut started = vec![
+        plain(run.started.format("%a %-d %b %Y %H:%M").to_string(), TEXT),
+        plain(format!(" · {}", crate::app::ago(&run.started, &now)), FAINT),
+    ];
+    if skipped {
+        started.push(plain(format!(" · {}", run.trigger.label()), FAINT));
+    }
+    lines.push(row(if skipped { "When" } else { "Started" }, started));
+    if !skipped {
+        if run.status.active() {
+            let mut going = vec![plain(
+                crate::app::span_words(run.awake_for(now).num_seconds()),
+                TEXT,
+            )];
+            if run.asleep_secs > 0 {
+                going.push(plain(
+                    format!(
+                        " · not counting {} the computer slept",
+                        crate::app::span_words(i64::try_from(run.asleep_secs).unwrap_or(0))
+                    ),
+                    FAINT,
+                ));
+            }
+            lines.push(row("Going for", going));
+        } else {
+            lines.push(row("Took", vec![plain(crate::app::took(&run), TEXT)]));
+        }
+        // What started it, for which time, and which try it is.
+        let by = match run.trigger {
+            crate::store::Trigger::Scheduled => "The schedule",
+            crate::store::Trigger::Missed => "Catching up on a missed time",
+            crate::store::Trigger::Manual => "You, by hand",
+            crate::store::Trigger::Retry => "A retry after a run that failed",
+            crate::store::Trigger::Start => "Herdr starting",
+        };
+        let mut why = vec![plain(by, TEXT)];
+        if let Some(slot) = run.slot {
+            if (run.started - slot).num_minutes().abs() >= 2 {
+                why.push(plain(
+                    format!(" · for {}", slot.format("%a %-d %b %H:%M")),
+                    FAINT,
+                ));
+            }
+        }
+        if run.attempt > 0 {
+            why.push(plain(format!(" · try {}", run.attempt + 1), FAINT));
+        }
+        lines.push(row("Started by", why));
+    }
+    // The result: as much as leaves room for the output.
+    let result: Vec<String> = run
+        .result
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .flat_map(|l| wrap(&crate::app::visible_text(l), room))
+        .collect();
+    let most = (height.saturating_sub(lines.len() + 4) / 2).clamp(1, 8);
+    let label = if run.agent == crate::routine::SHELL {
+        "Last line"
+    } else {
+        "Result"
+    };
+    for (i, l) in result.iter().take(most).enumerate() {
+        let text = if i + 1 == most && result.len() > most {
+            format!("{} …", clip(l, room.saturating_sub(2)))
+        } else {
+            l.clone()
+        };
+        lines.push(row(
+            if i == 0 { label } else { "" },
+            vec![plain(text, TEXT)],
+        ));
+    }
+    // The end of the output fills the rest.
+    let left = height.saturating_sub(lines.len());
+    if left >= 3 {
+        lines.push(Line::from(""));
+        let rows: Vec<String> = page
+            .tail
+            .iter()
+            .flat_map(|l| hard_wrap(&l.replace('\t', "    "), w))
+            .collect();
+        let fit = left - 2;
+        let more = page.cut || rows.len() > fit;
+        let head = if more { "End of the output" } else { "Output" };
+        let note = if more { " l shows all of it" } else { "" };
+        let rule = w.saturating_sub(head.width() + note.width() + 2);
+        lines.push(Line::from(vec![
+            Span::styled(head, bold(ACCENT)),
+            plain(format!(" {} ", "─".repeat(rule)), BORDER),
+            plain(note, FAINT),
+        ]));
+        if rows.is_empty() {
+            let open = !run.tab_closed && run.cron_pid == 0 && !run.pane_id.is_empty();
+            let why = if skipped {
+                "Nothing ran at this time."
+            } else if run.status.active() && open {
+                "Nothing is saved yet: o goes to its tab, where it is at work."
+            } else if run.status.active() {
+                "Nothing is saved yet."
+            } else {
+                "No output was saved for this run."
+            };
+            lines.push(Line::from(plain(why, FAINT)));
+        }
+        let skip = rows.len().saturating_sub(fit);
+        for l in rows.into_iter().skip(skip) {
+            lines.push(Line::from(plain(l, TEXT)));
+        }
+    }
+    let area = centered(stage, width, lines.len() as u16 + 2);
+    let inner = dialog(frame, app, area, &title);
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
 /// Splits a line into rows of at most `width` columns and keeps every
 /// character (unlike `wrap`, which joins words): it breaks after the last
 /// space that fits, or inside a word that is longer than a row.
@@ -3198,8 +3624,16 @@ const HELP: [(&str, &[(&str, &str)]); 7] = [
                 "autostart: Herdr starts at login, so routines run after a restart, or not",
             ),
             (
+                "W",
+                "keep the computer awake: during runs, always, or not (or click \"awake\" at the top)",
+            ),
+            (
                 "C",
                 "take over the jobs that are only in your crontab (◇ under Cron jobs)",
+            ),
+            (
+                "s",
+                "sort the routines: what needs you first, or by name (the choice is kept)",
             ),
             ("i", "Nerd Font icons / plain symbols"),
             ("?", "these keys"),
@@ -3225,7 +3659,12 @@ const HELP: [(&str, &[(&str, &str)]); 7] = [
             ("c", "duplicate (the copy starts switched off)"),
             ("o", "go to the tab of its last run"),
             ("l", "output of its last run"),
+            ("x", "stop its run that is going (asks first)"),
             ("h", "its runs (or click \"n runs ›\"); Esc comes back"),
+            (
+                "Line on top",
+                "what needs you, what is running and what comes next; a click goes there",
+            ),
             ("d  Del", "delete (asks: keep its runs, or delete them too)"),
             (
                 "⏎ on ◇",
@@ -3236,11 +3675,22 @@ const HELP: [(&str, &[(&str, &str)]); 7] = [
     (
         "Runs",
         &[
-            ("⏎", "go to the run's tab, or its output once the tab is closed"),
-            ("l", "output of the run"),
+            (
+                "⏎",
+                "open the run: how it went and why, its result and the end of its output; the keys below work there too",
+            ),
+            ("o", "go to the run's tab, or its output once the tab is closed"),
+            ("l", "the whole output of the run"),
             ("f", "open the output file"),
+            ("r", "run its routine again (asks first)"),
+            ("x", "stop the run while it is going (asks first)"),
             ("h", "only its runs; again for all runs"),
-            ("Esc", "leave \"only its runs\": back to the routine, or all runs"),
+            ("p", "only runs that went wrong or need you; again for all"),
+            ("/", "search: the routine's name, the message or the result"),
+            (
+                "Esc",
+                "remove the filters: back to the routine, or all runs (✕ removes one)",
+            ),
             ("d  Del", "delete the run (asks first)"),
         ],
     ),
@@ -3250,11 +3700,15 @@ const HELP: [(&str, &[(&str, &str)]); 7] = [
             ("↑ ↓  Tab", "field (PgUp, PgDn: several)"),
             (
                 "⏎  Space",
-                "choose from the list, write the prompt, show or hide More settings, save",
+                "choose from the list, write the prompt, switch a weekday, show or hide More settings, save",
             ),
             (
                 "← →",
-                "next / previous choice; in a text field they move the cursor",
+                "next / previous choice; in a text field they move the cursor, on the weekdays from day to day",
+            ),
+            (
+                "1–7",
+                "on the weekdays: switch Monday (1) to Sunday (7)",
             ),
             (
                 "Home  End",
@@ -3309,7 +3763,7 @@ const HELP: [(&str, &[(&str, &str)]); 7] = [
             ("typing", "narrows a long list (such as the agents)"),
             (
                 "y",
-                "yes; ⏎ too where nothing is lost. Deleting, discarding and running by hand need y",
+                "yes; ⏎ too where nothing is lost. Deleting, discarding, stopping a run and running by hand need y",
             ),
             ("r", "when deleting a routine: delete its runs too"),
             ("any other key", "no"),

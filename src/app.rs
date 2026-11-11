@@ -11,7 +11,7 @@ use crate::routine::{self, Routine, Settings};
 use crate::runner;
 use crate::scheduler;
 use crate::store::{self, Run};
-use crate::theme::{Icons, ACCENT, GREEN, MUTED, RED, YELLOW};
+use crate::theme::{Icons, ACCENT, BLUE, GREEN, MUTED, RED, YELLOW};
 use crate::ui;
 use chrono::{DateTime, Local};
 use ratatui::crossterm::event::{
@@ -20,7 +20,7 @@ use ratatui::crossterm::event::{
 use ratatui::layout::Rect;
 use ratatui::style::Color;
 use ratatui::DefaultTerminal;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -85,6 +85,69 @@ pub enum Hit {
     Take(usize),
     /// A weekday switch in the form (Monday is 0).
     Day(usize),
+    /// The ✕ of a filter of the Runs tab.
+    Unfilter(RunFilter),
+    /// A part of the line above the routines, such as "2 went wrong".
+    Attention(Attention),
+}
+
+/// The filters of the Runs tab, which narrow it together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunFilter {
+    /// Only the runs of one routine.
+    Routine,
+    /// Only runs that went wrong or need the owner.
+    Problems,
+    /// Only runs with the searched text.
+    Search,
+}
+
+/// What a routine wants from its owner, most pressing first. The list is
+/// sorted by it, and the line above the routines counts each kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Attention {
+    /// Its run waits for an answer.
+    NeedsYou,
+    /// Its last run went wrong.
+    WentWrong,
+    /// New or changed outside the list: it waits for approval.
+    ToApprove,
+    /// Something in its files keeps it from running.
+    CannotRun,
+    /// A run of it is going.
+    Running,
+    /// On, with a next time (or none, such as "when Herdr starts").
+    Waiting,
+    Off,
+}
+
+/// How the routines are sorted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Sort {
+    /// What needs the owner first, then by next time, off last.
+    #[default]
+    Attention,
+    Name,
+}
+
+impl Sort {
+    fn word(self) -> &'static str {
+        match self {
+            Sort::Attention => "attention",
+            Sort::Name => "name",
+        }
+    }
+}
+
+/// What a list to choose from is for.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PickFor {
+    /// `n`: how to create a routine.
+    New,
+    /// A field of the form.
+    Field(Field),
+    /// When the computer is kept awake.
+    Awake,
 }
 
 /// Runs the system's opener (first argument) on a web link, true when it
@@ -102,8 +165,9 @@ pub struct Picker {
     pub title: String,
     pub items: Vec<crate::form::Item>,
     pub sel: usize,
-    /// The form field it fills; None for "how to create a routine".
-    pub field: Option<Field>,
+    pub purpose: PickFor,
+    /// A note under the entries, about all of them.
+    pub hint: String,
     /// Typed to narrow a long list (such as the models an agent lists).
     pub filter: String,
     /// Every entry; `items` is what the filter leaves.
@@ -118,14 +182,15 @@ impl Picker {
         title: String,
         items: Vec<crate::form::Item>,
         sel: usize,
-        field: Option<Field>,
+        purpose: PickFor,
     ) -> Picker {
         Picker {
             title,
             all: items.clone(),
             items,
             sel,
-            field,
+            purpose,
+            hint: String::new(),
             filter: String::new(),
             top: 0,
         }
@@ -159,6 +224,15 @@ pub struct Input {
     pub title: String,
     pub hint: String,
     pub text: String,
+    pub purpose: InputFor,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum InputFor {
+    /// A model name for the form.
+    Model,
+    /// The text the Runs tab is searched for.
+    Search,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -168,6 +242,8 @@ pub enum ConfirmFor {
     Delete(String, bool),
     /// One run: routine id and run id.
     DeleteRun(String, String),
+    /// Ending a run that is going: routine id and run id.
+    StopRun(String, String),
     DiscardForm,
     /// What was written in the prompt editor since it opened.
     DiscardEditor,
@@ -193,6 +269,7 @@ impl Confirm {
             ConfirmFor::Run(_) => "run",
             ConfirmFor::Delete(_, true) => "delete, keep runs",
             ConfirmFor::Delete(_, false) | ConfirmFor::DeleteRun(..) => "delete",
+            ConfirmFor::StopRun(..) => "stop",
             ConfirmFor::DiscardForm | ConfirmFor::DiscardEditor => "discard",
             ConfirmFor::Import(_, crate::crontab::Take::ToHerdr) => "move",
             ConfirmFor::Import(..) => "take over",
@@ -216,13 +293,14 @@ impl Confirm {
             self.purpose,
             ConfirmFor::Delete(..)
                 | ConfirmFor::DeleteRun(..)
+                | ConfirmFor::StopRun(..)
                 | ConfirmFor::DiscardForm
                 | ConfirmFor::DiscardEditor
         )
     }
 
-    /// Whether ⏎ confirms like `y`. Deleting, discarding and running by
-    /// hand ask for `y` itself.
+    /// Whether ⏎ confirms like `y`. Deleting, discarding, stopping a run
+    /// and running by hand ask for `y` itself.
     pub fn enter_confirms(&self) -> bool {
         !self.danger() && !matches!(self.purpose, ConfirmFor::Run(_))
     }
@@ -244,10 +322,26 @@ pub struct LogView {
     pub note: String,
 }
 
+/// One run on a page of its own: how it went, its result and the end of
+/// its output. The run itself is read from the list each time it is drawn,
+/// so a run that is going shows how it goes on.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunPage {
+    pub routine_id: String,
+    pub run_id: String,
+    /// The end of the run's output, read when the page opened and again
+    /// while the run is going.
+    pub tail: Vec<String>,
+    /// The output is longer than `tail`.
+    pub cut: bool,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Mode {
     Normal,
     Help,
+    /// A run's page (⏎ on a run).
+    RunPage(RunPage),
     Pick(Picker),
     Input(Input),
     Confirm(Confirm),
@@ -377,9 +471,18 @@ pub fn until(t: &DateTime<Local>, now: &DateTime<Local>) -> String {
     }
 }
 
+/// How long a run took; for one that is going, how long it has been at
+/// work (without the time the computer slept).
 pub fn took(run: &Run) -> String {
-    let end = run.ended.unwrap_or_else(Local::now);
-    let s = (end - run.started).num_seconds().max(0);
+    span_words(match run.ended {
+        Some(end) => (end - run.started).num_seconds(),
+        None => run.awake_for(Local::now()).num_seconds(),
+    })
+}
+
+/// A length of time in words: "40 s", "12 min", "2 h 5 min".
+pub fn span_words(seconds: i64) -> String {
+    let s = seconds.max(0);
     if s < 60 {
         format!("{s} s")
     } else if s < 3600 {
@@ -400,6 +503,19 @@ pub struct App {
     pub all_runs: Vec<Run>,
     /// The routine whose runs the Runs view shows; None for all.
     pub run_filter: Option<String>,
+    /// The Runs view shows only runs that went wrong or need the owner.
+    pub runs_problems: bool,
+    /// The Runs view shows only runs with this text (in the routine's
+    /// name, the message or the result); empty for all.
+    pub runs_search: String,
+    /// How the routines are sorted, kept across restarts.
+    pub sort: Sort,
+    /// When the computer is kept awake.
+    pub awake: crate::awake::Mode,
+    /// Routines that wait for a free place, with the time they run for.
+    pub waiting: BTreeMap<String, DateTime<Local>>,
+    /// Routines whose runs went wrong in a row, with how many.
+    pub failing: HashMap<String, u32>,
     pub sel_routine: usize,
     /// The cursor in the Cron jobs view.
     pub sel_cron: usize,
@@ -465,6 +581,12 @@ impl App {
             runs: Vec::new(),
             all_runs: Vec::new(),
             run_filter: None,
+            runs_problems: false,
+            runs_search: String::new(),
+            sort: Sort::default(),
+            awake: crate::awake::Mode::default(),
+            waiting: BTreeMap::new(),
+            failing: HashMap::new(),
             sel_routine: 0,
             sel_cron: 0,
             sel_run: 0,
@@ -495,6 +617,10 @@ impl App {
             autostart_after_intro: false,
             opened: None,
             accounts: None,
+        };
+        app.sort = match std::fs::read_to_string(app.sort_file()) {
+            Ok(text) if text.trim() == Sort::Name.word() => Sort::Name,
+            _ => Sort::Attention,
         };
         app.reload();
         app
@@ -529,15 +655,31 @@ impl App {
                 self.filter_from = None;
             }
         }
-        self.runs = match &self.run_filter {
-            Some(id) => self
-                .all_runs
-                .iter()
-                .filter(|r| &r.routine_id == id)
-                .cloned()
-                .collect(),
-            None => self.all_runs.clone(),
-        };
+        self.runs = self.shown_runs();
+        self.waiting = scheduler::waiting_for_a_place(&self.paths);
+        // How many runs went wrong in a row, for those whose last one did.
+        self.failing = self
+            .routines
+            .iter()
+            .filter(|r| {
+                self.latest_run(&r.id)
+                    .is_some_and(|run| run.status.problem())
+            })
+            .map(|r| (r.id.clone(), runner::failures_in_a_row(&self.paths, &r.id)))
+            .filter(|(_, n)| *n >= 2)
+            .collect();
+        if self.sort == Sort::Attention {
+            // What needs the owner first; the names keep the rest in order.
+            let now = Local::now();
+            let mut keyed: Vec<((Attention, i64), Routine)> = std::mem::take(&mut self.routines)
+                .into_iter()
+                .map(|r| (self.attention_key(&r, &now), r))
+                .collect();
+            keyed.sort_by_key(|(key, _)| *key);
+            self.routines = keyed.into_iter().map(|(_, r)| r).collect();
+        }
+        self.awake = crate::awake::mode(&self.paths);
+        self.refresh_run_page();
         self.scheduler = scheduler::running(&self.paths);
         self.accounts = crate::accounts::list(&self.paths);
         if crontab_due {
@@ -554,6 +696,171 @@ impl App {
         self.sel_run = self.sel_run.min(self.runs.len().saturating_sub(1));
         self.last_load = Instant::now();
         self.fill_models();
+    }
+
+    /// The runs the Runs view shows: all, narrowed by its filters.
+    fn shown_runs(&self) -> Vec<Run> {
+        let text = self.runs_search.trim().to_lowercase();
+        self.all_runs
+            .iter()
+            .filter(|r| {
+                self.run_filter
+                    .as_ref()
+                    .is_none_or(|id| &r.routine_id == id)
+            })
+            .filter(|r| {
+                !self.runs_problems || r.status.problem() || r.status == store::Status::NeedsYou
+            })
+            .filter(|r| {
+                text.is_empty()
+                    || [&r.routine_name, &r.message, &r.result]
+                        .iter()
+                        .any(|part| part.to_lowercase().contains(&text))
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Whether the Runs view is narrowed by any filter.
+    pub fn runs_filtered(&self) -> bool {
+        self.run_filter.is_some() || self.runs_problems || !self.runs_search.trim().is_empty()
+    }
+
+    /// What a routine wants from its owner (see [`Attention`]).
+    pub fn attention(&self, r: &Routine) -> Attention {
+        let status = self.latest_run(&r.id).map(|run| run.status);
+        if status == Some(store::Status::NeedsYou) {
+            Attention::NeedsYou
+        } else if status.is_some_and(|s| s.problem()) {
+            Attention::WentWrong
+        } else if r.problem.is_some() {
+            Attention::CannotRun
+        } else if !r.approved {
+            Attention::ToApprove
+        } else if status.is_some_and(|s| s.active()) {
+            Attention::Running
+        } else if r.file.enabled {
+            Attention::Waiting
+        } else {
+            Attention::Off
+        }
+    }
+
+    /// When a routine that is on and can run comes next; none for one
+    /// without a next time (such as "when Herdr starts").
+    pub fn next_time(&self, r: &Routine, now: &DateTime<Local>) -> Option<DateTime<Local>> {
+        if !r.file.enabled || !r.can_run() {
+            return None;
+        }
+        match r.schedule() {
+            Some(crate::schedule::Schedule::AtStart) | None => None,
+            Some(s) => s.next_after(now),
+        }
+    }
+
+    /// The place of a routine in the list sorted by what needs the owner:
+    /// the kind, then the next time (those without one come after).
+    fn attention_key(&self, r: &Routine, now: &DateTime<Local>) -> (Attention, i64) {
+        let kind = self.attention(r);
+        let next = match kind {
+            Attention::Waiting => self.next_time(r, now).map_or(i64::MAX, |t| t.timestamp()),
+            _ => 0,
+        };
+        (kind, next)
+    }
+
+    /// The line above the routines: what needs the owner, what is going
+    /// and what comes next. Only the parts that are not zero.
+    pub fn attention_parts(&self) -> Vec<(Attention, String, Color)> {
+        let count = |kind: Attention| {
+            self.routines
+                .iter()
+                .filter(|r| self.attention(r) == kind)
+                .count()
+        };
+        let mut v = Vec::new();
+        let mut part = |kind: Attention, one: &str, many: &str, color: Color| {
+            let n = count(kind);
+            if n > 0 {
+                v.push((
+                    kind,
+                    format!("{n} {}", if n == 1 { one } else { many }),
+                    color,
+                ));
+            }
+        };
+        part(Attention::NeedsYou, "needs you", "need you", YELLOW);
+        part(Attention::WentWrong, "went wrong", "went wrong", RED);
+        part(Attention::ToApprove, "to approve", "to approve", YELLOW);
+        part(Attention::CannotRun, "cannot run", "cannot run", RED);
+        part(Attention::Running, "running", "running", BLUE);
+        if let Some((r, when)) = self.next_up() {
+            v.push((
+                Attention::Waiting,
+                format!("next: {} {when}", r.file.name),
+                MUTED,
+            ));
+        }
+        v
+    }
+
+    /// The routine that runs next, and when ("in 9 min", "Thu 02:30").
+    pub fn next_up(&self) -> Option<(&Routine, String)> {
+        let now = Local::now();
+        self.routines
+            .iter()
+            .filter(|r| !self.waiting.contains_key(&r.id))
+            .filter_map(|r| self.next_time(r, &now).map(|t| (t, r)))
+            .min_by_key(|(t, _)| *t)
+            .map(|(t, r)| (r, until(&t, &now)))
+    }
+
+    /// A click on a part of that line: the runs that went wrong, or the
+    /// first routine the part counts.
+    fn attention_click(&mut self, kind: Attention) {
+        if kind == Attention::WentWrong {
+            self.run_filter = None;
+            self.filter_from = None;
+            self.runs_search.clear();
+            self.runs_problems = true;
+            self.view = View::Runs;
+            self.sel_run = 0;
+            self.tops[2] = 0;
+            self.follow = true;
+            return self.reload();
+        }
+        let id = if kind == Attention::Waiting {
+            self.next_up().map(|(r, _)| r.id.clone())
+        } else {
+            self.routines
+                .iter()
+                .find(|r| self.attention(r) == kind)
+                .map(|r| r.id.clone())
+        };
+        if let Some(id) = id {
+            self.select_id(&id);
+        }
+    }
+
+    fn sort_file(&self) -> std::path::PathBuf {
+        self.paths.state.join("list-sort")
+    }
+
+    /// `s`: the routines by what needs the owner first, or by name. The
+    /// choice is kept for the next time the list opens.
+    fn toggle_sort(&mut self) {
+        self.sort = match self.sort {
+            Sort::Attention => Sort::Name,
+            Sort::Name => Sort::Attention,
+        };
+        let saved = paths::write_atomic(&self.sort_file(), self.sort.word().as_bytes());
+        self.reload();
+        self.follow = true;
+        match (self.sort, saved) {
+            (_, Err(e)) => self.flash(format!("Sorted, but the choice was not saved: {e}"), YELLOW),
+            (Sort::Attention, _) => self.flash("Sorted by what needs you first", ACCENT),
+            (Sort::Name, _) => self.flash("Sorted by name", ACCENT),
+        }
     }
 
     /// What each list's cursor is on: the routine's id, the cron job's id
@@ -795,13 +1102,19 @@ impl App {
             return self.flash("No run yet", MUTED);
         }
         let from = self.view;
+        // All of its runs: what narrowed the Runs tab before does not
+        // come along.
+        self.runs_problems = false;
+        self.runs_search.clear();
         self.filter_runs(Some(id));
         self.filter_from = Some(from);
     }
 
-    /// Esc in the runs of one routine: back to that routine where the
-    /// filter came from its tab, else all runs again.
+    /// Esc in filtered runs: every filter goes. Back to the routine where
+    /// "only its runs" came from its tab, else all runs again.
     fn leave_filter(&mut self) {
+        self.runs_problems = false;
+        self.runs_search.clear();
         match self.filter_from.take() {
             Some(view) => {
                 self.run_filter = None;
@@ -811,6 +1124,51 @@ impl App {
             }
             None => self.filter_runs(None),
         }
+    }
+
+    /// Applies a changed filter of the Runs view. The cursor stays on its
+    /// run where the new list still has it.
+    fn refilter_runs(&mut self) {
+        let on = self
+            .runs
+            .get(self.sel_run)
+            .map(|r| (r.routine_id.clone(), r.id.clone()));
+        self.runs = self.shown_runs();
+        self.sel_run = on
+            .and_then(|(routine, run)| {
+                self.runs
+                    .iter()
+                    .position(|r| r.routine_id == routine && r.id == run)
+            })
+            .unwrap_or(0);
+        self.tops[2] = 0;
+        self.follow = true;
+    }
+
+    /// `p` in Runs: only the runs that went wrong or need the owner.
+    fn toggle_problems(&mut self) {
+        self.runs_problems = !self.runs_problems;
+        self.refilter_runs();
+    }
+
+    /// `/` in Runs: asks for the text to search the runs for.
+    fn ask_search(&mut self) {
+        self.mode = Mode::Input(Input {
+            title: "Search the runs".into(),
+            hint: "Shows the runs with this text in the routine's name, the message or the result. Empty shows all again.".into(),
+            text: self.runs_search.clone(),
+            purpose: InputFor::Search,
+        });
+    }
+
+    /// The ✕ of a filter: only that one goes.
+    fn unfilter(&mut self, which: RunFilter) {
+        match which {
+            RunFilter::Routine => return self.filter_runs(None),
+            RunFilter::Problems => self.runs_problems = false,
+            RunFilter::Search => self.runs_search.clear(),
+        }
+        self.refilter_runs();
     }
 
     /// The name of the routine the runs are filtered to.
@@ -981,6 +1339,193 @@ impl App {
         }
     }
 
+    /// The run a key is about: the one under the cursor in Runs, else the
+    /// last run of the routine under the cursor.
+    fn run_at_cursor(&self) -> Option<Run> {
+        match self.view {
+            View::Runs => self.runs.get(self.sel_run).cloned(),
+            _ => self
+                .selected_routine()
+                .and_then(|r| self.latest_run(&r.id))
+                .cloned(),
+        }
+    }
+
+    /// `x`: ends a run that is going, after asking.
+    fn ask_stop(&mut self, run: Option<Run>) {
+        let Some(run) = run.filter(|r| r.status.active()) else {
+            return self.flash("No run is going here", MUTED);
+        };
+        let what = if run.cron_pid != 0 {
+            "Its command is stopped."
+        } else {
+            "Its tab is closed; what it wrote so far is kept."
+        };
+        self.mode = Mode::Confirm(Confirm {
+            question: "Stop this run?".into(),
+            lines: vec![
+                format!(
+                    "{}, started {}.",
+                    run.routine_name,
+                    ago(&run.started, &Local::now())
+                ),
+                what.into(),
+            ],
+            purpose: ConfirmFor::StopRun(run.routine_id, run.id),
+        });
+    }
+
+    fn stop_run(&mut self, routine_id: &str, run_id: &str) {
+        // The record as it is now: the run may have ended meanwhile.
+        let Some(mut run) = store::load(&self.paths, routine_id, run_id) else {
+            self.reload();
+            return self.flash("Not stopped: the run is not there any more", RED);
+        };
+        let cron = run.cron_pid != 0;
+        match runner::stop(&self.paths, &mut run) {
+            // A cron job's own process writes down how it ended.
+            Ok(()) if cron => self.flash("Stopping; its run shows it in a moment", ACCENT),
+            Ok(()) => self.flash("Run stopped", ACCENT),
+            Err(e) => self.flash(format!("Not stopped: {e}"), RED),
+        }
+        self.reload();
+    }
+
+    /// `d` on a run: deletes it, after asking.
+    fn ask_delete_run(&mut self, run: Run) {
+        if run.status.active() {
+            return self.flash("It is still running (x stops it)", MUTED);
+        }
+        self.mode = Mode::Confirm(Confirm {
+            question: format!("Delete this run of {}?", run.routine_name),
+            lines: vec!["Its record, output and result are deleted. An open tab stays.".into()],
+            purpose: ConfirmFor::DeleteRun(run.routine_id, run.id),
+        });
+    }
+
+    /// The end of a run's output, for its page: `(lines, there is more)`.
+    fn output_tail(&self, run: &Run) -> (Vec<String>, bool) {
+        let (text, cut) = self
+            .output_file(run)
+            .and_then(|f| paths::read_tail_lossy(&f, 64 * 1024))
+            .unwrap_or_default();
+        let mut lines: Vec<String> = text.lines().map(visible_text).collect();
+        while lines.last().is_some_and(|l| l.trim().is_empty()) {
+            lines.pop();
+        }
+        (lines, cut)
+    }
+
+    /// ⏎ on a run: its page.
+    fn open_run_page(&mut self, run: &Run) {
+        let (tail, cut) = self.output_tail(run);
+        self.mode = Mode::RunPage(RunPage {
+            routine_id: run.routine_id.clone(),
+            run_id: run.id.clone(),
+            tail,
+            cut,
+        });
+    }
+
+    /// The run a page shows, as the list has it now.
+    pub fn page_run(&self, page: &RunPage) -> Option<&Run> {
+        self.all_runs
+            .iter()
+            .find(|r| r.routine_id == page.routine_id && r.id == page.run_id)
+    }
+
+    /// After a reload: a page whose run is gone closes, and one whose run
+    /// is going reads the output again.
+    fn refresh_run_page(&mut self) {
+        let Mode::RunPage(page) = &self.mode else {
+            return;
+        };
+        match self.page_run(page).cloned() {
+            None => self.mode = Mode::Normal,
+            Some(run) if run.status.active() || page.tail.is_empty() => {
+                let (tail, cut) = self.output_tail(&run);
+                if let Mode::RunPage(page) = &mut self.mode {
+                    page.tail = tail;
+                    page.cut = cut;
+                }
+            }
+            Some(_) => {}
+        }
+    }
+
+    /// A key on a run's page: the same keys as on the run in the list.
+    fn run_page_key(&mut self, page: RunPage, code: KeyCode) {
+        let Some(run) = self.page_run(&page).cloned() else {
+            self.mode = Mode::Normal;
+            return;
+        };
+        match code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => self.mode = Mode::Normal,
+            KeyCode::Char('o') => {
+                self.mode = Mode::Normal;
+                self.open_run(Some(run));
+            }
+            KeyCode::Char('l') => self.show_log(&run),
+            KeyCode::Char('f') => self.open_output_file(&run),
+            KeyCode::Char('r') => {
+                self.mode = Mode::Normal;
+                self.ask_run_of(&run.routine_id);
+            }
+            KeyCode::Char('x') => self.ask_stop(Some(run)),
+            KeyCode::Char('d') | KeyCode::Delete => self.ask_delete_run(run),
+            _ => {}
+        }
+    }
+
+    /// `W` or a click on "awake": when the computer is kept awake.
+    fn ask_awake(&mut self) {
+        if !crate::awake::available() {
+            return self.flash("Keeping the computer awake is not supported here", MUTED);
+        }
+        let items: Vec<crate::form::Item> = crate::awake::Mode::ALL
+            .iter()
+            .map(|m| crate::form::Item {
+                value: m.title().into(),
+                label: m.title().into(),
+                detail: m.detail().into(),
+            })
+            .collect();
+        let now = crate::awake::mode(&self.paths);
+        let sel = crate::awake::Mode::ALL
+            .iter()
+            .position(|m| *m == now)
+            .unwrap_or(0);
+        let mut picker = Picker::new("Keep the computer awake".into(), items, sel, PickFor::Awake);
+        picker.hint =
+            "A laptop with its lid closed still goes to sleep, whatever is chosen here.".into();
+        self.mode = Mode::Pick(picker);
+    }
+
+    fn set_awake(&mut self, title: &str) {
+        let Some(mode) = crate::awake::Mode::ALL
+            .into_iter()
+            .find(|m| m.title() == title)
+        else {
+            return;
+        };
+        match crate::awake::set_mode(&self.paths, mode) {
+            Ok(()) => {
+                self.awake = mode;
+                use crate::awake::Mode as Awake;
+                let (text, color) = match mode {
+                    Awake::Runs => ("The computer now stays awake while a run is going", GREEN),
+                    Awake::Always => ("The computer now stays awake while Herdr runs", GREEN),
+                    Awake::Off => (
+                        "The computer now sleeps as its own settings say, also in the middle of a run",
+                        YELLOW,
+                    ),
+                };
+                self.flash(text, color);
+            }
+            Err(e) => self.flash(format!("Not changed: {e}"), RED),
+        }
+    }
+
     /// The file with a run's output: a shell command's (or check's) whole
     /// output, else what its tab showed.
     pub fn output_file(&self, run: &Run) -> Option<std::path::PathBuf> {
@@ -1040,7 +1585,7 @@ impl App {
         }
         if lines.is_empty() {
             let why = if run.status.active() {
-                "The run is still going: ⏎ on it in Runs goes to its tab."
+                "The run is still going: o goes to its tab."
             } else {
                 "No output was saved for this run."
             };
@@ -1105,7 +1650,7 @@ impl App {
             ],
             // In the Cron jobs tab, a cron job is the likely choice.
             usize::from(self.view == View::Cron),
-            None,
+            PickFor::New,
         ));
     }
 
@@ -1364,8 +1909,15 @@ impl App {
     }
 
     fn ask_run(&mut self) {
-        let Some(r) = self.selected_routine().cloned() else {
-            return;
+        if let Some(id) = self.selected_routine().map(|r| r.id.clone()) {
+            self.ask_run_of(&id);
+        }
+    }
+
+    /// Asks before running a routine by hand.
+    fn ask_run_of(&mut self, id: &str) {
+        let Some(r) = self.routines.iter().find(|r| r.id == id).cloned() else {
+            return self.flash("Its routine was deleted", MUTED);
         };
         if let Some(p) = &r.problem {
             return self.flash(format!("Cannot run: {p}"), RED);
@@ -1672,6 +2224,7 @@ impl App {
                 }
                 self.reload();
             }
+            ConfirmFor::StopRun(routine_id, run_id) => self.stop_run(&routine_id, &run_id),
             ConfirmFor::DiscardForm => self.form = None,
             ConfirmFor::DiscardEditor => self.editor = None,
             ConfirmFor::Import(jobs, how) => self.import_cron(jobs, how),
@@ -1760,7 +2313,7 @@ impl App {
             form.label(field).into(),
             items,
             sel,
-            Some(field),
+            PickFor::Field(field),
         ));
     }
 
@@ -1769,13 +2322,17 @@ impl App {
         let Some(item) = p.items.get(p.sel) else {
             return;
         };
-        let Some(field) = p.field else {
-            match item.value.as_str() {
-                BY_AGENT => self.create_with_agent(),
-                BY_CRON => self.new_cron_form(),
-                _ => self.new_form(),
+        let field = match p.purpose {
+            PickFor::New => {
+                match item.value.as_str() {
+                    BY_AGENT => self.create_with_agent(),
+                    BY_CRON => self.new_cron_form(),
+                    _ => self.new_form(),
+                }
+                return;
             }
-            return;
+            PickFor::Awake => return self.set_awake(&item.value),
+            PickFor::Field(field) => field,
         };
         if item.value == OTHER_MODEL {
             let text = self
@@ -1787,6 +2344,7 @@ impl App {
                 title: "Model name".into(),
                 hint: "The model's full name or an alias the agent knows. Empty means the agent's default.".into(),
                 text,
+                purpose: InputFor::Model,
             });
             return;
         }
@@ -1797,8 +2355,16 @@ impl App {
 
     fn entered(&mut self, input: Input) {
         self.mode = Mode::Normal;
-        if let Some(form) = self.form.as_mut() {
-            form.choose(Field::Model, input.text.trim());
+        match input.purpose {
+            InputFor::Model => {
+                if let Some(form) = self.form.as_mut() {
+                    form.choose(Field::Model, input.text.trim());
+                }
+            }
+            InputFor::Search => {
+                self.runs_search = input.text.trim().to_string();
+                self.refilter_runs();
+            }
         }
     }
 
@@ -1889,8 +2455,9 @@ impl App {
             }
             View::Routines | View::Cron => self.edit_selected(),
             View::Runs => {
-                let run = self.runs.get(self.sel_run).cloned();
-                self.open_run(run);
+                if let Some(run) = self.runs.get(self.sel_run).cloned() {
+                    self.open_run_page(&run);
+                }
             }
         }
     }
@@ -1925,6 +2492,7 @@ impl App {
                 KeyCode::End | KeyCode::Char('G') => self.help_scroll = self.help_max,
                 _ => {}
             },
+            Mode::RunPage(page) => self.run_page_key(page, k.code),
             Mode::Menu(mut m) => match k.code {
                 KeyCode::Up | KeyCode::BackTab if !m.items.is_empty() => {
                     m.sel = (m.sel + m.items.len() - 1) % m.items.len();
@@ -2179,11 +2747,23 @@ impl App {
     fn list_key(&mut self, k: KeyEvent) {
         match k.code {
             KeyCode::Char('q') => self.mode = Mode::AskQuit,
-            // Esc in the runs of one routine goes back.
-            KeyCode::Esc if self.run_filter.is_some() && self.view == View::Runs => {
-                self.leave_filter()
-            }
+            // Esc in filtered runs removes the filters.
+            KeyCode::Esc if self.runs_filtered() && self.view == View::Runs => self.leave_filter(),
             KeyCode::Esc => {}
+            KeyCode::Char('p') if self.view == View::Runs => self.toggle_problems(),
+            KeyCode::Char('/') if self.view == View::Runs => self.ask_search(),
+            KeyCode::Char('o') if self.view == View::Runs => {
+                if let Some(run) = self.runs.get(self.sel_run).cloned() {
+                    self.open_run(Some(run));
+                }
+            }
+            KeyCode::Char('r') if self.view == View::Runs => {
+                if let Some(id) = self.runs.get(self.sel_run).map(|r| r.routine_id.clone()) {
+                    self.ask_run_of(&id);
+                }
+            }
+            KeyCode::Char('W') => self.ask_awake(),
+            KeyCode::Char('s') => self.toggle_sort(),
             KeyCode::Char('h') => match self.view {
                 View::Routines | View::Cron if self.selected_cron_job().is_some() => {
                     self.only_in_crontab()
@@ -2205,18 +2785,7 @@ impl App {
             }
             KeyCode::Char('d') | KeyCode::Delete if self.view == View::Runs => {
                 if let Some(run) = self.runs.get(self.sel_run).cloned() {
-                    if run.status.active() {
-                        self.flash("It is still running", MUTED);
-                    } else {
-                        self.mode = Mode::Confirm(Confirm {
-                            question: format!("Delete this run of {}?", run.routine_name),
-                            lines: vec![
-                                "Its record, output and result are deleted. An open tab stays."
-                                    .into(),
-                            ],
-                            purpose: ConfirmFor::DeleteRun(run.routine_id, run.id),
-                        });
-                    }
+                    self.ask_delete_run(run);
                 }
             }
             KeyCode::Char('?') => {
@@ -2242,11 +2811,15 @@ impl App {
             KeyCode::Enter => self.enter(),
             // A job that is only in the crontab has no runs, prompt or
             // switch here: say so instead of doing nothing.
-            KeyCode::Char('l' | 'e' | 'p' | 'r' | 'a' | ' ' | 'c' | 'o' | 'd')
+            KeyCode::Char('l' | 'e' | 'p' | 'r' | 'a' | ' ' | 'c' | 'o' | 'd' | 'x')
             | KeyCode::Delete
                 if self.selected_cron_job().is_some() =>
             {
                 self.only_in_crontab()
+            }
+            KeyCode::Char('x') if self.rows_len() > 0 => {
+                let run = self.run_at_cursor();
+                self.ask_stop(run);
             }
             KeyCode::Char('l') => {
                 let run = match self.view {
@@ -2381,6 +2954,12 @@ impl App {
                 }
                 v.push(item("Output of its last run", "l", MenuAction::Key('l')));
                 v.push(item("Its runs", "h", MenuAction::Key('h')));
+                if run.status.active() {
+                    v.push(MenuItem {
+                        danger: true,
+                        ..item("Stop its run…", "x", MenuAction::Key('x'))
+                    });
+                }
             }
             v.push(MenuItem {
                 danger: true,
@@ -2397,15 +2976,21 @@ impl App {
             }
         } else if let (View::Runs, Some(run)) = (self.view, self.runs.get(self.sel_run)) {
             let open = !run.tab_closed && run.cron_pid == 0 && !run.pane_id.is_empty();
-            v.push(item(
-                if open { "Go to its tab" } else { "Its output" },
-                "⏎",
-                MenuAction::Key('\n'),
-            ));
+            v.push(item("Open", "⏎", MenuAction::Key('\n')));
             if open {
-                v.push(item("Its output", "l", MenuAction::Key('l')));
+                v.push(item("Go to its tab", "o", MenuAction::Key('o')));
             }
+            v.push(item("Its output", "l", MenuAction::Key('l')));
             v.push(item("Open the output file", "f", MenuAction::Key('f')));
+            if self.routines.iter().any(|r| r.id == run.routine_id) {
+                v.push(item("Run its routine again…", "r", MenuAction::Key('r')));
+            }
+            if run.status.active() {
+                v.push(MenuItem {
+                    danger: true,
+                    ..item("Stop this run…", "x", MenuAction::Key('x'))
+                });
+            }
             v.push(item(
                 if self.run_filter.is_some() {
                     "All runs"
@@ -2556,6 +3141,16 @@ impl App {
                 if let (true, Some(form)) = (normal, self.form.as_mut()) {
                     form.select(Field::Days);
                     form.toggle_day(day);
+                }
+            }
+            Hit::Unfilter(which) => {
+                if normal {
+                    self.unfilter(which);
+                }
+            }
+            Hit::Attention(kind) => {
+                if normal {
+                    self.attention_click(kind);
                 }
             }
             // From the footer: a click is never typed into a field.
@@ -3064,6 +3659,9 @@ mod tests {
             socket: dir.join("sock"),
         };
         std::fs::create_dir_all(&paths.state).unwrap();
+        // By name, so the tests know which routine is where; the order by
+        // what needs the owner has tests of its own.
+        std::fs::write(paths.state.join("list-sort"), "name").unwrap();
         for (i, name) in ["Morning report", "Weekly cleanup"].iter().enumerate() {
             let mut f = Form::new("/tmp");
             f.name = name.to_string();
@@ -3655,8 +4253,12 @@ mod tests {
         let head = at(&format!(" {name} ─")).expect("details heading");
         assert!(at(" Schedule        Weekdays").is_some_and(|i| i > head));
         assert!(at("Do task").is_some_and(|i| i > head), "the prompt shows");
-        // The routines follow each other without empty rows.
-        let first = at(&name).unwrap();
+        // The routines follow each other without empty rows (the line on
+        // top names the next one too).
+        let first = lines
+            .iter()
+            .position(|l| l.contains(&name) && !l.contains("next:"))
+            .unwrap();
         let other = a.routines[1].file.name.clone();
         assert_eq!(at(&other).unwrap(), first + 2);
         // They show whenever rows are free below the list, also in a
@@ -3710,7 +4312,7 @@ mod tests {
             lines[0]
         );
         assert!(lines.iter().any(|l| l
-            .contains(&format!("Only runs of {}  {count} of {all}", ids[1].1))
+            .contains(&format!("Only  runs of {} ✕   {count} of {all}", ids[1].1))
             && l.contains("Esc back to the routine")
             && l.contains("h all runs")));
         assert!(lines.iter().any(|l| l.contains("Result 1.1")));
@@ -3725,7 +4327,7 @@ mod tests {
         assert_eq!(a.runs.len(), a.all_runs.len());
         assert!(a.run_filter.is_none());
         let lines = screen(&mut a, 140, 30);
-        assert!(!lines.iter().any(|l| l.contains("Only runs of")));
+        assert!(!lines.iter().any(|l| l.contains("runs of")));
         // Esc goes back to the routine the filter came from.
         a.view = View::Routines;
         a.select_id(&ids[1].0);
@@ -4294,7 +4896,7 @@ mod tests {
         assert_eq!(hit_rect(&a, Hit::Row(target)), before);
         // So a second click lands on the same run and opens it.
         a.click(before.x + 5, before.y);
-        assert!(matches!(a.mode, Mode::Log(_)), "{:?}", a.mode);
+        assert!(matches!(a.mode, Mode::RunPage(_)), "{:?}", a.mode);
         press(&mut a, KeyCode::Esc);
         // The wheel moves the view, not the cursor.
         for _ in 0..3 {
@@ -4910,6 +5512,651 @@ mod tests {
         screen(a, w, h).join("\n")
     }
 
+    /// A made-up routine, saved in the list (so it is approved).
+    fn add_routine(a: &mut App, name: &str, enabled: bool) -> String {
+        let mut f = Form::new("/tmp");
+        f.name = name.to_string();
+        f.prompt = "Do the task.".into();
+        f.enabled = enabled;
+        let (file, prompt) = f.build().unwrap();
+        let r = Routine {
+            id: routine::new_id(&a.paths, name),
+            file,
+            prompt,
+            problem: None,
+            unreadable: false,
+            approved: false,
+        };
+        r.save_approved(&a.paths).unwrap();
+        r.id
+    }
+
+    /// A made-up run of a routine that ended (or is going) in `status`.
+    /// `n` orders the runs: a higher one is newer.
+    fn add_run(a: &mut App, id: &str, n: u32, status: store::Status, message: &str) -> Run {
+        let name = a
+            .routines
+            .iter()
+            .find(|r| r.id == id)
+            .map_or(id.to_string(), |r| r.file.name.clone());
+        let mut run = Run::new(id, &name, "claude", store::Trigger::Scheduled, None);
+        run.id = format!("20261101-08{n:02}00-000");
+        run.started = Local::now() - chrono::Duration::minutes(i64::from(60 - n));
+        if status.active() {
+            run.status = status;
+            run.message = message.into();
+        } else {
+            run.finish(status, message);
+        }
+        run.save(&a.paths).unwrap();
+        run
+    }
+
+    fn footer(a: &mut App, w: u16, h: u16) -> String {
+        screen(a, w, h)[h as usize - 1].clone()
+    }
+
+    #[test]
+    fn the_awake_chip_opens_a_choice_of_three() {
+        use crate::awake;
+        let mut a = app("awake");
+        if !awake::available() {
+            // No helper on this system: no chip, and the key says why.
+            assert!(!screen(&mut a, 160, 30)[0].contains("awake"));
+            press(&mut a, KeyCode::Char('W'));
+            assert!(a.flash.as_ref().unwrap().text.contains("not supported"));
+            return;
+        }
+        let top = screen(&mut a, 160, 30)[0].clone();
+        assert!(top.contains("awake during runs"), "{top}");
+        // It stands left of autostart and routines.
+        assert!(top.find("awake").unwrap() < top.find("routines o").unwrap());
+        // A click on it (or W) offers the three ways, with a note about
+        // the lid.
+        let chip = hit_rect(&a, Hit::Key('W'));
+        a.click(chip.x + 2, chip.y);
+        let Mode::Pick(p) = a.mode.clone() else {
+            panic!("no choice: {:?}", a.mode);
+        };
+        let names: Vec<&str> = p.items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(names, ["During runs", "Always", "Off"]);
+        assert_eq!(p.sel, 0, "the way that holds now is marked");
+        for (w, h) in [(160, 50), (80, 24), (60, 20)] {
+            let all = screen(&mut a, w, h).join("\n");
+            assert!(all.contains("Keep the computer awake"), "{all}");
+            assert!(all.contains("No idle sleep while a run is going"), "{all}");
+            assert!(all.contains("lid closed still goes to sleep"), "{all}");
+        }
+        press(&mut a, KeyCode::Down);
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(awake::mode(&a.paths), awake::Mode::Always);
+        assert_eq!(
+            a.flash.as_ref().unwrap().text,
+            "The computer now stays awake while Herdr runs"
+        );
+        assert!(screen(&mut a, 160, 30)[0].contains("awake always"));
+        // Off is a hollow sign and says what it means for a run.
+        press(&mut a, KeyCode::Char('W'));
+        press(&mut a, KeyCode::Char('3'));
+        assert_eq!(awake::mode(&a.paths), awake::Mode::Off);
+        assert!(a.flash.as_ref().unwrap().text.contains("middle of a run"));
+        let top = screen(&mut a, 160, 30)[0].clone();
+        assert!(top.contains("○ awake off"), "{top}");
+        // A narrow header keeps the tabs whole and shortens the chip.
+        for w in [60, 80, 100, 120] {
+            let top = screen(&mut a, w, 24)[0].clone();
+            assert!(top.contains(" Runs"), "{w}: {top}");
+        }
+        // Esc leaves it as it is.
+        press(&mut a, KeyCode::Char('W'));
+        press(&mut a, KeyCode::Esc);
+        assert_eq!(awake::mode(&a.paths), awake::Mode::Off);
+        assert!(screen_at_top(&mut a, 100, 40).contains("awake"));
+    }
+
+    #[test]
+    fn a_going_run_is_stopped_only_after_y() {
+        use std::os::unix::process::ExitStatusExt;
+        let mut a = app("stop");
+        a.icons.nerd = false;
+        // The run of "Morning report" is going, in another Herdr session.
+        let mut run = a.all_runs[0].clone();
+        run.status = store::Status::Running;
+        run.server = "another-session".into();
+        run.save(&a.paths).unwrap();
+        a.reload();
+        a.select_id("morning-report");
+        assert!(footer(&mut a, 160, 30).contains("x stop its run"));
+        screen(&mut a, 120, 30);
+        let row = hit_rect(&a, Hit::Row(0));
+        mouse(
+            &mut a,
+            MouseEventKind::Down(MouseButton::Right),
+            row.x + 4,
+            row.y,
+        );
+        let Mode::Menu(m) = a.mode.clone() else {
+            panic!("no menu");
+        };
+        assert!(m
+            .items
+            .iter()
+            .any(|i| i.label == "Stop its run…" && i.danger));
+        press(&mut a, KeyCode::Char('x'));
+        let Mode::Confirm(c) = a.mode.clone() else {
+            panic!("x does not ask: {:?}", a.mode);
+        };
+        assert_eq!(c.question, "Stop this run?");
+        assert!(c.lines[0].starts_with("Morning report, started "), "{c:?}");
+        assert_eq!(
+            c.lines[1],
+            "Its tab is closed; what it wrote so far is kept."
+        );
+        assert!(c.danger() && !c.enter_confirms());
+        let all = screen(&mut a, 100, 30).join("\n");
+        assert!(all.contains(" y stop ") && all.contains(" n no "), "{all}");
+        // ⏎ is no answer: the run goes on.
+        press(&mut a, KeyCode::Enter);
+        assert!(matches!(a.mode, Mode::Normal));
+        assert!(a.flash.is_none());
+        // y stops it; here it cannot, and says why.
+        press(&mut a, KeyCode::Char('x'));
+        press(&mut a, KeyCode::Char('y'));
+        let flash = a.flash.clone().unwrap();
+        assert_eq!(
+            flash.text,
+            "Not stopped: it runs in another Herdr session; stop it there"
+        );
+        assert!(flash.sticky);
+        // A cron job's command is asked to end; its own process writes
+        // down how it ended.
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let mut cron = add_run(&mut a, "morning-report", 50, store::Status::Running, "");
+        cron.cron_pid = child.id();
+        cron.cron_started = scheduler::started_at(child.id()).unwrap_or_default();
+        cron.save(&a.paths).unwrap();
+        a.reload();
+        a.view = View::Runs;
+        a.sel_run = a.runs.iter().position(|r| r.id == cron.id).unwrap();
+        assert!(footer(&mut a, 160, 30).contains("x stop"));
+        press(&mut a, KeyCode::Char('x'));
+        let Mode::Confirm(c) = a.mode.clone() else {
+            panic!("x does not ask: {:?}", a.mode);
+        };
+        assert_eq!(c.lines[1], "Its command is stopped.");
+        press(&mut a, KeyCode::Char('y'));
+        let said = a.flash.as_ref().unwrap().text.clone();
+        let ended = child.wait().unwrap();
+        assert_eq!(said, "Stopping; its run shows it in a moment");
+        assert_eq!(ended.signal(), Some(libc::SIGTERM));
+        // Its process is gone now: a second try says so.
+        press(&mut a, KeyCode::Char('x'));
+        press(&mut a, KeyCode::Char('y'));
+        assert_eq!(
+            a.flash.as_ref().unwrap().text,
+            "Not stopped: its process is not there any more"
+        );
+        // A run that ended has nothing to stop.
+        let done = add_run(&mut a, "morning-report", 55, store::Status::Finished, "");
+        a.reload();
+        a.sel_run = a.runs.iter().position(|r| r.id == done.id).unwrap();
+        assert!(!footer(&mut a, 160, 30).contains("x stop"));
+        press(&mut a, KeyCode::Char('x'));
+        assert!(matches!(a.mode, Mode::Normal));
+        assert_eq!(a.flash.as_ref().unwrap().text, "No run is going here");
+    }
+
+    #[test]
+    fn runs_are_narrowed_to_problems_and_searched() {
+        use store::Status;
+        let mut a = app("narrow");
+        a.icons.nerd = false;
+        let other = add_routine(&mut a, "Docs link check", true);
+        a.reload();
+        add_run(&mut a, &other, 1, Status::Finished, "");
+        let failed = add_run(&mut a, &other, 2, Status::Failed, "Ended with exit code 2");
+        add_run(&mut a, "morning-report", 3, Status::NeedsYou, "");
+        add_run(
+            &mut a,
+            "morning-report",
+            4,
+            Status::NoResult,
+            "The agent stopped without its summary",
+        );
+        add_run(
+            &mut a,
+            &other,
+            5,
+            Status::Skipped,
+            "Missed: more than 2 hours late",
+        );
+        a.reload();
+        a.view = View::Runs;
+        let all = a.all_runs.len();
+        assert_eq!(a.runs.len(), all);
+        // A run without its summary has a sign and a colour of its own,
+        // and says why; a skipped time says why too.
+        let lines = screen(&mut a, 120, 40);
+        let text = lines.join("\n");
+        assert!(text.contains("! ") && text.contains("No result"), "{text}");
+        assert!(text.contains("The agent stopped without its summary"));
+        assert!(text.contains("Missed: more than 2 hours late"), "{text}");
+        assert!(footer(&mut a, 160, 40).contains("p problems only"));
+        // p: what went wrong, and what needs the owner.
+        press(&mut a, KeyCode::Char('p'));
+        let statuses: Vec<Status> = a.runs.iter().map(|r| r.status).collect();
+        assert_eq!(
+            statuses,
+            [Status::NoResult, Status::NeedsYou, Status::Failed]
+        );
+        let text = screen(&mut a, 120, 40).join("\n");
+        assert!(
+            text.contains(&format!("Only  problems only ✕   3 of {all}")),
+            "{text}"
+        );
+        assert!(text.contains("Esc all runs"), "{text}");
+        // / asks for a text; it is looked for in name, message and result.
+        press(&mut a, KeyCode::Char('/'));
+        let Mode::Input(i) = a.mode.clone() else {
+            panic!("no search: {:?}", a.mode);
+        };
+        assert_eq!(i.title, "Search the runs");
+        for c in "EXIT code".chars() {
+            press(&mut a, KeyCode::Char(c));
+        }
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(a.runs.len(), 1);
+        assert_eq!(a.runs[0].id, failed.id);
+        let text = screen(&mut a, 120, 40).join("\n");
+        assert!(
+            text.contains(&format!(
+                "Only  problems only ✕   “EXIT code” ✕   1 of {all}"
+            )),
+            "{text}"
+        );
+        // Together with "only its runs".
+        press(&mut a, KeyCode::Char('h'));
+        assert_eq!(a.run_filter.as_deref(), Some(other.as_str()));
+        assert_eq!(a.runs.len(), 1);
+        for (w, h) in [(160, 50), (100, 30), (80, 24), (60, 20)] {
+            let text = screen(&mut a, w, h).join("\n");
+            assert!(text.contains("runs of Docs"), "{w}: {text}");
+            assert!(text.contains("problems"), "{w}: {text}");
+            assert!(text.contains("“EXIT"), "{w}: {text}");
+            assert!(text.contains(&format!("1 of {all}")), "{w}: {text}");
+        }
+        // A ✕ removes its own filter only.
+        screen(&mut a, 120, 40);
+        let x = hit_rect(&a, Hit::Unfilter(RunFilter::Problems));
+        a.click(x.x + 2, x.y);
+        assert!(!a.runs_problems);
+        assert_eq!(a.runs_search, "EXIT code");
+        assert!(a.run_filter.is_some());
+        screen(&mut a, 120, 40);
+        let x = hit_rect(&a, Hit::Unfilter(RunFilter::Routine));
+        a.click(x.x + 2, x.y);
+        assert!(a.run_filter.is_none() && a.view == View::Runs);
+        assert_eq!(a.runs.len(), 1);
+        // A search that finds nothing says so, and Esc shows all again.
+        press(&mut a, KeyCode::Char('/'));
+        a.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        for c in "zebra".chars() {
+            press(&mut a, KeyCode::Char(c));
+        }
+        press(&mut a, KeyCode::Enter);
+        assert!(a.runs.is_empty());
+        let text = screen(&mut a, 120, 40).join("\n");
+        assert!(text.contains("No run matches."), "{text}");
+        assert!(text.contains("Esc shows all runs again."), "{text}");
+        press(&mut a, KeyCode::Esc);
+        assert!(!a.runs_filtered());
+        assert_eq!(a.runs.len(), all);
+        assert_eq!(a.view, View::Runs);
+        // Esc in a search leaves the filters as they were.
+        press(&mut a, KeyCode::Char('p'));
+        press(&mut a, KeyCode::Char('/'));
+        press(&mut a, KeyCode::Char('q'));
+        press(&mut a, KeyCode::Esc);
+        assert!(a.runs_problems && a.runs_search.is_empty());
+        // The filters stay when new runs come in.
+        add_run(
+            &mut a,
+            &other,
+            6,
+            Status::TimedOut,
+            "Stopped after 5 minutes",
+        );
+        a.reload();
+        assert_eq!(a.runs.len(), 4);
+        assert_eq!(a.runs[0].status, Status::TimedOut);
+        // "Its runs" on a routine shows all of them, whatever narrowed
+        // the tab before; p narrows them, and Esc drops both filters and
+        // goes back to the routine.
+        a.view = View::Routines;
+        a.select_id(&other);
+        press(&mut a, KeyCode::Char('h'));
+        assert!(!a.runs_problems);
+        assert_eq!(a.run_filter.as_deref(), Some(other.as_str()));
+        assert_eq!(a.runs.len(), a.run_count(&other));
+        press(&mut a, KeyCode::Char('p'));
+        assert_eq!(a.runs.len(), 2);
+        let text = screen(&mut a, 140, 40).join("\n");
+        assert!(text.contains("Esc back to the routine"), "{text}");
+        press(&mut a, KeyCode::Esc);
+        assert_eq!(a.view, View::Routines);
+        assert!(!a.runs_filtered());
+        assert_eq!(a.selected_routine().unwrap().id, other);
+    }
+
+    #[test]
+    fn enter_opens_a_runs_page() {
+        use store::Status;
+        let mut a = app("page");
+        a.icons.nerd = false;
+        let mut run = add_run(
+            &mut a,
+            "morning-report",
+            10,
+            Status::Failed,
+            "Ended with exit code 2",
+        );
+        run.trigger = store::Trigger::Retry;
+        run.attempt = 1;
+        run.result = "3 links are broken.\nSee the list in links.md.".into();
+        run.save(&a.paths).unwrap();
+        let out: Vec<String> = (1..=60).map(|i| format!("checked page {i}")).collect();
+        std::fs::write(run.file(&a.paths, "out"), out.join("\n")).unwrap();
+        a.reload();
+        a.view = View::Runs;
+        a.sel_run = a.runs.iter().position(|r| r.id == run.id).unwrap();
+        assert!(footer(&mut a, 160, 30).contains("⏎ open"));
+        press(&mut a, KeyCode::Enter);
+        assert!(matches!(a.mode, Mode::RunPage(_)), "{:?}", a.mode);
+        for (w, h) in [(160, 50), (120, 40), (100, 30), (80, 24), (60, 20)] {
+            let lines = screen(&mut a, w, h);
+            let text = lines.join("\n");
+            for part in [
+                "Morning report · ",
+                "Status      ✗ Failed",
+                "Reason      Ended with exit code 2",
+                "Started     ",
+                "Took        ",
+                "Started by  A retry after a run that failed · try 2",
+                "Result      3 links are broken.",
+                "End of the output",
+                "checked page 60",
+            ] {
+                assert!(text.contains(part), "{w}x{h}: no {part:?} in\n{text}");
+            }
+            assert!(!text.contains("checked page 1 "), "{w}x{h}: {text}");
+            // What can be done with it is in the footer.
+            let foot = &lines[h as usize - 1];
+            assert!(foot.contains("Esc close"), "{foot}");
+            if w >= 100 {
+                for key in ["l whole output", "r run again", "f open file", "d delete"] {
+                    assert!(foot.contains(key), "{w}: no {key} in {foot}");
+                }
+            }
+            assert!(!foot.contains("x stop") && !foot.contains("go to its tab"));
+        }
+        // l shows the whole output; d and r ask as they do in the list.
+        press(&mut a, KeyCode::Char('l'));
+        assert!(matches!(a.mode, Mode::Log(_)));
+        press(&mut a, KeyCode::Esc);
+        press(&mut a, KeyCode::Enter);
+        press(&mut a, KeyCode::Char('d'));
+        let Mode::Confirm(c) = a.mode.clone() else {
+            panic!("d does not ask: {:?}", a.mode);
+        };
+        assert_eq!(
+            c.purpose,
+            ConfirmFor::DeleteRun(run.routine_id.clone(), run.id.clone())
+        );
+        press(&mut a, KeyCode::Char('n'));
+        press(&mut a, KeyCode::Enter);
+        press(&mut a, KeyCode::Char('r'));
+        let Mode::Confirm(c) = a.mode.clone() else {
+            panic!("r does not ask: {:?}", a.mode);
+        };
+        assert_eq!(c.question, "Run Morning report now?");
+        assert!(!c.enter_confirms());
+        press(&mut a, KeyCode::Char('n'));
+        // f opens the file and stays on the page.
+        press(&mut a, KeyCode::Enter);
+        press(&mut a, KeyCode::Char('f'));
+        assert!(matches!(a.mode, Mode::RunPage(_)));
+        assert_eq!(a.flash.as_ref().unwrap().text, "Opened the output file");
+        press(&mut a, KeyCode::Esc);
+        assert!(matches!(a.mode, Mode::Normal));
+
+        // A run that is going: how long, and x stops it (after asking).
+        let mut going = add_run(&mut a, "morning-report", 20, Status::Running, "");
+        going.asleep_secs = 600;
+        going.pane_id = "p-1".into();
+        going.save(&a.paths).unwrap();
+        a.reload();
+        a.sel_run = a.runs.iter().position(|r| r.id == going.id).unwrap();
+        press(&mut a, KeyCode::Enter);
+        let lines = screen(&mut a, 120, 40);
+        let text = lines.join("\n");
+        assert!(text.contains("Status      ↻ Running"), "{text}");
+        assert!(
+            text.contains("Going for   30 min · not counting 10 min the computer slept"),
+            "{text}"
+        );
+        assert!(text.contains("Started by  The schedule"), "{text}");
+        assert!(
+            text.contains("Nothing is saved yet: o goes to its tab"),
+            "{text}"
+        );
+        let foot = &lines[39];
+        assert!(
+            foot.contains("o go to its tab") && foot.contains("x stop"),
+            "{foot}"
+        );
+        assert!(!foot.contains("d delete"), "{foot}");
+        press(&mut a, KeyCode::Char('d'));
+        assert!(matches!(a.mode, Mode::RunPage(_)), "a going run stays");
+        press(&mut a, KeyCode::Char('x'));
+        assert!(
+            matches!(&a.mode, Mode::Confirm(c) if matches!(c.purpose, ConfirmFor::StopRun(..)))
+        );
+        press(&mut a, KeyCode::Char('n'));
+        // Its output shows as soon as there is some.
+        press(&mut a, KeyCode::Enter);
+        std::fs::write(going.file(&a.paths, "out"), "first step done\n").unwrap();
+        a.reload();
+        let text = screen(&mut a, 120, 40).join("\n");
+        assert!(text.contains("first step done"), "{text}");
+        // The page closes when its run is deleted elsewhere.
+        store::remove(&a.paths, &going);
+        a.reload();
+        assert!(matches!(a.mode, Mode::Normal));
+
+        // A time at which nothing ran: when and why, nothing else.
+        let skipped = add_run(
+            &mut a,
+            "morning-report",
+            30,
+            Status::Skipped,
+            "Missed: more than 2 hours late",
+        );
+        a.reload();
+        a.sel_run = a.runs.iter().position(|r| r.id == skipped.id).unwrap();
+        press(&mut a, KeyCode::Enter);
+        let text = screen(&mut a, 120, 40).join("\n");
+        assert!(text.contains("Status      ⊘ Skipped"), "{text}");
+        assert!(text.contains("Reason      Missed: more than 2 hours late"));
+        assert!(text.contains("When        ") && text.contains(" · Scheduled"));
+        assert!(
+            !text.contains("Took") && !text.contains("Started by"),
+            "{text}"
+        );
+        assert!(text.contains("Nothing ran at this time."), "{text}");
+        // A click beside the page closes it.
+        a.click(0, 5);
+        assert!(matches!(a.mode, Mode::Normal));
+        // In the list, o goes to the tab or, once that is closed, shows
+        // the output; the menu names the same keys.
+        a.sel_run = a.runs.iter().position(|r| r.id == run.id).unwrap();
+        press(&mut a, KeyCode::Char('o'));
+        assert!(matches!(a.mode, Mode::Log(_)));
+        press(&mut a, KeyCode::Esc);
+        screen(&mut a, 120, 40);
+        let row = hit_rect(&a, Hit::Row(a.sel_run));
+        mouse(
+            &mut a,
+            MouseEventKind::Down(MouseButton::Right),
+            row.x + 4,
+            row.y,
+        );
+        let Mode::Menu(m) = a.mode.clone() else {
+            panic!("no menu");
+        };
+        let labels: Vec<(&str, &str)> = m.items.iter().map(|i| (i.label.as_str(), i.key)).collect();
+        assert_eq!(
+            labels,
+            [
+                ("Open", "⏎"),
+                ("Its output", "l"),
+                ("Open the output file", "f"),
+                ("Run its routine again…", "r"),
+                ("Only its runs", "h"),
+                ("Delete this run…", "d"),
+            ]
+        );
+    }
+
+    #[test]
+    fn what_needs_the_owner_comes_first() {
+        use store::Status;
+        let mut a = app("first");
+        a.icons.nerd = false;
+        let alpha = add_routine(&mut a, "Alpha backup", true);
+        let beta = add_routine(&mut a, "Beta report", true);
+        let gamma = add_routine(&mut a, "Gamma review", true);
+        let delta = add_routine(&mut a, "Delta digest", false);
+        a.reload();
+        add_run(&mut a, &alpha, 1, Status::Finished, "");
+        add_run(&mut a, &beta, 2, Status::Failed, "Ended with exit code 2");
+        add_run(&mut a, &gamma, 3, Status::NeedsYou, "");
+        add_run(&mut a, &delta, 4, Status::Finished, "");
+        a.reload();
+        // By name, as the tests' list starts.
+        let names =
+            |a: &App| -> Vec<String> { a.routines.iter().map(|r| r.file.name.clone()).collect() };
+        assert_eq!(
+            names(&a),
+            [
+                "Alpha backup",
+                "Beta report",
+                "Delta digest",
+                "Gamma review",
+                "Morning report",
+                "Weekly cleanup"
+            ]
+        );
+        assert!(footer(&mut a, 200, 30).contains("s sort by what needs you"));
+        // s: needs you, went wrong, to approve, running, by next time, off.
+        a.select_id(&alpha);
+        press(&mut a, KeyCode::Char('s'));
+        assert_eq!(
+            a.flash.as_ref().unwrap().text,
+            "Sorted by what needs you first"
+        );
+        assert_eq!(
+            names(&a),
+            [
+                "Gamma review",
+                "Beta report",
+                "Weekly cleanup",
+                "Morning report",
+                "Alpha backup",
+                "Delta digest"
+            ]
+        );
+        assert_eq!(
+            a.selected_routine().unwrap().id,
+            alpha,
+            "the cursor follows"
+        );
+        assert!(footer(&mut a, 200, 30).contains("s sort by name"));
+        // The choice is kept for the next time the list opens.
+        assert_eq!(
+            std::fs::read_to_string(a.paths.state.join("list-sort")).unwrap(),
+            "attention"
+        );
+        assert_eq!(App::new(a.paths.clone()).sort, Sort::Attention);
+        // One line on top says it in numbers, and what comes next.
+        let line = screen(&mut a, 140, 40)[2].clone();
+        assert!(
+            line.contains("1 needs you · 1 went wrong · 1 to approve · 1 running · next: "),
+            "{line}"
+        );
+        assert!(line.contains(" in ") || line.contains(":"), "{line}");
+        // A narrow window keeps what needs the owner.
+        for w in [100, 80, 60] {
+            let line = screen(&mut a, w, 24)[2].clone();
+            assert!(line.contains("1 needs you · 1 went wrong"), "{w}: {line}");
+            assert!(!line.trim_end().ends_with('·'), "{w}: {line}");
+        }
+        // A click on a part goes to the routine it counts...
+        screen(&mut a, 140, 40);
+        let part = hit_rect(&a, Hit::Attention(Attention::ToApprove));
+        a.click(part.x + 1, part.y);
+        assert_eq!(a.selected_routine().unwrap().id, "weekly-cleanup");
+        let part = hit_rect(&a, Hit::Attention(Attention::NeedsYou));
+        a.click(part.x + 1, part.y);
+        assert_eq!(a.selected_routine().unwrap().id, gamma);
+        // ...and "went wrong" to the runs that did.
+        let part = hit_rect(&a, Hit::Attention(Attention::WentWrong));
+        a.click(part.x + 1, part.y);
+        assert_eq!(a.view, View::Runs);
+        assert!(a.runs_problems);
+        assert_eq!(a.runs.len(), 2);
+        press(&mut a, KeyCode::Esc);
+        press(&mut a, KeyCode::Char('1'));
+        // A routine that waits for a free place says so instead of its
+        // next time, and one that went wrong again says how often.
+        std::fs::write(
+            a.paths.state.join("queue.json"),
+            format!(
+                r#"{{"{alpha}":{{"slot":"{}","trigger":"scheduled"}}}}"#,
+                Local::now().to_rfc3339()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            a.paths.state.join("streaks.json"),
+            format!(r#"{{"{beta}":3,"{alpha}":4}}"#),
+        )
+        .unwrap();
+        a.reload();
+        assert_eq!(a.failing.get(&beta), Some(&3));
+        assert!(!a.failing.contains_key(&alpha), "its last run worked");
+        a.select_id(&beta);
+        for (w, h) in [(160, 50), (120, 40)] {
+            let text = screen(&mut a, w, h).join("\n");
+            assert!(text.contains("waits for a free place"), "{w}: {text}");
+            assert!(text.contains("3 times in a row"), "{w}: {text}");
+            assert!(
+                text.contains("went wrong 3 times in a row"),
+                "the details say it in full: {text}"
+            );
+        }
+        // The line on top is for the routines; the other tabs have none.
+        press(&mut a, KeyCode::Char('2'));
+        assert!(!screen(&mut a, 140, 40).join("\n").contains("needs you ·"));
+        // Back to names.
+        press(&mut a, KeyCode::Char('s'));
+        assert_eq!(a.flash.as_ref().unwrap().text, "Sorted by name");
+        assert_eq!(names(&a)[0], "Alpha backup");
+        assert_eq!(
+            std::fs::read_to_string(a.paths.state.join("list-sort")).unwrap(),
+            "name"
+        );
+    }
+
     /// Made-up accounts of the Multiaccount plugin, beside the config.
     fn add_accounts(a: &mut App) {
         let dir = a.paths.config.parent().unwrap().join("multiaccount");
@@ -5039,7 +6286,7 @@ mod tests {
         a.select_id("weekly-cleanup");
         let all = screen(&mut a, 120, 44).join("\n");
         for part in [
-            "If missed       runs once, if less than 2 hours late",
+            "If missed       runs once, if under 2 hours late",
             "Switches off    after 3 runs in a row that went wrong",
             "After the run   ~/bin/tell-me.sh · after a run that went wrong",
             "Account         Work",
@@ -5049,7 +6296,7 @@ mod tests {
         // The approval view names everything that will run.
         let text = approval_lines(&a.paths, &r).join("\n");
         for part in [
-            "When a time is missed: A catch-up run only within 2 hours of the missed time",
+            "When a time is missed: A catch-up run only within 2 hours of its time",
             "Switches itself off: after 3 runs in a row that went wrong",
             "After a run that went wrong (a shell command, as you, without asking, in the folder above): ~/bin/tell-me.sh",
             "Account: Work (Multiaccount id work-2), used also when it is at its limit",
