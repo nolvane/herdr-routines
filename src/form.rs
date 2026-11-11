@@ -341,7 +341,8 @@ pub struct Form {
     pub runs_in: RunsIn,
     pub keep_runs: u32,
     pub keep_days: u32,
-    pub more: crate::routine::More,
+    /// The routine's further settings (`routine::More`).
+    pub extra: crate::routine::More,
     pub check: String,
     pub remember: bool,
     pub enabled: bool,
@@ -387,7 +388,7 @@ impl Form {
             runs_in: RunsIn::default(),
             keep_runs: KEEP_RUNS,
             keep_days: KEEP_DAYS,
-            more: Default::default(),
+            extra: Default::default(),
             check: String::new(),
             remember: false,
             enabled: true,
@@ -438,7 +439,7 @@ impl Form {
         f.runs_in = r.file.runs_in;
         f.keep_runs = r.file.keep_runs;
         f.keep_days = r.file.keep_days;
-        f.more = r.file.more.clone();
+        f.extra = r.file.more.clone();
         f.check = r.file.check_command.clone();
         f.remember = r.file.remember;
         f.enabled = r.file.enabled;
@@ -1097,7 +1098,7 @@ impl Form {
             },
             keep_runs: self.keep_runs,
             keep_days: self.keep_days,
-            more: self.more.clone(),
+            more: self.extra.clone(),
         };
         if let Some(problem) = Routine::check(&file, &self.prompt) {
             return Err(problem);

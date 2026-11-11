@@ -357,7 +357,7 @@ fn running_by_hand_checks_the_routine_again() {
     let refused = crate::crontab::run_now(&a.paths, &shown).unwrap_err();
     assert!(refused.contains("waits for approval"), "{refused}");
     a.fire("say-hi");
-    let said = a.flash.as_ref().map(|f| f.0.clone()).unwrap_or_default();
+    let said = a.flash.as_ref().map(|f| f.text.clone()).unwrap_or_default();
     assert!(said.starts_with("Not started"), "{said}");
     assert!(store::runs_of(&a.paths, "say-hi").is_empty());
     crate::crontab::use_fake(None);
