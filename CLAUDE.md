@@ -110,6 +110,9 @@ Herdr or the crontab: both are stand-ins a test sets for its own thread
 Regression tests for the approval rules live in
 `src/app_security_tests.rs`.
 
+There is no CI workflow: the checks run locally, since GitHub's runners
+would add nothing the local run does not cover.
+
 To try a change by hand without touching your own Herdr session, use a
 throwaway session and separate config and state folders:
 
