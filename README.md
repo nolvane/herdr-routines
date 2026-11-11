@@ -170,11 +170,18 @@ always stays).
   text a permission mode that fits.
 - **Retries:** a failed run (a command ending with an error, an agent that
   does not start) can be tried again up to three times a few minutes later.
-- **Once, or when Herdr starts:** besides repeating schedules, a routine can
-  run once on a date (then it switches itself off) or each time the Herdr
-  server starts. A cron job set for one date runs on that date only: its
-  crontab line has no year, so cron would start it again a year later,
-  and the plugin's wrapper then skips it.
+- **Schedules without cron syntax:** every so many minutes or hours, daily,
+  on chosen weekdays, weekly, every two weeks, monthly on a day, on the
+  last day or the last working day of the month, on the first Monday (or
+  any numbered weekday), once on a date (then the routine switches itself
+  off), or each time the Herdr server starts. The form shows the schedule
+  in words and its next three times. Five-field cron works too, and in the
+  file also `L` and `LW` as day of the month, `mon#1` and `friL` as
+  weekday, `@every 2 weeks from 2026-11-09 09:00` and cron's `@daily` and
+  the like. A cron job takes only what the system's cron knows; one set
+  for a single date runs on that date only (its crontab line has no year,
+  so cron would start it again a year later, and the plugin's wrapper then
+  skips it).
 - **Needs you:** when an agent asks a question or waits for an approval, the
   run is marked and Herdr shows a notification. Answer it in the tab; the
   run carries on. This also covers questions before the agent is ready, such
@@ -182,11 +189,49 @@ always stays).
   you answered.
 - **Notification or popup** per routine ("Alerts"): Herdr's usual
   notification, a popup in Herdr that stays in front until you press OK
-  when a run fails, runs too long or needs you, or such a popup also when
-  a run finishes. The popup can take you to the run's tab.
+  when a run went wrong or needs you, or such a popup also when a run
+  finishes. The popup can take you to the run's tab.
+- **Every run that went wrong is told:** a command that ends with an error,
+  a run past its time limit, an agent that could not be started (not
+  signed in, a check command that broke), a tab closed before the run was
+  done, and an agent that stopped without a result (see below). When Herdr
+  is closed, as it can be for a cron job, the system's own notification is
+  used instead.
+- **No result:** every agent run is asked to end with a summary. A run
+  whose agent stops without one (it reached a usage limit, or gave up)
+  shows as "No result" instead of "Finished", and you are told. It is not
+  tried again by itself, since the work may be done.
+- **A row of failed runs is told once:** when a routine goes wrong again
+  and again (an hourly one over night), you are told at the first run, at
+  every tenth, and when it works again, not at each one. A routine can
+  switch itself off after a number of runs in a row that went wrong.
+- **After the run:** an optional command of your own that runs when a run
+  went wrong (or after every run), such as a script that posts to your
+  chat or phone. It gets `HERDR_ROUTINES_STATUS` (`finished`, `failed`,
+  `timed-out`, `closed`, `no-result`), `_NAME`, `_ID`, `_RUN`, `_MESSAGE`,
+  `_RESULT`, `_OUTPUT` (the output file) and `_STARTED`, runs in the
+  routine's folder and may take five minutes. It is part of what you
+  approve.
 - **Missed times:** when Herdr or the computer was off or asleep at the
   time, each routine either runs once afterwards or skips to its next time,
-  as you set it per routine.
+  as you set it per routine. Running once can have a limit, such as "if
+  less than 2 hours late", so a morning routine does not start in the
+  evening. A skipped time shows in Runs with the reason, and one
+  notification says what was caught up and what was skipped.
+- **A few at a time:** Herdr starts at most three runs side by side
+  (`max_parallel` in the settings); further ones wait for a free place and
+  start when a run ends. A run that waits for your answer takes no place.
+- **Awake while a run is going:** the computer does not go to sleep in the
+  middle of a run (`caffeinate` on macOS, `systemd-inhibit` on Linux). The
+  "awake" switch at the top chooses between during runs, always while
+  Herdr runs (so no time is missed for sleep) and off. A closed laptop lid
+  still sleeps; time slept does not count towards a run's time limit.
+- **Accounts:** with the
+  [Multiaccount](https://github.com/nolvane/herdr-multiaccount) plugin
+  installed, a Claude Code routine can name the account it runs with;
+  without a name Multiaccount decides as for any other session.
+- **Stop a run** from the list: its tab is closed (what it wrote is kept),
+  or a cron job's command is stopped.
 - **No overlap:** a routine that is still running is not started again; the
   skipped time shows in the runs. Such notes ("Skipped", "Nothing to do")
   are kept besides the runs and never push a real run out of the history.
@@ -346,7 +391,25 @@ time_limit_minutes = 120
 # many days (default 90); 0 means no limit
 # keep_runs = 30
 # keep_days = 90
+# Optional, with missed = "run-once": catch a missed time up only when it
+# is at most this many hours late (default: however late, within a week)
+# late_hours = 2
+# Optional: a one-line command after a run that went wrong, or after every
+# run with after_always = true
+# after_command = "~/bin/tell-me.sh"
+# after_always = true
+# Optional: switch the routine off after this many runs in a row that
+# went wrong
+# off_after_failures = 5
+# Optional, for claude with the Multiaccount plugin: the account's id
+# account = "work"
 ```
+
+Besides five-field cron, `schedule` takes `@once 2026-12-24 08:15`,
+`@start`, `@every 2 weeks from 2026-11-09 09:00` (or `days`), cron's
+`@hourly`, `@daily`, `@weekly`, `@monthly` and `@yearly`, and in the cron
+fields `L` (the last day of the month), `LW` (its last working day),
+`mon#1` (the first Monday; up to `#5`) and `friL` (the last Friday).
 
 `prompt.md` holds the prompt, as you would type it to the agent. A shell
 routine has `agent = "shell"` and its command in `command.sh` instead; it
@@ -423,8 +486,8 @@ and leaves a running server alone.
 
 Optional, in `config.toml` in the plugin's config directory. See
 [config.toml.example](config.toml.example): the workspace name, when
-finished tabs close, notifications on finish, icons and where the list
-opens. How many runs are kept is set per routine (see "Run history").
+finished tabs close, notifications on finish, how many runs start side by
+side, icons and where the list opens. How many runs are kept is set per routine (see "Run history").
 
 ## Command line
 

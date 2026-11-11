@@ -917,3 +917,141 @@ keep their names.
 
 Why: the same thing had up to three names in different places, so the help
 did not match the form and the README matched neither.
+
+## 2026-11-11: One place for what follows a run's end
+
+`runner::ended` is called once for every run that ends, wherever it ends:
+a launch that did not get going, the scheduler's watch, a cron job's
+wrapper, a run cut off because its Herdr session went away. It tells the
+owner, counts runs in a row that went wrong, may switch the routine off
+and starts the routine's command after a run. Times at which nothing ran
+("Skipped", "Nothing to do") and a run the owner stopped in the list do
+not go through it.
+
+Why: alerts were sent from five places, each for one kind of ending, and
+the kinds nobody thought of (an agent that is not signed in, a tab closed
+early) told nobody. The README promised a popup "when a run fails".
+
+## 2026-11-11: An agent run without its summary is "No result", not finished
+
+Every agent run is asked to end with a summary between two marker lines.
+When the agent's turn ends without one, the run gets the status "No
+result" and counts as a run that went wrong (the owner is told). It is not
+retried: the work may be done, and a second run could do it twice. The
+marker lines are matched whatever dresses them (bold marks, a colon,
+another case), so an agent that formats them is not taken for one that
+stopped.
+
+Why: Herdr reports that the agent's turn ended, not that the work is
+done. A run stopped by a usage limit looked exactly like a good one, a
+whole week of them unnoticed.
+
+## 2026-11-11: A row of failed runs is told once
+
+The owner is told at the first run in a row that went wrong, at every
+tenth, and when a run works again ("works again"). The count per routine
+is in `streaks.json` in the state folder, changed under a lock. A failed
+run that will be retried does not count yet. `off_after_failures` switches
+the routine off when the count reaches it, as `space` would, and only when
+the routine's files are still the approved ones.
+
+Why: an hourly routine failing over night left a dozen popups, and a
+routine that never works kept running and costing.
+
+## 2026-11-11: A command after the run instead of built-in integrations
+
+`after_command` is one line the owner writes; it runs in the login shell
+in the routine's folder, at most five minutes, with the run's status,
+message, result and output file in `HERDR_ROUTINES_…` variables. It is
+part of `routine.toml`, so it is shown for approval and runs only as
+approved. The scheduler starts it in a thread and lets it finish before it
+exits.
+
+Why: "tell me on my phone" or "post to our chat" means an outside service,
+its terms and its tokens. With the owner's own command the plugin calls no
+service and holds no token ("no outside service" stays true), and it works
+with whatever the owner uses.
+
+## 2026-11-11: At most three runs side by side, the rest wait
+
+`max_parallel` (default 3, 0 for no limit) is how many runs the scheduler
+starts side by side. A routine whose time has come while the places are
+taken is noted in `queue.json` with the time it runs for and starts in a
+later round; a restarted scheduler still knows it. Runs that are starting
+or running take a place; one that waits for the owner does not, nor do
+runs started by hand or cron jobs.
+
+Why: several routines set for 08:00 started as many agents at the same
+moment and used up the subscription's limit at once. Waiting in a file and
+not as a run record keeps Runs free of records for runs that did not
+start yet.
+
+## 2026-11-11: Awake while a run is going, chosen in the list
+
+The scheduler holds `caffeinate -i -w <its pid>` (macOS) or
+`systemd-inhibit … tail --pid=<its pid>` (Linux) while a run is starting
+or running, always, or never, as the owner chose in the list (file
+`awake` in the state folder; default: during runs). A cron job's wrapper
+does the same for its own run. The helper watches the process that
+started it, so nothing is left holding the computer awake when that
+process ends in any way. Seconds the computer slept (the wall clock ahead
+of the steady clock between two rounds) are added to each going run and do
+not count towards its time limit.
+
+Why: a laptop went to sleep in the middle of a twenty-minute run; on
+waking, the run was past its limit and, with "stop the run", was closed.
+The choice is in the state folder and not in `config.toml`, since the list
+changes it and must not rewrite a file the owner edits by hand.
+
+## 2026-11-11: Missed times: a window, a row and one notification
+
+`late_hours` limits how late a missed time may be to still be caught up
+(0: however late, within the week missed times are looked for). A missed
+time that is skipped, by setting or for being too late, becomes a
+"Skipped" record with the reason, and one notification per round names
+the routines caught up and skipped.
+
+Why: a morning briefing caught up at ten at night is noise, and a skipped
+time was visible only in the log, so after a weekend nobody could tell
+whether Friday's report ran.
+
+## 2026-11-11: Schedules beyond cron in the own parser
+
+The cron parser also takes `L` and `LW` as day of the month and `mon#1` …
+`#5` and `friL` as weekday (the forms Quartz and others use), and
+`schedule` takes `@every N weeks|days from <date time>` and cron's short
+forms. `Schedule::classic` says whether the system's cron knows a
+schedule; a cron job (`runs_in = "cron"`) with one it does not know shows
+a problem instead of being written into the crontab.
+
+Why: month-end work needs "the last working day", which five cron fields
+cannot say, and "every two weeks" needs a first date. The earlier decision
+for an own parser allows this without a dependency.
+
+## 2026-11-11: A routine can name its Multiaccount account
+
+`account` in `routine.toml` (Claude Code routines only) is the id of an
+account of the Multiaccount plugin. The run's tab is created with
+`HERDR_MULTIACCOUNT_USE=<id>`, the variable that plugin documents for "one
+session on a given account"; its `claude` function reads it when Herdr
+starts the agent in the tab. For the form, only the list of accounts (id,
+name, kind) is read from Multiaccount's `accounts.json` beside this
+plugin's config folder; no login is in that file, and ids are checked
+against Multiaccount's own form before they go into an environment.
+Without the plugin the setting is not offered and a set one has no effect.
+
+Why: routines for different purposes should use different subscriptions,
+and Multiaccount already does the choosing; this plugin only has to say
+which one. Reading the one file avoids starting the other plugin's binary
+and parsing text meant for people.
+
+## 2026-11-11: Stopping a run from the list
+
+`runner::stop` saves the run's record as stopped by its owner first and
+closes its tab after, so the scheduler, finding the tab gone, does not
+tell the owner about a run they ended themselves (it re-reads the record
+before it ends a run). A cron job's wrapper is sent SIGTERM; it stops the
+command's process group and writes the record itself.
+
+Why: the only way to end a run was to find its tab and close it by hand,
+which then counted as a run that went wrong.

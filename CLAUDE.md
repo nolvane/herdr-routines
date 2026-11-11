@@ -17,18 +17,23 @@ each run in its own tab. What it does and how users install it:
 
 ## Layout
 
-- `scheduler.rs`: the background loop, when a routine is due, the pid file.
-- `runner.rs`: starting a run and following it (states, notifications,
-  closing finished tabs), the check command, results and memory.
+- `scheduler.rs`: the background loop, when a routine is due, the queue for
+  a free place (`max_parallel`), the pid file.
+- `runner.rs`: starting a run and following it (states, closing finished
+  tabs), the check command, results and memory, and what follows a run's
+  end (`ended`: telling the owner, runs in a row that went wrong, the
+  command after a run).
 - `herdr.rs`: the Herdr calls. `routine.rs`: routines and settings.
   `agent.rs`: permission modes, models and effort per agent and their
   flags. `models.rs`: model lists the agents print. `store.rs`: run
-  records. `schedule.rs`: cron, `@once` and `@start`; `cron.rs`: cron
-  itself. `shell.rs`: commands in the login shell with a time limit.
+  records. `schedule.rs`: cron, `@once`, `@every` and `@start`; `cron.rs`:
+  cron itself, with `L`, `LW`, `mon#1` and `friL`. `shell.rs`: commands in the login shell with a time limit.
   `autostart.rs`: Herdr at login. `paths.rs`: where files go.
   `approval.rs`: the owner's approval of routines changed outside the
   list. `alert.rs`: notifications and the popup pane about a run.
   `crontab.rs`: the user's crontab, managed cron jobs and their wrapper.
+  `awake.rs`: keeping the computer awake. `accounts.rs`: the Multiaccount
+  plugin's accounts.
 - `app.rs`: the list's state, keys and mouse. `ui.rs`: drawing, in the look
   of the Git Panel and Multiaccount plugins (keep them alike).
   `form.rs`: the edit form. `editor.rs`: the prompt editor. `pane.rs`: the
@@ -66,6 +71,8 @@ each run in its own tab. What it does and how users install it:
   `crontab` tools, are started through `shell.rs` (own process group,
   time limit); `herdr` only through `herdr.rs`. Text that came back from
   a run goes into a prompt through `runner::as_data`.
+- Every way a run ends goes through `runner::ended`, once; alerts about
+  an ending are sent only there.
 - Herdr calls about a run's agent use `Run::agent_target`; calls about its
   pane check `own_pane` first (same tab and terminal).
 - The scheduler and a `fire` process both write run records: a record in
@@ -111,7 +118,7 @@ everything afterwards with `herdr-routines stop`,
 ## Non-goals
 
 - No headless agent runs: every agent run is an interactive agent in a
-  tab. Only one-line shell commands can be classic cron jobs
+  tab. Only one-line shell commands can be cron jobs
   (`runs_in = "cron"`), which the system's cron starts through the
   plugin's wrapper (`SHELL=<state>/bin/cron/<id>`, see `crontab.rs`).
 - No scheduler of its own outside Herdr: routines run while the Herdr

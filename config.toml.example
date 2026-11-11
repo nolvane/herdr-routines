@@ -11,6 +11,11 @@ close_finished_after_minutes = 60
 # Also notify when a run finishes, not only when it needs you.
 notify_finished = false
 
+# How many runs Herdr starts side by side. Further ones wait for a free
+# place and start when a run ends (0 = no limit). A run that waits for your
+# answer takes no place; runs started by hand and cron jobs do not count.
+max_parallel = 3
+
 # "nerd" for Nerd Font icons, "plain" for plain symbols.
 icons = "nerd"
 

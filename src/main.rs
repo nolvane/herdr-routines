@@ -158,6 +158,7 @@ fn run_json(l: &store::Run) -> serde_json::Value {
         "ended": l.ended.map(|t| t.to_rfc3339()),
         "message": l.message,
         "result": l.result,
+        "problem": l.status.problem(),
     })
 }
 
@@ -194,6 +195,12 @@ fn routines_json(paths: &Paths) -> String {
                 "runs_in": f.runs_in,
                 "keep_runs": f.keep_runs,
                 "keep_days": f.keep_days,
+                "late_hours": f.more.late_hours,
+                "after_command": f.more.after_command,
+                "after_always": f.more.after_always,
+                "off_after_failures": f.more.off_after_failures,
+                "account": f.more.account,
+                "failures_in_a_row": runner::failures_in_a_row(paths, &r.id),
                 "problem": r.problem,
                 "approved": r.approved,
                 "next": r.schedule().filter(|_| f.enabled).and_then(|c| c.next_after(&now)).map(|t| t.to_rfc3339()),
@@ -437,6 +444,12 @@ mod tests {
             "runs_in",
             "keep_runs",
             "keep_days",
+            "late_hours",
+            "after_command",
+            "after_always",
+            "off_after_failures",
+            "account",
+            "failures_in_a_row",
             "problem",
             "approved",
             "next",

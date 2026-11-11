@@ -7,6 +7,36 @@ All notable changes to this plugin. The format follows
 
 ### Added
 
+- Every run that went wrong is told, not only a command's error and the
+  time limit: an agent that could not be started, a check command that
+  broke, a tab closed before the run was done. When Herdr is closed (a
+  cron job), the system's own notification is used.
+- "No result": an agent run that ends without the summary it was asked for
+  (a usage limit, an agent that gave up) no longer shows as finished.
+- A row of failed runs is told at the first run, at every tenth and when it
+  works again; a routine can switch itself off after a number of them.
+- "After the run": a command of your own when a run went wrong, or after
+  every run, with the run's status and result in `HERDR_ROUTINES_…`
+  variables.
+- "awake" at the top: the computer does not sleep in the middle of a run
+  (or not at all while Herdr runs, or as its own settings say). Time slept
+  does not count towards a run's time limit.
+- At most three runs start side by side (`max_parallel`); further ones
+  wait for a free place.
+- A missed time can be caught up only when less than some hours late; a
+  skipped missed time shows in Runs, and one notification says what was
+  caught up and what was skipped after a break.
+- Schedules without cron syntax: every so many minutes or hours, chosen
+  weekdays, every two weeks, monthly on a day, the last day or last
+  working day of the month, the first Monday; with the next three times
+  shown. In the file also `L`, `LW`, `mon#1`, `friL`,
+  `@every 2 weeks from …` and cron's `@daily` and the like.
+- Stop a run from the list.
+- With the Multiaccount plugin installed, a Claude Code routine can name
+  the account it runs with.
+- `routines` (JSON) also prints the new settings and how many runs went
+  wrong in a row; `runs` says whether a run counts as a problem.
+
 - Cron jobs: a shell command can run from the system's crontab
   instead of Herdr ("Runs in: Cron", or `n` then "Cron job"), also
   when Herdr is closed. They have their own tab "Cron jobs", are edited
