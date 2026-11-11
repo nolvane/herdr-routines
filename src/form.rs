@@ -155,6 +155,8 @@ pub enum Field {
     Remember,
     Args,
     Enabled,
+    /// The row that shows or hides the settings most routines never change.
+    More,
     Save,
 }
 
@@ -163,7 +165,7 @@ impl Field {
         match self {
             Field::Name => "Name",
             Field::Prompt => "Prompt",
-            Field::Agent => "Agent",
+            Field::Agent => "Runs with",
             Field::Mode => "Permission mode",
             Field::Model => "Model",
             Field::Effort => "Effort",
@@ -178,13 +180,14 @@ impl Field {
             Field::Limit => "Time limit",
             Field::AtLimit => "At the time limit",
             Field::Retry => "If it fails",
-            Field::Alert => "Tell me by",
+            Field::Alert => "Alerts",
             Field::RunsIn => "Runs in",
-            Field::Keep => "Keep",
+            Field::Keep => "Run history",
             Field::Check => "Check first",
             Field::Remember => "Earlier results",
             Field::Args => "Extra options",
-            Field::Enabled => "On",
+            Field::Enabled => "Switched",
+            Field::More => "More settings",
             Field::Save => "Save",
         }
     }
@@ -257,7 +260,7 @@ impl Field {
                 "When a run fails (a command ends with an error, an agent does not start), it can be tried again a little later."
             }
             Field::RunsIn => {
-                "Herdr: Herdr starts it in a tab, as long as Herdr runs, and you can watch it live. Cron: a classic cron job in your computer's crontab, which also runs when Herdr is closed; its output and result still show in Runs. On macOS, a cron job that works in Documents, Desktop or Downloads needs Full Disk Access for cron."
+                "Herdr: Herdr starts it in a tab, as long as Herdr runs, and you can watch it live. Cron: a cron job in your computer's crontab, which also runs when Herdr is closed; its output and result still show in Runs. On macOS, a cron job that works in Documents, Desktop or Downloads needs Full Disk Access for cron."
             }
             Field::Alert => {
                 "How you hear about a run. Notification: Herdr's usual notification when it fails, runs too long or needs you. Popup on problems: a window in Herdr that stays in front until you press OK. Popup always: also when a run finishes."
@@ -286,7 +289,10 @@ impl Field {
                 "For experts, leave empty if unsure: options added to the agent's start command, such as --add-dir ~/other to let it work in a second folder too."
             }
             Field::Enabled => {
-                "Yes: it runs on its schedule. No: the routine is kept but never runs by itself; r in the list still runs it by hand."
+                "On: it runs on its schedule. Off: the routine is kept but never runs by itself; r in the list still runs it by hand."
+            }
+            Field::More => {
+                "Permission mode, model, time limit, retries, alerts, run history and more. They start with values that suit most routines; ⏎ shows or hides them."
             }
             Field::Save => "Saves the routine (Ctrl+S anywhere in the form).",
         }
@@ -341,6 +347,13 @@ pub struct Form {
     pub enabled: bool,
     pub prompt: String,
     pub field: usize,
+    /// Where typing goes in the current text field, in characters.
+    pub cursor: usize,
+    /// "More settings" is open.
+    pub more: bool,
+    /// The first row the form shows, kept between frames so it only
+    /// scrolls when the current field would leave the window.
+    pub top: usize,
     pub dirty: bool,
     /// Models offered besides the agent's own suggestions: `(name, where
     /// it comes from)`, set by the list before the model list opens.
@@ -380,6 +393,9 @@ impl Form {
             enabled: true,
             prompt: String::new(),
             field: 0,
+            cursor: 0,
+            more: false,
+            top: 0,
             dirty: false,
             more_models: Vec::new(),
         }
@@ -427,6 +443,7 @@ impl Form {
         f.remember = r.file.remember;
         f.enabled = r.file.enabled;
         f.prompt = r.prompt.clone();
+        f.cursor_end();
         f
     }
 
@@ -472,28 +489,22 @@ impl Form {
         }
     }
 
-    /// The fields shown for the current agent and repeat choice.
+    /// The fields shown now: what the routine does, when and where it
+    /// runs, and, when "More settings" is open, everything else.
     pub fn fields(&self) -> Vec<Field> {
+        self.fields_with(self.more)
+    }
+
+    /// Every field this kind of routine has, also those "More settings"
+    /// hides.
+    pub fn all_fields(&self) -> Vec<Field> {
+        self.fields_with(true)
+    }
+
+    fn fields_with(&self, more: bool) -> Vec<Field> {
         let a = self.agent();
-        let mut v = vec![Field::Name, Field::Agent];
-        if self.is_shell() {
-            v.push(Field::RunsIn);
-        }
         let cron = self.is_cron();
-        if !agent::modes(a).is_empty() {
-            v.push(Field::Mode);
-        }
-        if !agent::models(a).is_empty() {
-            v.push(Field::Model);
-        }
-        if !agent::efforts(a).is_empty() {
-            v.push(Field::Effort);
-        }
-        // Cron starts its jobs in the home folder.
-        if !cron {
-            v.push(Field::Folder);
-        }
-        v.push(Field::Repeat);
+        let mut v = vec![Field::Name, Field::Agent, Field::Prompt, Field::Repeat];
         match self.repeat {
             Repeat::Custom => v.push(Field::Cron),
             Repeat::Weekly => {
@@ -507,47 +518,118 @@ impl Form {
             Repeat::AtStart => {}
             _ => v.push(Field::Time),
         }
-        // Cron skips missed times and always stops a run at its limit.
-        if self.repeat != Repeat::AtStart && !cron {
-            v.push(Field::Missed);
+        if self.is_shell() {
+            v.push(Field::RunsIn);
         }
-        v.extend([Field::Enabled, Field::Limit]);
+        // Cron starts its jobs in the home folder.
         if !cron {
-            v.push(Field::AtLimit);
+            v.push(Field::Folder);
         }
-        v.extend([Field::Retry, Field::Alert, Field::Keep]);
-        if !self.is_shell() {
-            v.extend([Field::Check, Field::Remember, Field::Args]);
+        v.push(Field::More);
+        if more {
+            if !agent::modes(a).is_empty() {
+                v.push(Field::Mode);
+            }
+            if !agent::models(a).is_empty() {
+                v.push(Field::Model);
+            }
+            if !agent::efforts(a).is_empty() {
+                v.push(Field::Effort);
+            }
+            if !self.is_shell() {
+                v.extend([Field::Check, Field::Remember, Field::Args]);
+            }
+            v.push(Field::Enabled);
+            // Cron skips missed times and always stops a run at its limit.
+            if self.repeat != Repeat::AtStart && !cron {
+                v.push(Field::Missed);
+            }
+            v.push(Field::Limit);
+            if !cron {
+                v.push(Field::AtLimit);
+            }
+            v.extend([Field::Retry, Field::Alert, Field::Keep]);
         }
-        // The prompt last, right above the save button: it is the longest
-        // field and the one people write after choosing everything else.
-        v.extend([Field::Prompt, Field::Save]);
+        v.push(Field::Save);
         v
     }
 
     /// The part of the form a field is in, for the headings.
     pub fn section(&self, f: Field) -> &'static str {
         match f {
-            Field::Name
-            | Field::Agent
-            | Field::RunsIn
-            | Field::Mode
+            Field::Name | Field::Agent | Field::Prompt => "Routine",
+            Field::Repeat | Field::Date | Field::Weekday | Field::Time | Field::Cron => "When",
+            Field::RunsIn | Field::Folder => "Where",
+            Field::Mode
             | Field::Model
             | Field::Effort
-            | Field::Folder => "Routine",
-            Field::Repeat
-            | Field::Date
-            | Field::Weekday
-            | Field::Time
-            | Field::Cron
-            | Field::Missed
-            | Field::Enabled => "Schedule",
+            | Field::Check
+            | Field::Remember
+            | Field::Args => "Agent settings",
+            Field::Enabled | Field::Missed => "Schedule details",
             Field::Limit | Field::AtLimit | Field::Retry | Field::Alert | Field::Keep => {
-                "Time limit, retries, alerts and history"
+                "Time limit, retries, alerts and run history"
             }
-            Field::Check | Field::Remember | Field::Args => "Agent extras",
-            Field::Prompt => "What to do",
-            Field::Save => "",
+            Field::More | Field::Save => "",
+        }
+    }
+
+    /// What "More settings" holds, in a few words, for its row while it is
+    /// closed: the permission mode and whatever differs from the defaults.
+    pub fn more_summary(&self) -> String {
+        let a = self.agent();
+        let mut v: Vec<String> = Vec::new();
+        if !agent::modes(a).is_empty() {
+            v.push(agent::label(agent::modes(a), &self.mode));
+        }
+        if !self.model.is_empty() {
+            v.push(agent::label(agent::models(a), &self.model));
+        }
+        if !self.effort.is_empty() {
+            v.push(format!(
+                "{} effort",
+                agent::label(agent::efforts(a), &self.effort).to_lowercase()
+            ));
+        }
+        if !self.is_shell() {
+            if !self.check.trim().is_empty() {
+                v.push("checks first".into());
+            }
+            if self.remember {
+                v.push("gets earlier results".into());
+            }
+            if !self.args.trim().is_empty() {
+                v.push("extra options".into());
+            }
+        }
+        if !self.enabled {
+            v.push("switched off".into());
+        }
+        if self.missed == Missed::Skip && self.all_fields().contains(&Field::Missed) {
+            v.push("skips missed times".into());
+        }
+        if self.limit.trim() != "120" {
+            v.push(format!("{} min limit", self.limit.trim()));
+        }
+        if self.stop_at_limit && !self.is_cron() {
+            v.push("stops at the limit".into());
+        }
+        if self.retries > 0 {
+            v.push(retry_text(self.retries, self.retry_delay).0.to_lowercase());
+        }
+        if self.alert != Alert::default() {
+            v.push(self.alert.label().to_lowercase());
+        }
+        if (self.keep_runs, self.keep_days) != (KEEP_RUNS, KEEP_DAYS) {
+            v.push(format!(
+                "keeps {}",
+                keep_text(self.keep_runs, self.keep_days).0.to_lowercase()
+            ));
+        }
+        if v.is_empty() {
+            "the usual settings".into()
+        } else {
+            v.join(" · ")
         }
     }
 
@@ -559,12 +641,46 @@ impl Form {
     pub fn move_by(&mut self, delta: i32) {
         let n = self.fields().len() as i32;
         self.field = (self.field as i32 + delta).clamp(0, n - 1) as usize;
+        self.cursor_end();
     }
 
+    /// Goes to the field at this place in [`Form::fields`].
+    pub fn go(&mut self, index: usize) {
+        self.field = index.min(self.fields().len().saturating_sub(1));
+        self.cursor_end();
+    }
+
+    /// Goes to a field; one that "More settings" hides opens them first.
     pub fn select(&mut self, f: Field) {
+        if !self.fields().contains(&f) && self.all_fields().contains(&f) {
+            self.more = true;
+        }
         if let Some(i) = self.fields().iter().position(|x| *x == f) {
             self.field = i;
         }
+        self.cursor_end();
+    }
+
+    /// Shows or hides the settings behind "More settings", staying on its
+    /// row.
+    pub fn toggle_more(&mut self) {
+        self.more = !self.more;
+        self.select(Field::More);
+    }
+
+    /// The text of a typed field.
+    pub fn text(&self, f: Field) -> Option<&str> {
+        Some(match f {
+            Field::Name => &self.name,
+            Field::Args => &self.args,
+            Field::Folder => &self.folder,
+            Field::Time => &self.time,
+            Field::Cron => &self.cron,
+            Field::Limit => &self.limit,
+            Field::Date => &self.date,
+            Field::Check => &self.check,
+            _ => return None,
+        })
     }
 
     fn text_mut(&mut self, f: Field) -> Option<&mut String> {
@@ -581,26 +697,60 @@ impl Form {
         }
     }
 
-    pub fn type_char(&mut self, c: char) {
-        let f = self.current();
-        if let Some(t) = self.text_mut(f) {
-            t.push(c);
-            self.dirty = true;
-        }
+    /// How many characters the current text field has.
+    fn text_len(&self) -> usize {
+        self.text(self.current()).map_or(0, |t| t.chars().count())
     }
 
+    /// Puts the typing cursor behind the current field's text.
+    pub fn cursor_end(&mut self) {
+        self.cursor = self.text_len();
+    }
+
+    pub fn cursor_home(&mut self) {
+        self.cursor = 0;
+    }
+
+    /// Moves the typing cursor left or right inside the text.
+    pub fn cursor_by(&mut self, delta: i32) {
+        let len = self.text_len() as i32;
+        self.cursor = (self.cursor as i32 + delta).clamp(0, len) as usize;
+    }
+
+    pub fn type_char(&mut self, c: char) {
+        self.paste(c.encode_utf8(&mut [0; 4]));
+    }
+
+    /// Puts text in at the typing cursor.
     pub fn paste(&mut self, text: &str) {
         let f = self.current();
+        let at = self.cursor.min(self.text_len());
         if let Some(t) = self.text_mut(f) {
-            t.push_str(text);
+            t.insert_str(byte_at(t, at), text);
+            self.cursor = at + text.chars().count();
             self.dirty = true;
         }
     }
 
+    /// Removes the character before the typing cursor.
     pub fn backspace(&mut self) {
+        let at = self.cursor.min(self.text_len());
+        if at == 0 {
+            return;
+        }
+        self.cursor = at - 1;
+        self.delete();
+    }
+
+    /// Removes the character at the typing cursor.
+    pub fn delete(&mut self) {
         let f = self.current();
+        let at = self.cursor;
+        if at >= self.text_len() {
+            return;
+        }
         if let Some(t) = self.text_mut(f) {
-            t.pop();
+            t.remove(byte_at(t, at));
             self.dirty = true;
         }
     }
@@ -609,6 +759,7 @@ impl Form {
         let f = self.current();
         if let Some(t) = self.text_mut(f) {
             t.clear();
+            self.cursor = 0;
             self.dirty = true;
         }
     }
@@ -642,7 +793,7 @@ impl Form {
             Field::Mode => agent::label(agent::modes(a), &self.mode),
             Field::Model => agent::label(agent::models(a), &self.model),
             Field::Effort => agent::label(agent::efforts(a), &self.effort),
-            Field::AtLimit | Field::Retry | Field::Keep | Field::Remember => {
+            Field::AtLimit | Field::Retry | Field::Keep | Field::Remember | Field::Enabled => {
                 let v = self.value(f);
                 self.items(f)
                     .into_iter()
@@ -714,8 +865,8 @@ impl Form {
                 .map(|r| item(r.label(), r.label(), r.detail()))
                 .collect(),
             Field::Enabled => vec![
-                item("Yes", "Yes", "Runs on its schedule"),
-                item("No", "No", "Kept, but never runs"),
+                item("Yes", "On", "Runs on its schedule"),
+                item("No", "Off", "Kept, but never runs by itself"),
             ],
             Field::AtLimit => vec![
                 item("keep", "Keep running", "Only marked; the tab stays open"),
@@ -955,6 +1106,11 @@ impl Form {
     }
 }
 
+/// The byte where the character with this number starts.
+fn byte_at(s: &str, chars: usize) -> usize {
+    s.char_indices().nth(chars).map_or(s.len(), |(i, _)| i)
+}
+
 fn parse_time(t: &str) -> Result<(u32, u32), String> {
     let err = || "the time is HH:MM, such as 08:15".to_string();
     let (h, m) = t.trim().split_once(':').ok_or_else(err)?;
@@ -1013,7 +1169,7 @@ pub fn split_args(s: &str) -> Result<Vec<String>, String> {
                     cur.push(n);
                     has = true;
                 }
-                None => return Err("extra arguments: a backslash at the end".into()),
+                None => return Err("extra options: a backslash at the end".into()),
             },
             (Some('"'), '"') => quote = None,
             (Some(_), c) => cur.push(c),
@@ -1034,7 +1190,7 @@ pub fn split_args(s: &str) -> Result<Vec<String>, String> {
         }
     }
     if quote.is_some() {
-        return Err("extra arguments: a quote is not closed".into());
+        return Err("extra options: a quote is not closed".into());
     }
     if has {
         out.push(cur);
@@ -1116,7 +1272,8 @@ mod tests {
     fn agent_choices_follow_the_agent() {
         let mut f = Form::new("~");
         assert_eq!(f.mode, "auto");
-        assert!(f.fields().contains(&Field::Effort));
+        assert!(f.all_fields().contains(&Field::Effort));
+        assert!(!f.fields().contains(&Field::Effort), "behind More settings");
         f.choose(Field::Model, "opus");
         f.choose(Field::Effort, "high");
         f.choose(Field::Agent, "amp");
@@ -1124,11 +1281,11 @@ mod tests {
             (f.mode.as_str(), f.model.as_str(), f.effort.as_str()),
             ("", "", "")
         );
-        assert!(!f.fields().contains(&Field::Mode));
+        assert!(!f.all_fields().contains(&Field::Mode));
         assert_eq!(f.current(), Field::Agent);
         f.choose(Field::Agent, "codex");
         assert_eq!(f.mode, "auto");
-        assert!(f.fields().contains(&Field::Model));
+        assert!(f.all_fields().contains(&Field::Model));
         f.choose(Field::Model, "some-model");
         assert!(f
             .items(Field::Model)
@@ -1147,7 +1304,7 @@ mod tests {
         f.choose(Field::Agent, SHELL);
         assert!(f.is_shell());
         assert_eq!(f.label(Field::Prompt), "Command");
-        let fields = f.fields();
+        let fields = f.all_fields();
         for gone in [Field::Mode, Field::Model, Field::Effort, Field::Args] {
             assert!(!fields.contains(&gone), "{gone:?}");
         }
@@ -1238,13 +1395,90 @@ mod tests {
         assert_eq!(back.shown(Field::Alert), "Popup on problems");
         // "When Herdr starts" needs no time and no missed setting.
         f.choose(Field::Repeat, Repeat::AtStart.label());
-        assert!(!f.fields().contains(&Field::Time));
-        assert!(!f.fields().contains(&Field::Missed));
+        assert!(!f.all_fields().contains(&Field::Time));
+        assert!(!f.all_fields().contains(&Field::Missed));
         assert_eq!(f.build().unwrap().0.schedule, "@start");
         // Shell commands have no check and no memory.
         f.choose(Field::Agent, SHELL);
-        assert!(!f.fields().contains(&Field::Check));
+        assert!(!f.all_fields().contains(&Field::Check));
         assert!(!f.build().unwrap().0.remember);
         assert!(f.build().unwrap().0.check_command.is_empty());
+    }
+
+    #[test]
+    fn the_form_starts_with_what_when_and_where() {
+        let mut f = Form::new("~/code/app");
+        assert_eq!(
+            f.fields(),
+            vec![
+                Field::Name,
+                Field::Agent,
+                Field::Prompt,
+                Field::Repeat,
+                Field::Time,
+                Field::Folder,
+                Field::More,
+                Field::Save
+            ]
+        );
+        assert_eq!(f.more_summary(), "Auto");
+        // The rest shows under "More settings", with today's defaults.
+        f.select(Field::More);
+        f.toggle_more();
+        assert_eq!(f.current(), Field::More);
+        for hidden in [Field::Mode, Field::Limit, Field::Retry, Field::Keep] {
+            assert!(f.fields().contains(&hidden), "{hidden:?}");
+        }
+        assert_eq!(f.fields().last(), Some(&Field::Save));
+        f.toggle_more();
+        // Going to a hidden field opens them.
+        f.select(Field::Limit);
+        assert!(f.more);
+        assert_eq!(f.current(), Field::Limit);
+        f.limit = "30".into();
+        f.retries = 1;
+        f.enabled = false;
+        assert_eq!(
+            f.more_summary(),
+            "Auto · switched off · 30 min limit · try once more"
+        );
+    }
+
+    #[test]
+    fn text_fields_have_a_cursor_that_moves() {
+        let mut f = Form::new("~");
+        for c in "Wekly chek".chars() {
+            f.type_char(c);
+        }
+        assert_eq!(f.cursor, 10);
+        // Left to behind "che", then the missing letter.
+        f.cursor_by(-1);
+        f.type_char('c');
+        assert_eq!(f.name, "Wekly check");
+        f.cursor_home();
+        f.cursor_by(2);
+        f.type_char('e');
+        assert_eq!(f.name, "Weekly check");
+        // Delete removes at the cursor, Backspace before it.
+        f.delete();
+        assert_eq!(f.name, "Weely check");
+        f.backspace();
+        assert_eq!(f.name, "Wely check");
+        f.cursor_home();
+        f.backspace();
+        f.cursor_by(-5);
+        assert_eq!((f.name.as_str(), f.cursor), ("Wely check", 0));
+        f.cursor_end();
+        f.delete();
+        f.paste(" ü!");
+        assert_eq!(f.name, "Wely check ü!");
+        f.cursor_by(-1);
+        f.backspace();
+        assert_eq!(f.name, "Wely check !");
+        // Each field starts with the cursor behind its text.
+        f.select(Field::Folder);
+        assert_eq!(f.cursor, 1);
+        f.clear();
+        assert_eq!((f.folder.as_str(), f.cursor), ("", 0));
     }
 }

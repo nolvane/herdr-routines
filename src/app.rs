@@ -20,6 +20,7 @@ use ratatui::crossterm::event::{
 use ratatui::layout::Rect;
 use ratatui::style::Color;
 use ratatui::DefaultTerminal;
+use std::collections::HashSet;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -78,6 +79,10 @@ pub enum Hit {
     Link,
     /// An entry of the right-click menu.
     MenuRow(usize),
+    /// The ‹ or › beside a choice in the form: the field and the step.
+    Cycle(usize, i8),
+    /// A way to take over cron jobs, in the dialog that offers them.
+    Take(usize),
 }
 
 /// Runs the system's opener (first argument) on a web link, true when it
@@ -101,6 +106,9 @@ pub struct Picker {
     pub filter: String,
     /// Every entry; `items` is what the filter leaves.
     pub all: Vec<crate::form::Item>,
+    /// The first entry shown, kept so the list only scrolls when the
+    /// marked entry would leave the window.
+    pub top: usize,
 }
 
 impl Picker {
@@ -117,6 +125,7 @@ impl Picker {
             sel,
             field,
             filter: String::new(),
+            top: 0,
         }
     }
 
@@ -134,6 +143,7 @@ impl Picker {
         };
         self.items = self.all.iter().filter(|i| keep(i)).cloned().collect();
         self.sel = 0;
+        self.top = 0;
     }
 }
 
@@ -157,6 +167,10 @@ pub enum ConfirmFor {
     /// One run: routine id and run id.
     DeleteRun(String, String),
     DiscardForm,
+    /// What was written in the prompt editor since it opened.
+    DiscardEditor,
+    /// Taking over cron jobs in a way that changes the crontab.
+    Import(Vec<crate::crontab::CronJob>, crate::crontab::Take),
     Autostart,
     AutostartOff,
     RoutinesOn,
@@ -168,6 +182,48 @@ pub struct Confirm {
     pub question: String,
     pub lines: Vec<String>,
     pub purpose: ConfirmFor,
+}
+
+impl Confirm {
+    /// What `y` does, for its button.
+    pub fn yes(&self) -> &'static str {
+        match &self.purpose {
+            ConfirmFor::Run(_) => "run",
+            ConfirmFor::Delete(_, true) => "delete, keep runs",
+            ConfirmFor::Delete(_, false) | ConfirmFor::DeleteRun(..) => "delete",
+            ConfirmFor::DiscardForm | ConfirmFor::DiscardEditor => "discard",
+            ConfirmFor::Import(_, crate::crontab::Take::ToHerdr) => "move",
+            ConfirmFor::Import(..) => "take over",
+            ConfirmFor::Autostart | ConfirmFor::RoutinesOn => "turn on",
+            ConfirmFor::AutostartOff | ConfirmFor::RoutinesOff => "turn off",
+        }
+    }
+
+    /// What any other key does, for its button.
+    pub fn no(&self) -> &'static str {
+        match &self.purpose {
+            ConfirmFor::DiscardForm | ConfirmFor::DiscardEditor => "keep editing",
+            _ => "no",
+        }
+    }
+
+    /// Something is lost for good: its button is red, and ⏎ does not
+    /// confirm it.
+    pub fn danger(&self) -> bool {
+        matches!(
+            self.purpose,
+            ConfirmFor::Delete(..)
+                | ConfirmFor::DeleteRun(..)
+                | ConfirmFor::DiscardForm
+                | ConfirmFor::DiscardEditor
+        )
+    }
+
+    /// Whether ⏎ confirms like `y`. Deleting, discarding and running by
+    /// hand ask for `y` itself.
+    pub fn enter_confirms(&self) -> bool {
+        !self.danger() && !matches!(self.purpose, ConfirmFor::Run(_))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -182,6 +238,8 @@ pub struct LogView {
     /// The approval view (`a`): the routine and exactly the files shown,
     /// approved with `y` once read to the end.
     pub approve: Option<(String, crate::approval::Snapshot)>,
+    /// A line that stays above the scrolled text: how a run went and why.
+    pub note: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -251,7 +309,43 @@ pub struct Editor {
     pub target: EditTarget,
     /// What is edited, for the header.
     pub title: String,
+    /// The text when the editor opened, which discarding goes back to.
+    pub original: String,
 }
+
+/// A message in the footer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Flash {
+    pub text: String,
+    pub color: Color,
+    /// When it goes by itself; a problem (red or yellow) stays until the
+    /// next key or click instead.
+    until: Instant,
+    pub sticky: bool,
+}
+
+/// The ways to take over cron jobs, in the order the dialog lists them:
+/// its key, what it is called and what it means.
+pub const TAKES: [(char, crate::crontab::Take, &str, &str); 3] = [
+    (
+        'k',
+        crate::crontab::Take::KeepCron,
+        "Keep as a cron job",
+        "Cron still runs it, also when Herdr is closed; you see, edit and switch it here, with its output in Runs",
+    ),
+    (
+        'm',
+        crate::crontab::Take::ToHerdr,
+        "Move to Herdr",
+        "Herdr runs it in a tab instead; its crontab line is commented out",
+    ),
+    (
+        'c',
+        crate::crontab::Take::Copy,
+        "Copy to Herdr, switched off",
+        "A routine with the same command and schedule; your crontab stays as it is",
+    ),
+];
 
 /// How the list works, shown on first open and under `?`.
 pub const INTRO: [&str; 5] = [
@@ -314,7 +408,25 @@ pub struct App {
     pub editor: Option<Editor>,
     pub help_scroll: u16,
     pub help_max: u16,
-    pub flash: Option<(String, Color, Instant)>,
+    pub flash: Option<Flash>,
+    /// The first row each list shows (routines, cron jobs, runs). The
+    /// wheel changes it; the cursor moves it only to stay in view.
+    pub tops: [usize; 3],
+    /// The cursor moved by key: the list scrolls to show it when drawn.
+    pub follow: bool,
+    /// Where the mouse is, for marking the row under it.
+    pub mouse: Option<(u16, u16)>,
+    /// The open dialog's place: a click beside it closes it.
+    pub dialog: Option<Rect>,
+    /// The tab the runs filter was set from; Esc goes back there.
+    pub filter_from: Option<View>,
+    /// Routines that were approved at least once: one that waits again
+    /// was changed, any other is new.
+    pub known: HashSet<String>,
+    /// The marked way in the dialog that takes over cron jobs.
+    pub take_sel: usize,
+    /// The size the list was last drawn at.
+    pub size: (u16, u16),
     pub quit: bool,
     pub hits: Vec<(Rect, Hit)>,
     pub opener: Opener,
@@ -359,6 +471,14 @@ impl App {
             help_scroll: 0,
             help_max: 0,
             flash: None,
+            tops: [0; 3],
+            follow: true,
+            mouse: None,
+            dialog: None,
+            filter_from: None,
+            known: HashSet::new(),
+            take_sel: 0,
+            size: (0, 0),
             quit: false,
             hits: Vec::new(),
             opener: open_in_browser,
@@ -376,6 +496,9 @@ impl App {
     }
 
     pub fn reload(&mut self) {
+        // The cursor stays on its routine, cron job or run, wherever a
+        // reload puts it: new runs and renamed routines move the rows.
+        let on = self.cursor_keys();
         // The crontab changes rarely: read every 15 seconds, or after a
         // change made here (which clears `crontab_read`). Its managed jobs
         // come first, as hand edits there win.
@@ -386,6 +509,10 @@ impl App {
             self.cron_pull();
         }
         self.routines = routine::load_all(&self.paths);
+        self.known = crate::approval::Approvals::load(&self.paths)
+            .0
+            .into_keys()
+            .collect();
         self.all_runs = store::all_runs(&self.paths);
         // A filter stays while its routine or any of its runs is there
         // (runs can outlive a deleted routine).
@@ -394,6 +521,7 @@ impl App {
                 && !self.all_runs.iter().any(|r| &r.routine_id == id)
             {
                 self.run_filter = None;
+                self.filter_from = None;
             }
         }
         self.runs = match &self.run_filter {
@@ -412,6 +540,7 @@ impl App {
                 .unwrap_or_default();
             self.crontab_read = Some(Instant::now());
         }
+        self.restore_cursors(on);
         let herdr = self.routines.iter().filter(|r| !r.is_cron()).count();
         let cron = self.routines.len() - herdr + self.crontab_jobs.len();
         self.sel_routine = self.sel_routine.min(herdr.saturating_sub(1));
@@ -419,6 +548,77 @@ impl App {
         self.sel_run = self.sel_run.min(self.runs.len().saturating_sub(1));
         self.last_load = Instant::now();
         self.fill_models();
+    }
+
+    /// What each list's cursor is on: the routine's id, the cron job's id
+    /// (or, for one only in the crontab, its line) and the run.
+    fn cursor_keys(&self) -> [Option<String>; 3] {
+        let routine = self
+            .routines
+            .iter()
+            .filter(|r| !r.is_cron())
+            .nth(self.sel_routine)
+            .map(|r| r.id.clone());
+        let managed: Vec<&Routine> = self.routines.iter().filter(|r| r.is_cron()).collect();
+        let cron = match managed.get(self.sel_cron) {
+            Some(r) => Some(format!("id:{}", r.id)),
+            None => self
+                .crontab_jobs
+                .get(self.sel_cron - managed.len())
+                .map(|j| format!("line:{}", j.line)),
+        };
+        let run = self
+            .runs
+            .get(self.sel_run)
+            .map(|r| format!("{}/{}", r.routine_id, r.id));
+        [routine, cron, run]
+    }
+
+    /// Puts each cursor back on what it was on, where that is still
+    /// there. A list that is scrolled keeps its picture: it moves along
+    /// with rows that came in above.
+    fn restore_cursors(&mut self, on: [Option<String>; 3]) {
+        let [routine, cron, run] = on;
+        let mut moved = [None; 3];
+        if let Some(id) = routine {
+            let now = self
+                .routines
+                .iter()
+                .filter(|r| !r.is_cron())
+                .position(|r| r.id == id);
+            moved[0] = now.map(|i| (self.sel_routine, i));
+        }
+        if let Some(key) = cron {
+            let managed: Vec<&Routine> = self.routines.iter().filter(|r| r.is_cron()).collect();
+            let now = managed
+                .iter()
+                .position(|r| format!("id:{}", r.id) == key)
+                .or_else(|| {
+                    self.crontab_jobs
+                        .iter()
+                        .position(|j| format!("line:{}", j.line) == key)
+                        .map(|i| i + managed.len())
+                });
+            moved[1] = now.map(|i| (self.sel_cron, i));
+        }
+        if let Some(key) = run {
+            let now = self
+                .runs
+                .iter()
+                .position(|r| format!("{}/{}", r.routine_id, r.id) == key);
+            moved[2] = now.map(|i| (self.sel_run, i));
+        }
+        for (list, change) in moved.into_iter().enumerate() {
+            let Some((was, now)) = change else { continue };
+            match list {
+                0 => self.sel_routine = now,
+                1 => self.sel_cron = now,
+                _ => self.sel_run = now,
+            }
+            if self.tops[list] > 0 {
+                self.tops[list] = (self.tops[list] + now).saturating_sub(was);
+            }
+        }
     }
 
     /// The models the form offers besides the agent's suggestions: what
@@ -447,8 +647,31 @@ impl App {
         form.more_models = more;
     }
 
+    /// Says something in the footer. What went wrong (red or yellow)
+    /// stays until the next key or click; the rest goes after a moment.
     pub fn flash(&mut self, text: impl Into<String>, color: Color) {
-        self.flash = Some((text.into(), color, Instant::now() + FLASH));
+        self.flash = Some(Flash {
+            text: text.into(),
+            color,
+            until: Instant::now() + FLASH,
+            sticky: color == RED || color == YELLOW,
+        });
+    }
+
+    /// A key or a click: the problem it was shown before has been seen.
+    fn seen_flash(&mut self) {
+        if self.flash.as_ref().is_some_and(|f| f.sticky) {
+            self.flash = None;
+        }
+    }
+
+    /// The list a tab shows, as a place in `tops`.
+    pub fn list_index(view: View) -> usize {
+        match view {
+            View::Routines => 0,
+            View::Cron => 1,
+            View::Runs => 2,
+        }
     }
 
     /// The routines the current tab lists: those Herdr runs, or the cron
@@ -499,6 +722,7 @@ impl App {
             return;
         };
         self.view = if cron { View::Cron } else { View::Routines };
+        self.follow = true;
         if let Some(i) = self.listed().iter().position(|r| r.id == id) {
             if cron {
                 self.sel_cron = i;
@@ -517,12 +741,60 @@ impl App {
         self.all_runs.iter().filter(|r| r.routine_id == id).count()
     }
 
-    /// Shows the runs of one routine (or all with None).
+    /// Shows the runs of one routine (or all with None). The cursor stays
+    /// on its run where the new list still has it.
     pub fn filter_runs(&mut self, routine_id: Option<String>) {
+        let on = self
+            .runs
+            .get(self.sel_run)
+            .map(|r| (r.routine_id.clone(), r.id.clone()));
+        let from_runs = self.view == View::Runs;
         self.run_filter = routine_id;
-        self.sel_run = 0;
+        self.filter_from = None;
         self.view = View::Runs;
         self.reload();
+        self.sel_run = 0;
+        self.tops[2] = 0;
+        if from_runs {
+            if let Some((routine, run)) = on {
+                if let Some(i) = self
+                    .runs
+                    .iter()
+                    .position(|r| r.routine_id == routine && r.id == run)
+                {
+                    self.sel_run = i;
+                }
+            }
+        }
+        self.follow = true;
+    }
+
+    /// `h` or a click on "n runs" on a routine: its runs, and Esc comes
+    /// back to it. One without runs says so instead of an empty list.
+    fn runs_of_selected(&mut self) {
+        let Some(id) = self.selected_routine().map(|r| r.id.clone()) else {
+            return;
+        };
+        if self.run_count(&id) == 0 {
+            return self.flash("No run yet", MUTED);
+        }
+        let from = self.view;
+        self.filter_runs(Some(id));
+        self.filter_from = Some(from);
+    }
+
+    /// Esc in the runs of one routine: back to that routine where the
+    /// filter came from its tab, else all runs again.
+    fn leave_filter(&mut self) {
+        match self.filter_from.take() {
+            Some(view) => {
+                self.run_filter = None;
+                self.view = view;
+                self.reload();
+                self.follow = true;
+            }
+            None => self.filter_runs(None),
+        }
     }
 
     /// The name of the routine the runs are filtered to.
@@ -651,7 +923,7 @@ impl App {
         // From disk, as for switching: what is copied is what is approved.
         let source = match Routine::load(&self.paths, &id) {
             Ok(r) => r,
-            Err(e) => return self.flash(format!("Cannot copy: {e}"), RED),
+            Err(e) => return self.flash(format!("Cannot duplicate: {e}"), RED),
         };
         let mut name = format!("{} copy", source.file.name);
         let mut n = 2;
@@ -670,13 +942,16 @@ impl App {
         };
         match saved {
             Ok(()) => {
-                self.flash(format!("Copied as {}, switched off", copy.file.name), GREEN);
+                self.flash(
+                    format!("Duplicated as {}, switched off", copy.file.name),
+                    GREEN,
+                );
                 // A copied cron job gets its own (switched off) crontab line.
                 self.cron_write(&copy.id);
                 self.reload();
                 self.select_id(&copy.id);
             }
-            Err(e) => self.flash(format!("Cannot copy: {e}"), RED),
+            Err(e) => self.flash(format!("Cannot duplicate: {e}"), RED),
         }
     }
 
@@ -754,10 +1029,20 @@ impl App {
                 "No output was saved for this run."
             };
             lines.push(why.into());
-            if !run.message.is_empty() {
-                lines.push(String::new());
-                lines.push(run.message.clone());
-            }
+        }
+        // How it went and why, always in sight above the output.
+        let how = if run.attempt > 0 {
+            format!("{} {}", run.trigger.label(), run.attempt)
+        } else {
+            run.trigger.label().to_string()
+        };
+        let mut note = format!(
+            "{how} · {} {}",
+            if run.status.active() { "for" } else { "took" },
+            took(run)
+        );
+        if !run.message.trim().is_empty() {
+            note = format!("{} · {note}", visible_text(run.message.trim()));
         }
         // Open at the result, or else at the end, where the answer is.
         self.mode = Mode::Log(LogView {
@@ -772,6 +1057,7 @@ impl App {
             max: 0,
             file,
             approve: None,
+            note,
         });
     }
 
@@ -792,7 +1078,7 @@ impl App {
                 ),
                 item(
                     BY_CRON,
-                    "Classic cron job",
+                    "Cron job",
                     "A command in your crontab, runs also when Herdr is closed",
                 ),
                 item(
@@ -928,6 +1214,7 @@ impl App {
         let mut t = TextArea::new(text);
         t.go_to_end();
         self.editor = Some(Editor {
+            original: t.text(),
             text: t,
             target,
             title: title.into(),
@@ -1044,7 +1331,11 @@ impl App {
             Some(f) if f.dirty => {
                 self.mode = Mode::Confirm(Confirm {
                     question: "Discard the changes?".into(),
-                    lines: vec!["The routine stays as it was.".into()],
+                    lines: vec![if f.id.is_some() {
+                        "The routine stays as it was.".into()
+                    } else {
+                        "The new routine is not created.".into()
+                    }],
                     purpose: ConfirmFor::DiscardForm,
                 })
             }
@@ -1146,6 +1437,7 @@ impl App {
             max: u16::MAX,
             file: None,
             approve: Some((r.id, files)),
+            note: String::new(),
         });
     }
 
@@ -1192,13 +1484,17 @@ impl App {
         };
         let runs = self.run_count(&r.id);
         let mut lines = vec![if r.is_cron() {
-            "The cron job goes, also its line in your crontab.".to_string()
+            "The cron job is deleted, and its line in your crontab with it.".to_string()
+        } else if r.is_shell() {
+            "The routine and its command are deleted. Tabs of runs that are still open stay."
+                .to_string()
         } else {
-            "The routine and its prompt go. Tabs of runs still open stay.".to_string()
+            "The routine and its prompt are deleted. Tabs of runs that are still open stay."
+                .to_string()
         }];
         if runs > 0 {
             lines.push(format!(
-                "Its {} stay in Runs (y), or go too (r).",
+                "Its {} stay in Runs (y), or are deleted too (r).",
                 if runs == 1 {
                     "run".to_string()
                 } else {
@@ -1213,19 +1509,56 @@ impl App {
         });
     }
 
-    /// `C`: the jobs in the crontab.
+    /// `C`: the jobs that are only in the crontab, to take them over.
     fn show_cron(&mut self) {
         match crate::crontab::read() {
             Ok(text) => {
                 let jobs = crate::crontab::parse(&text);
                 if jobs.is_empty() {
-                    self.flash("No cron jobs in your crontab", MUTED);
+                    self.flash("No other cron jobs in your crontab", MUTED);
                 } else {
+                    self.take_sel = 0;
                     self.mode = Mode::Cron(jobs);
                 }
             }
             Err(e) => self.flash(format!("Could not read the crontab: {e}"), RED),
         }
+    }
+
+    /// Takes cron jobs over. Keeping and moving change the crontab, so
+    /// they ask first; a copy leaves it alone.
+    fn ask_import(&mut self, jobs: Vec<crate::crontab::CronJob>, how: crate::crontab::Take) {
+        use crate::crontab::Take;
+        let one = jobs.len() == 1;
+        let what = if one {
+            "1 cron job".to_string()
+        } else {
+            format!("{} cron jobs", jobs.len())
+        };
+        let (question, text) = match how {
+            Take::Copy => return self.import_cron(jobs, how),
+            Take::ToHerdr => (
+                format!("Move {what} to Herdr?"),
+                if one {
+                    "Herdr runs it in a tab from now on. Its line in your crontab is commented out, so it does not run twice; a backup of the crontab is kept."
+                } else {
+                    "Herdr runs them in tabs from now on. Their lines in your crontab are commented out, so nothing runs twice; a backup of the crontab is kept."
+                },
+            ),
+            Take::KeepCron => (
+                format!("Take over {what}?"),
+                if one {
+                    "Cron still runs it, also when Herdr is closed. The list puts a marker around its line in your crontab to follow its runs; a backup of the crontab is kept."
+                } else {
+                    "Cron still runs them, also when Herdr is closed. The list puts a marker around their lines in your crontab to follow their runs; a backup of the crontab is kept."
+                },
+            ),
+        };
+        self.mode = Mode::Confirm(Confirm {
+            question,
+            lines: vec![text.to_string()],
+            purpose: ConfirmFor::Import(jobs, how),
+        });
     }
 
     fn import_cron(&mut self, jobs: Vec<crate::crontab::CronJob>, how: crate::crontab::Take) {
@@ -1240,7 +1573,7 @@ impl App {
                 };
                 let text = match how {
                     Take::ToHerdr => format!("Moved {what} to Herdr"),
-                    Take::KeepCron => format!("{what} now managed here, still run by cron"),
+                    Take::KeepCron => format!("Took over {what}; cron still runs them"),
                     Take::Copy => format!("Copied {what}, switched off"),
                 };
                 self.flash(text, GREEN);
@@ -1264,7 +1597,7 @@ impl App {
             self.mode = Mode::Confirm(Confirm {
                 question: "Turn autostart off?".into(),
                 lines: vec![
-                    "Herdr then no longer starts at login: after a restart, routines run only once you open Herdr. Herdr running now keeps running.".into(),
+                    "Herdr then no longer starts when you log in: after a restart, routines run only once you open Herdr. Herdr running now keeps running.".into(),
                 ],
                 purpose: ConfirmFor::AutostartOff,
             });
@@ -1275,9 +1608,9 @@ impl App {
 
     fn ask_autostart(&mut self) {
         self.mode = Mode::Confirm(Confirm {
-            question: "Start Herdr at login?".into(),
+            question: "Turn autostart on?".into(),
             lines: vec![
-                "Herdr then runs in the background from the moment you log in, so routines also run after a restart without opening it. Opening Herdr connects to it as usual.".into(),
+                "Herdr then starts in the background when you log in, so routines also run after a restart without opening it. Opening Herdr connects to it as usual.".into(),
                 "Takes effect at the next login. Change it any time with a click on \"autostart\" at the top.".into(),
             ],
             purpose: ConfirmFor::Autostart,
@@ -1320,6 +1653,8 @@ impl App {
                 self.reload();
             }
             ConfirmFor::DiscardForm => self.form = None,
+            ConfirmFor::DiscardEditor => self.editor = None,
+            ConfirmFor::Import(jobs, how) => self.import_cron(jobs, how),
             ConfirmFor::RoutinesOn => self.routines_on(),
             ConfirmFor::RoutinesOff => self.routines_off(),
         }
@@ -1332,7 +1667,7 @@ impl App {
             self.mode = Mode::Confirm(Confirm {
                 question: "Switch all routines off?".into(),
                 lines: vec![
-                    "No routine runs until you switch them on again here, also not after Herdr restarts. Classic cron jobs skip their times too. Runs going on now carry on.".into(),
+                    "No routine runs until you switch them on again here, also not after Herdr restarts. Cron jobs skip their times too. Runs going on now carry on.".into(),
                     "Each routine keeps its own on or off.".into(),
                 ],
                 purpose: ConfirmFor::RoutinesOff,
@@ -1341,7 +1676,7 @@ impl App {
             self.mode = Mode::Confirm(Confirm {
                 question: "Switch routines on?".into(),
                 lines: vec![
-                    "Routines that are on run on their schedule again, and classic cron jobs at their times.".into(),
+                    "Routines that are on run on their schedule again, and cron jobs at their times.".into(),
                 ],
                 purpose: ConfirmFor::RoutinesOn,
             });
@@ -1459,6 +1794,7 @@ impl App {
                 self.open_editor(&text, EditTarget::Form, title);
             }
             Field::Save => self.try_save(),
+            Field::More => form.toggle_more(),
             f if f.is_choice() => self.open_picker(),
             _ => form.move_by(1),
         }
@@ -1488,13 +1824,46 @@ impl App {
             return;
         }
         let c = self.cursor();
-        *c = (*c as i32 + by).clamp(0, len as i32 - 1) as usize;
+        *c = (*c as i64 + by as i64).clamp(0, len as i64 - 1) as usize;
+        self.follow = true;
+    }
+
+    /// Goes to another tab.
+    fn show(&mut self, view: View) {
+        self.view = view;
+        self.follow = true;
+    }
+
+    /// A key that needs a routine, on a job that is only in the crontab.
+    fn only_in_crontab(&mut self) {
+        self.flash(
+            "This job is only in your crontab: ⏎ takes it over first",
+            MUTED,
+        );
+    }
+
+    /// `Ctrl+D` in the editor: leaves without keeping what was written,
+    /// after asking when something changed.
+    fn discard_editor(&mut self) {
+        let Some(ed) = &self.editor else {
+            return;
+        };
+        if ed.text.text() == ed.original {
+            self.editor = None;
+            return;
+        }
+        self.mode = Mode::Confirm(Confirm {
+            question: "Discard what you wrote?".into(),
+            lines: vec!["The text stays as it was when the editor opened.".into()],
+            purpose: ConfirmFor::DiscardEditor,
+        });
     }
 
     fn enter(&mut self) {
         match self.view {
             View::Cron if self.selected_cron_job().is_some() => {
                 let job = self.selected_cron_job().cloned().unwrap();
+                self.take_sel = 0;
                 self.mode = Mode::Cron(vec![job]);
             }
             View::Routines | View::Cron => self.edit_selected(),
@@ -1509,6 +1878,7 @@ impl App {
         if k.kind == KeyEventKind::Release {
             return;
         }
+        self.seen_flash();
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let writing = self.editor.is_some() && matches!(self.mode, Mode::Normal);
         if ctrl && k.code == KeyCode::Char('c') && !writing {
@@ -1556,6 +1926,7 @@ impl App {
             },
             Mode::Confirm(c) => match (k.code, &c.purpose) {
                 (KeyCode::Char('y'), _) => self.confirmed(c),
+                (KeyCode::Enter, _) if c.enter_confirms() => self.confirmed(c),
                 // Deleting a routine with runs: `r` takes its runs along.
                 (KeyCode::Char('r'), ConfirmFor::Delete(id, true)) => {
                     let id = id.clone();
@@ -1624,21 +1995,35 @@ impl App {
                 }
                 _ => {}
             },
-            Mode::Message { .. } => {
-                if matches!(
-                    k.code,
-                    KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char(' ')
-                ) {
+            Mode::Message { .. } => match k.code {
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char(' ') => {
                     self.mode = Mode::Normal;
                     if std::mem::take(&mut self.autostart_after_intro) {
                         self.ask_autostart_once();
                     }
                 }
-            }
+                // A note longer than the window scrolls.
+                KeyCode::Up | KeyCode::Char('k') => self.scroll_help(-1),
+                KeyCode::Down | KeyCode::Char('j') => self.scroll_help(1),
+                KeyCode::PageUp => self.scroll_help(-10),
+                KeyCode::PageDown => self.scroll_help(10),
+                _ => {}
+            },
             Mode::Cron(jobs) => match k.code {
-                KeyCode::Char('k') => self.import_cron(jobs, crate::crontab::Take::KeepCron),
-                KeyCode::Char('m') => self.import_cron(jobs, crate::crontab::Take::ToHerdr),
-                KeyCode::Char('c') => self.import_cron(jobs, crate::crontab::Take::Copy),
+                KeyCode::Up | KeyCode::BackTab => {
+                    self.take_sel = (self.take_sel + TAKES.len() - 1) % TAKES.len();
+                }
+                KeyCode::Down | KeyCode::Tab => self.take_sel = (self.take_sel + 1) % TAKES.len(),
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    let how = TAKES[self.take_sel.min(TAKES.len() - 1)].1;
+                    self.ask_import(jobs, how);
+                }
+                KeyCode::Char(c) if TAKES.iter().any(|t| t.0 == c) => {
+                    let how = TAKES.iter().find(|t| t.0 == c).map(|t| t.1);
+                    if let Some(how) = how {
+                        self.ask_import(jobs, how);
+                    }
+                }
                 KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::Normal,
                 _ => {}
             },
@@ -1695,6 +2080,7 @@ impl App {
             KeyCode::Esc => self.save_editor(),
             KeyCode::Char('s') if ctrl => self.save_editor(),
             KeyCode::Char('o') if ctrl => self.external = true,
+            KeyCode::Char('d') if ctrl => self.discard_editor(),
             KeyCode::Char('c') | KeyCode::Char('x') if ctrl => {
                 let Some(ed) = self.editor.as_mut() else {
                     return;
@@ -1736,12 +2122,20 @@ impl App {
             KeyCode::Esc => self.close_form(),
             KeyCode::Up | KeyCode::BackTab => form.move_by(-1),
             KeyCode::Down | KeyCode::Tab => form.move_by(1),
-            KeyCode::Home if !field.is_text() => form.field = 0,
-            KeyCode::End if !field.is_text() => form.move_by(99),
+            KeyCode::PageUp => form.move_by(-6),
+            KeyCode::PageDown => form.move_by(6),
+            // In a text field the arrows, Home and End move the cursor.
+            KeyCode::Left if field.is_text() => form.cursor_by(-1),
+            KeyCode::Right if field.is_text() => form.cursor_by(1),
+            KeyCode::Home if field.is_text() => form.cursor_home(),
+            KeyCode::End if field.is_text() => form.cursor_end(),
+            KeyCode::Home => form.go(0),
+            KeyCode::End => form.move_by(99),
             KeyCode::Left => form.cycle(-1),
             KeyCode::Right => form.cycle(1),
             KeyCode::Enter => self.form_enter(),
             KeyCode::Backspace => form.backspace(),
+            KeyCode::Delete => form.delete(),
             KeyCode::Char(' ') if !field.is_text() => self.form_enter(),
             KeyCode::Char('?') if !field.is_text() => {
                 self.help_scroll = 0;
@@ -1757,22 +2151,25 @@ impl App {
     fn list_key(&mut self, k: KeyEvent) {
         match k.code {
             KeyCode::Char('q') => self.mode = Mode::AskQuit,
-            // Esc in a filtered Runs view shows all runs again.
+            // Esc in the runs of one routine goes back.
             KeyCode::Esc if self.run_filter.is_some() && self.view == View::Runs => {
-                self.filter_runs(None)
+                self.leave_filter()
             }
             KeyCode::Esc => {}
-            KeyCode::Char('h') => {
-                let id = match self.view {
-                    View::Routines | View::Cron => self.selected_routine().map(|r| r.id.clone()),
-                    View::Runs => self.runs.get(self.sel_run).map(|r| r.routine_id.clone()),
-                };
-                if id.is_some() && id == self.run_filter && self.view == View::Runs {
-                    self.filter_runs(None);
-                } else if id.is_some() {
-                    self.filter_runs(id);
+            KeyCode::Char('h') => match self.view {
+                View::Routines | View::Cron if self.selected_cron_job().is_some() => {
+                    self.only_in_crontab()
                 }
-            }
+                View::Routines | View::Cron => self.runs_of_selected(),
+                View::Runs => {
+                    let id = self.runs.get(self.sel_run).map(|r| r.routine_id.clone());
+                    if id.is_some() && id == self.run_filter {
+                        self.filter_runs(None);
+                    } else if id.is_some() {
+                        self.filter_runs(id);
+                    }
+                }
+            },
             KeyCode::Char('f') if self.view == View::Runs => {
                 if let Some(run) = self.runs.get(self.sel_run).cloned() {
                     self.open_output_file(&run);
@@ -1786,7 +2183,8 @@ impl App {
                         self.mode = Mode::Confirm(Confirm {
                             question: format!("Delete this run of {}?", run.routine_name),
                             lines: vec![
-                                "Its record, output and result go. An open tab stays.".into()
+                                "Its record, output and result are deleted. An open tab stays."
+                                    .into(),
                             ],
                             purpose: ConfirmFor::DeleteRun(run.routine_id, run.id),
                         });
@@ -1801,22 +2199,27 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => self.step(1),
             KeyCode::PageUp => self.step(-10),
             KeyCode::PageDown => self.step(10),
-            KeyCode::Char('g') | KeyCode::Home => *self.cursor() = 0,
-            KeyCode::Char('G') | KeyCode::End => {
-                let last = self.rows_len().saturating_sub(1);
-                *self.cursor() = last;
-            }
-            KeyCode::Tab | KeyCode::Right => self.view = self.view.step(1),
-            KeyCode::BackTab | KeyCode::Left => self.view = self.view.step(-1),
-            KeyCode::Char('1') => self.view = View::Routines,
-            KeyCode::Char('2') => self.view = View::Cron,
-            KeyCode::Char('3') => self.view = View::Runs,
+            KeyCode::Char('g') | KeyCode::Home => self.step(i32::MIN / 2),
+            KeyCode::Char('G') | KeyCode::End => self.step(i32::MAX / 2),
+            KeyCode::Tab | KeyCode::Right => self.show(self.view.step(1)),
+            KeyCode::BackTab | KeyCode::Left => self.show(self.view.step(-1)),
+            KeyCode::Char('1') => self.show(View::Routines),
+            KeyCode::Char('2') => self.show(View::Cron),
+            KeyCode::Char('3') => self.show(View::Runs),
             KeyCode::Char('S') => self.toggle_routines(),
             KeyCode::Char('A') => self.toggle_autostart(),
             KeyCode::Char('C') => self.show_cron(),
             KeyCode::Char('i') => self.toggle_icons(),
             KeyCode::Char('n') => self.new_routine(),
             KeyCode::Enter => self.enter(),
+            // A job that is only in the crontab has no runs, prompt or
+            // switch here: say so instead of doing nothing.
+            KeyCode::Char('l' | 'e' | 'p' | 'r' | 'a' | ' ' | 'c' | 'o' | 'd')
+            | KeyCode::Delete
+                if self.selected_cron_job().is_some() =>
+            {
+                self.only_in_crontab()
+            }
             KeyCode::Char('l') => {
                 let run = match self.view {
                     View::Routines | View::Cron => self
@@ -1943,12 +2346,12 @@ impl App {
                 "space",
                 MenuAction::Key(' '),
             ));
-            v.push(item("Copy", "c", MenuAction::Key('c')));
+            v.push(item("Duplicate", "c", MenuAction::Key('c')));
             if let Some(run) = self.latest_run(&r.id) {
                 if !run.tab_closed && run.cron_pid == 0 {
-                    v.push(item("Go to the last run's tab", "o", MenuAction::Key('o')));
+                    v.push(item("Go to its last run's tab", "o", MenuAction::Key('o')));
                 }
-                v.push(item("Output of the last run", "l", MenuAction::Key('l')));
+                v.push(item("Output of its last run", "l", MenuAction::Key('l')));
                 v.push(item("Its runs", "h", MenuAction::Key('h')));
             }
             v.push(MenuItem {
@@ -1956,38 +2359,30 @@ impl App {
                 ..item("Delete…", "d", MenuAction::Key('d'))
             });
         } else if self.selected_cron_job().is_some() {
-            use crate::crontab::Take;
-            v.push(item(
-                "Keep as cron job, manage it here",
-                "k",
-                MenuAction::Take(Take::KeepCron),
-            ));
-            v.push(item("Move to Herdr", "m", MenuAction::Take(Take::ToHerdr)));
-            v.push(item(
-                "Copy to Herdr, switched off",
-                "c",
-                MenuAction::Take(Take::Copy),
-            ));
+            for (key, how, label, _) in TAKES {
+                let key: &'static str = match key {
+                    'k' => "k",
+                    'm' => "m",
+                    _ => "c",
+                };
+                v.push(item(label, key, MenuAction::Take(how)));
+            }
         } else if let (View::Runs, Some(run)) = (self.view, self.runs.get(self.sel_run)) {
             let open = !run.tab_closed && run.cron_pid == 0 && !run.pane_id.is_empty();
             v.push(item(
-                if open {
-                    "Go to its tab"
-                } else {
-                    "Show its output"
-                },
+                if open { "Go to its tab" } else { "Its output" },
                 "⏎",
                 MenuAction::Key('\n'),
             ));
             if open {
-                v.push(item("Show its output", "l", MenuAction::Key('l')));
+                v.push(item("Its output", "l", MenuAction::Key('l')));
             }
             v.push(item("Open the output file", "f", MenuAction::Key('f')));
             v.push(item(
                 if self.run_filter.is_some() {
                     "All runs"
                 } else {
-                    "Only this routine's runs"
+                    "Only its runs"
                 },
                 "h",
                 MenuAction::Key('h'),
@@ -2015,85 +2410,85 @@ impl App {
             }
             MenuAction::Take(how) => {
                 if let Some(job) = self.selected_cron_job().cloned() {
-                    self.import_cron(vec![job], how);
+                    self.ask_import(vec![job], how);
                 }
             }
         }
     }
 
     /// The mouse over a menu or a list to choose from marks the entry
-    /// under it, as Herdr's own menus do.
+    /// under it, as Herdr's own menus do; over a list it lights the row.
     fn hover(&mut self, x: u16, y: u16) {
-        let under = self
-            .hits
-            .iter()
-            .rev()
-            .find(|(r, _)| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height)
-            .map(|(_, h)| *h);
+        self.mouse = Some((x, y));
+        let under = self.hit_at(x, y).map(|(_, h)| h);
         match (&mut self.mode, under) {
             (Mode::Menu(m), Some(Hit::MenuRow(i))) if i < m.items.len() => m.sel = i,
             (Mode::Pick(p), Some(Hit::PickRow(i))) if i < p.items.len() => p.sel = i,
+            (Mode::Cron(_), Some(Hit::Take(i))) if i < TAKES.len() => self.take_sel = i,
             _ => {}
         }
     }
 
-    fn click(&mut self, x: u16, y: u16) {
-        // Outside an open menu, a click only closes it.
-        if matches!(self.mode, Mode::Menu(_)) {
-            let on_menu = self.hits.iter().any(|(r, h)| {
-                matches!(h, Hit::MenuRow(_))
-                    && x >= r.x
-                    && x < r.x + r.width
-                    && y >= r.y
-                    && y < r.y + r.height
-            });
-            if !on_menu {
-                self.mode = Mode::Normal;
-                return;
-            }
-        }
-        let Some((rect, hit)) = self
-            .hits
+    /// The clickable area under the mouse; the one drawn last wins.
+    fn hit_at(&self, x: u16, y: u16) -> Option<(Rect, Hit)> {
+        self.hits
             .iter()
             .rev()
             .find(|(r, _)| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height)
             .copied()
-        else {
+    }
+
+    /// One mouse model everywhere: a click on something that only does one
+    /// thing (a button, a key in the footer, an entry of a menu or of a
+    /// list to choose from) does it; a click on a row or a field marks it,
+    /// and a click on the marked one opens it; a click beside a dialog
+    /// closes it. While a dialog is open only the dialog and its keys in
+    /// the footer can be clicked (`ui::draw` drops everything else).
+    pub fn click(&mut self, x: u16, y: u16) {
+        self.mouse = Some((x, y));
+        self.seen_flash();
+        let normal = matches!(self.mode, Mode::Normal);
+        let Some((rect, hit)) = self.hit_at(x, y) else {
+            let d = self.dialog;
+            // No dialog on screen (the question in the footer): anywhere.
+            let beside =
+                d.is_none_or(|d| x < d.x || x >= d.x + d.width || y < d.y || y >= d.y + d.height);
+            if !normal && beside {
+                self.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            }
             return;
         };
         let double = self
             .last_click
             .is_some_and(|(at, h)| h == hit && at.elapsed() < Duration::from_millis(400));
         self.last_click = Some((Instant::now(), hit));
-        let normal = matches!(self.mode, Mode::Normal);
         match hit {
             Hit::View(v) => {
                 if normal {
-                    self.view = v;
+                    self.show(v);
                 }
             }
             Hit::Row(i) => {
                 if normal {
-                    *self.cursor() = i;
-                    if double {
+                    // The list stays where it is: a click never scrolls.
+                    if *self.cursor() == i {
                         self.enter();
+                    } else {
+                        *self.cursor() = i;
                     }
                 }
             }
             Hit::RunsOf(i) => {
                 if normal {
                     *self.cursor() = i;
-                    let id = self.listed().get(i).map(|r| r.id.clone());
-                    self.filter_runs(id);
+                    self.runs_of_selected();
                 }
             }
             Hit::PickRow(i) => {
                 if let Mode::Pick(mut p) = self.mode.clone() {
-                    p.sel = i;
-                    if double {
+                    if i < p.items.len() {
+                        p.sel = i;
                         self.picked(p);
-                    } else {
-                        self.mode = Mode::Pick(p);
                     }
                 }
             }
@@ -2105,11 +2500,28 @@ impl App {
                     return;
                 };
                 let again = form.field == i;
-                form.field = i;
+                if !again {
+                    form.go(i);
+                }
                 let f = form.current();
-                // A second click (or one on a button) acts.
-                if (again || f == Field::Save || f == Field::Prompt) && !f.is_text() {
+                // Rows that do one thing act at once; a choice opens on
+                // the click after the one that marked it.
+                if matches!(f, Field::Save | Field::Prompt | Field::More) || (again && !f.is_text())
+                {
                     self.form_enter();
+                }
+            }
+            Hit::Cycle(i, by) => {
+                if let (true, Some(form)) = (normal, self.form.as_mut()) {
+                    if form.field != i {
+                        form.go(i);
+                    }
+                    form.cycle(i32::from(by));
+                }
+            }
+            Hit::Take(i) => {
+                if let (Mode::Cron(jobs), Some(take)) = (self.mode.clone(), TAKES.get(i)) {
+                    self.ask_import(jobs, take.1);
                 }
             }
             // From the footer: a click is never typed into a field.
@@ -2157,7 +2569,7 @@ impl App {
 
     fn wheel(&mut self, by: i32) {
         match self.mode.clone() {
-            Mode::Help => self.scroll_help(by * 2),
+            Mode::Help | Mode::Message { .. } => self.scroll_help(by * 2),
             Mode::Pick(mut p) => {
                 p.sel = (p.sel as i32 + by)
                     .clamp(0, p.items.len() as i32 - 1)
@@ -2174,7 +2586,11 @@ impl App {
                 } else if let Some(form) = self.form.as_mut() {
                     form.move_by(by);
                 } else {
-                    self.step(by);
+                    // The view moves, the cursor stays on its row; drawing
+                    // keeps the offset inside the list.
+                    let top = &mut self.tops[App::list_index(self.view)];
+                    *top = (*top as i32 + by).max(0) as usize;
+                    self.follow = false;
                 }
             }
             _ => {}
@@ -2308,7 +2724,7 @@ impl App {
             if self
                 .flash
                 .as_ref()
-                .is_some_and(|(_, _, until)| Instant::now() >= *until)
+                .is_some_and(|f| !f.sticky && Instant::now() >= f.until)
             {
                 self.flash = None;
             }
@@ -2508,7 +2924,7 @@ retries = 0                       # try a failed run again this many times (0-3)
 retry_delay_minutes = 10          # ...this many minutes apart
 check_command = ""                # agents only: a shell command run first; the agent starts only if it exits 0, and gets its output
 remember = false                  # agents only: each run gets the results of the last ten runs
-runs_in = "herdr"                 # shell only: "herdr" (a tab, while Herdr runs) or "cron" (a classic cron job in my crontab, also when Herdr is closed; command.sh is then one line, run in my home folder; the list writes the crontab line once I approve it)
+runs_in = "herdr"                 # shell only: "herdr" (a tab, while Herdr runs) or "cron" (a cron job in my crontab, also when Herdr is closed; command.sh is then one line, run in my home folder; the list writes the crontab line once I approve it)
 keep_runs = 30                    # runs kept in the history (0: no limit)...
 keep_days = 90                    # ...and none older than this many days (0: no limit)
 alert = "notification"            # "notification", "popup-on-problems" (a popup that stays until OK when a run fails, runs too long or needs me) or "popup" (also when it finishes)
@@ -2704,7 +3120,7 @@ mod tests {
         // The crontab's jobs show in their own tab, not among the routines.
         assert_eq!(a.crontab_jobs.len(), 2);
         let lines = screen(&mut a, 120, 40);
-        assert!(!lines.iter().any(|l| l.contains("in your crontab ·")));
+        assert!(!lines.iter().any(|l| l.contains("only in your crontab")));
         assert!(lines.iter().any(|l| l.contains("Cron jobs (2)")));
         press(&mut a, KeyCode::Char('2'));
         assert_eq!(a.view, View::Cron);
@@ -2712,9 +3128,9 @@ mod tests {
         assert!(lines
             .iter()
             .any(|l| l.contains("backup.sh --all") && l.contains("Daily at 02:00")));
-        assert!(lines.iter().any(|l| l.contains("in your crontab ·")));
+        assert!(lines.iter().any(|l| l.contains("only in your crontab")));
         assert!(a.selected_cron_job().is_some());
-        assert!(lines.iter().any(|l| l.contains("⏎ manage it here")));
+        assert!(lines.iter().any(|l| l.contains("⏎ takes it over")));
         press(&mut a, KeyCode::Char('C'));
         let Mode::Cron(jobs) = a.mode.clone() else {
             panic!("no cron list: {:?}", a.flash);
@@ -2723,9 +3139,26 @@ mod tests {
         let lines = screen(&mut a, 100, 30);
         assert!(lines
             .iter()
-            .any(|l| l.contains("2 cron jobs in your crontab")));
+            .any(|l| l.contains("Take over 2 cron jobs from your crontab")));
         assert!(lines.iter().any(|l| l.contains("When the computer starts")));
+        // Moving changes the crontab, so it asks first; any other key
+        // leaves everything as it is.
         press(&mut a, KeyCode::Char('m'));
+        let Mode::Confirm(c) = a.mode.clone() else {
+            panic!("moving does not ask");
+        };
+        assert_eq!(c.question, "Move 2 cron jobs to Herdr?");
+        press(&mut a, KeyCode::Char('n'));
+        assert_eq!(a.crontab_jobs.len(), 2, "nothing moved");
+        assert!(std::fs::read_to_string(&tab)
+            .unwrap()
+            .contains("\n0 2 * * * /opt/jobs"));
+        // ⏎ on the marked way chooses it, and ⏎ confirms the question.
+        press(&mut a, KeyCode::Char('C'));
+        press(&mut a, KeyCode::Down);
+        press(&mut a, KeyCode::Enter);
+        assert!(matches!(a.mode, Mode::Confirm(_)));
+        press(&mut a, KeyCode::Enter);
         let moved: Vec<&Routine> = a
             .routines
             .iter()
@@ -2758,6 +3191,8 @@ mod tests {
         press(&mut a, KeyCode::Enter);
         assert!(matches!(a.mode, Mode::Cron(_)));
         press(&mut a, KeyCode::Char('k'));
+        assert!(matches!(a.mode, Mode::Confirm(_)), "keeping asks first");
+        press(&mut a, KeyCode::Char('y'));
         assert_eq!(a.view, View::Cron);
         assert_eq!(a.listed().len(), 1, "now one of this plugin's cron jobs");
         let job = a
@@ -2863,15 +3298,15 @@ mod tests {
         let lines = screen(&mut a, 100, 40);
         let all = lines.join("\n");
         assert!(
-            all.contains("Crontab        0 9 * * 1-5 and the command below"),
+            all.contains("Crontab line    0 9 * * 1-5 and the command below"),
             "{all}"
         );
         assert!(
-            all.contains("Command        date +%H%M >> /tmp/stamp.log"),
+            all.contains("Command         date +%H%M >> /tmp/stamp.log"),
             "{all}"
         );
         assert!(
-            all.contains("Keeps          The last 30 runs, none older than 90 days"),
+            all.contains("Run history     The last 30 runs, none older than 90 days"),
             "{all}"
         );
         // Run now asks, then starts it through its wrapper, not in a tab.
@@ -2887,11 +3322,11 @@ mod tests {
         let all = screen(&mut a, 100, 40).join("\n");
         assert!(!all.contains("Folder"), "{all}");
         assert!(
-            all.contains("Keep              ‹ 30 runs, 90 days ›"),
+            all.contains("Run history        ‹ 30 runs, 90 days ›"),
             "{all}"
         );
         assert!(
-            all.contains("Time limit, retries, alerts and history"),
+            all.contains("Time limit, retries, alerts and run history"),
             "{all}"
         );
         crate::crontab::use_fake(None);
@@ -2975,8 +3410,8 @@ mod tests {
     }
 
     #[test]
-    fn a_new_classic_cron_job_is_a_shell_command_in_cron() {
-        let mut a = app("newcron");
+    fn a_new_cron_job_is_a_shell_command_in_cron() {
+        let mut a = app("newcron-form");
         press(&mut a, KeyCode::Char('n'));
         press(&mut a, KeyCode::Down);
         press(&mut a, KeyCode::Enter);
@@ -3009,14 +3444,14 @@ mod tests {
             panic!("no menu");
         };
         let labels: Vec<&str> = m.items.iter().map(|i| i.label.as_str()).collect();
-        assert!(labels.contains(&"Edit") && labels.contains(&"Copy"));
+        assert!(labels.contains(&"Edit") && labels.contains(&"Duplicate"));
         assert!(m.items.last().unwrap().danger, "delete comes last, in red");
         let lines = screen(&mut a, 110, 34);
         assert!(lines
             .iter()
             .any(|l| l.contains("Switch off") && l.contains("space")));
         // Clicking an entry does what its key does.
-        let copy = m.items.iter().position(|i| i.label == "Copy").unwrap();
+        let copy = m.items.iter().position(|i| i.label == "Duplicate").unwrap();
         let at = a
             .hits
             .iter()
@@ -3068,7 +3503,7 @@ mod tests {
         let lines = screen(&mut a, 100, 30);
         assert!(lines
             .iter()
-            .any(|l| l.contains("y delete, keep runs") && l.contains("r delete with runs")));
+            .any(|l| l.contains("y delete, keep runs") && l.contains("r delete with its runs")));
         press(&mut a, KeyCode::Char('y'));
         assert!(!a.routines.iter().any(|r| r.id == id));
         assert!(a.run_count(&id) > 0, "its runs stay");
@@ -3146,15 +3581,20 @@ mod tests {
         let lines = screen(&mut a, 110, 34);
         let at = |s: &str| lines.iter().position(|l| l.contains(s));
         let head = at(&format!(" {name} ─")).expect("details heading");
-        assert!(at(" Schedule       Weekdays").is_some_and(|i| i > head));
+        assert!(at(" Schedule        Weekdays").is_some_and(|i| i > head));
         assert!(at("Do task").is_some_and(|i| i > head), "the prompt shows");
         // The routines follow each other without empty rows.
         let first = at(&name).unwrap();
-        let other = &a.routines[1].file.name;
-        assert_eq!(at(other).unwrap(), first + 2);
-        // A short window shows only the list.
-        let lines = screen(&mut a, 110, 20);
+        let other = a.routines[1].file.name.clone();
+        assert_eq!(at(&other).unwrap(), first + 2);
+        // They show whenever rows are free below the list, also in a
+        // small window.
+        let lines = screen(&mut a, 80, 16);
+        assert!(lines.iter().any(|l| l.contains(&format!(" {name} ─"))));
+        // A window with no rows to spare shows only the list.
+        let lines = screen(&mut a, 110, 9);
         assert!(!lines.iter().any(|l| l.contains(&format!(" {name} ─"))));
+        assert!(lines.iter().any(|l| l.contains(&other)));
     }
 
     #[test]
@@ -3199,21 +3639,44 @@ mod tests {
         );
         assert!(lines.iter().any(|l| l
             .contains(&format!("Only runs of {}  {count} of {all}", ids[1].1))
-            && l.contains("✕ show all runs")));
+            && l.contains("Esc back to the routine")
+            && l.contains("h all runs")));
         assert!(lines.iter().any(|l| l.contains("Result 1.1")));
+        // "h all runs" removes the filter and stays in Runs.
         let button = a
             .hits
             .iter()
-            .find_map(|(r, h)| (*h == Hit::Key('\u{1b}')).then_some(*r))
+            .find_map(|(r, h)| (*h == Hit::Key('h')).then_some(*r))
             .unwrap();
         a.click(button.x + 1, button.y);
+        assert_eq!(a.view, View::Runs);
         assert_eq!(a.runs.len(), a.all_runs.len());
         assert!(a.run_filter.is_none());
         let lines = screen(&mut a, 140, 30);
-        assert!(!lines.iter().any(|l| l.contains("show all runs")));
-        // Esc removes it too.
-        a.filter_runs(Some(ids[1].0.clone()));
+        assert!(!lines.iter().any(|l| l.contains("Only runs of")));
+        // Esc goes back to the routine the filter came from.
+        a.view = View::Routines;
+        a.select_id(&ids[1].0);
+        press(&mut a, KeyCode::Char('h'));
+        assert_eq!(a.view, View::Runs);
+        assert_eq!(a.run_filter.as_deref(), Some(ids[1].0.as_str()));
         press(&mut a, KeyCode::Esc);
+        assert_eq!(a.view, View::Routines);
+        assert!(a.run_filter.is_none());
+        assert_eq!(a.selected_routine().unwrap().id, ids[1].0);
+        // A filter set in Runs itself: Esc shows all runs again.
+        press(&mut a, KeyCode::Char('3'));
+        a.sel_run = a
+            .runs
+            .iter()
+            .position(|r| r.routine_id == ids[1].0)
+            .unwrap();
+        press(&mut a, KeyCode::Char('h'));
+        assert_eq!(a.runs.len(), count);
+        let lines = screen(&mut a, 140, 30);
+        assert!(lines.iter().any(|l| l.contains("Esc all runs")));
+        press(&mut a, KeyCode::Esc);
+        assert_eq!(a.view, View::Runs);
         assert!(a.run_filter.is_none());
     }
 
@@ -3249,7 +3712,7 @@ mod tests {
     fn a_routine_written_outside_the_list_waits_for_approval() {
         let mut a = app("approve");
         let all = screen(&mut a, 120, 30).join("\n");
-        assert!(all.contains("a approves"), "{all}");
+        assert!(all.contains("a shows it for approval"), "{all}");
         // Select "Weekly cleanup" (written outside the list).
         a.sel_routine = a.routines.iter().position(|r| !r.approved).unwrap();
         press(&mut a, KeyCode::Char('r'));
@@ -3364,25 +3827,62 @@ mod tests {
     }
 
     #[test]
-    fn the_prompt_sits_above_the_save_button() {
+    fn the_form_starts_with_what_when_and_where_and_keeps_save_in_sight() {
         let mut a = app("layout");
         press(&mut a, KeyCode::Char('n'));
         press(&mut a, KeyCode::Enter);
         let lines = screen(&mut a, 90, 40);
-        let tight = screen(&mut a, 90, 32);
-        // The explanation keeps an empty row above the footer.
-        assert!(tight[tight.len() - 2].trim().is_empty());
-        let at = |s: &str| lines.iter().position(|l| l.contains(s)).unwrap();
-        let prompt = at(" Prompt ");
-        let save = at("⏎ save");
+        let at = |s: &str| {
+            lines
+                .iter()
+                .position(|l| l.contains(s))
+                .unwrap_or_else(|| panic!("no {s:?} in\n{}", lines.join("\n")))
+        };
+        // What to do, when and where come first; the rest is one row.
+        let order = [
+            at(" Name "),
+            at(" Runs with "),
+            at(" Prompt "),
+            at(" Repeat "),
+            at(" Folder "),
+            at(" More settings "),
+            at("⏎ save"),
+        ];
+        assert!(order.windows(2).all(|w| w[0] < w[1]), "{order:?}");
+        assert!(!lines.iter().any(|l| l.contains(" Permission mode ")));
+        assert!(lines[at(" More settings ")].contains("▸ Auto"));
+        // Each part ends with an empty row when the window is tall enough,
+        // and one empty row sits before the button.
+        assert!(lines[at(" When ") - 1].trim().is_empty());
+        assert!(lines[at("⏎ save") - 1].trim().is_empty());
+        // ⏎ on "More settings" shows the rest, with today's defaults.
+        a.form.as_mut().unwrap().select(Field::More);
+        press(&mut a, KeyCode::Enter);
+        let lines = screen(&mut a, 90, 50);
+        for label in [" Permission mode ", " If missed ", " Run history "] {
+            assert!(lines.iter().any(|l| l.contains(label)), "{label}");
+        }
+        assert!(lines.iter().any(|l| l.contains("‹ Auto ›")));
+        // In a small window the fields scroll and say how many are out of
+        // sight; the button stays, with an empty row above the footer.
+        for (w, h) in [(80, 24), (60, 20)] {
+            let lines = screen(&mut a, w, h);
+            let all = lines.join("\n");
+            assert!(all.contains("⏎ save"), "{all}");
+            assert!(all.contains("more below"), "{all}");
+        }
+        a.form.as_mut().unwrap().select(Field::Keep);
+        let all = screen(&mut a, 80, 24).join("\n");
         assert!(
-            at(" On ") < prompt,
-            "the prompt comes after the other fields"
+            all.contains("⏎ save") && all.contains("more above"),
+            "{all}"
         );
-        assert_eq!(save, prompt + 2, "one empty row before the button");
-        assert!(lines[prompt + 1].trim().is_empty());
-        // Each part ends with an empty row when the window is tall enough.
-        assert!(lines[at(" Schedule ") - 1].trim().is_empty());
+        assert!(all.contains(" Run history "), "{all}");
+        // Hidden again, the cursor is back on a row that shows.
+        a.form.as_mut().unwrap().select(Field::Keep);
+        a.form.as_mut().unwrap().toggle_more();
+        let form = a.form.as_ref().unwrap();
+        assert!(form.fields().contains(&form.current()));
     }
 
     #[test]
@@ -3397,7 +3897,7 @@ mod tests {
         assert!(lines.iter().any(|l| l.contains("Step 8 of the task. …")));
         assert!(!lines.iter().any(|l| l.contains("Step 9 of")));
         // A short window still shows the first line and the "…".
-        let lines = screen(&mut a, 90, 32);
+        let lines = screen(&mut a, 90, 18);
         assert!(
             lines.iter().any(|l| l.contains("Step 1 of the task. …")),
             "{}",
@@ -3512,5 +4012,826 @@ mod tests {
         assert!(matches!(a.mode, Mode::Normal));
         let r = Routine::load(&a.paths, "morning-report").unwrap();
         assert_eq!(r.prompt, "Do task 0.\nThen stop..");
+    }
+
+    // ---- the list's own rules: who owns the mouse, what scrolls ----------
+
+    /// The screen's cells, for what text alone does not show.
+    fn cells(a: &mut App, w: u16, h: u16) -> ratatui::buffer::Buffer {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| ui::draw(f, a)).unwrap();
+        t.backend().buffer().clone()
+    }
+
+    /// Ended runs of the first routine, oldest first by `n`.
+    fn add_runs(a: &mut App, n: usize) {
+        let (id, name) = (a.routines[0].id.clone(), a.routines[0].file.name.clone());
+        for i in 0..n {
+            let mut run = Run::new(&id, &name, "claude", store::Trigger::Scheduled, None);
+            run.id = format!("20261101-08{i:02}00-000");
+            run.finish(store::Status::Finished, "");
+            run.result = format!("Result {i}");
+            run.save(&a.paths).unwrap();
+        }
+        a.reload();
+    }
+
+    fn hit_rect(a: &App, hit: Hit) -> Rect {
+        a.hits
+            .iter()
+            .rev()
+            .find_map(|(r, h)| (*h == hit).then_some(*r))
+            .unwrap_or_else(|| panic!("no {hit:?} in {:?}", a.hits))
+    }
+
+    fn mouse(a: &mut App, kind: MouseEventKind, x: u16, y: u16) {
+        a.event(Event::Mouse(ratatui::crossterm::event::MouseEvent {
+            kind,
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        }));
+    }
+
+    #[test]
+    fn a_dialog_owns_the_footer_and_the_mouse() {
+        let mut a = app("owner");
+        a.select_id("morning-report");
+        let id = a.selected_routine().unwrap().id.clone();
+        for mut run in store::runs_of(&a.paths, &id) {
+            run.finish(store::Status::Finished, "");
+            run.save(&a.paths).unwrap();
+        }
+        a.reload();
+        // In the list, the footer offers the list's keys.
+        let lines = screen(&mut a, 100, 30);
+        assert!(lines[29].contains("r run now"), "{}", lines[29]);
+        let run_now = hit_rect(&a, Hit::Key('r'));
+        let row = hit_rect(&a, Hit::Row(1));
+        // Under the delete question it offers only the question's keys, so
+        // a click where "r run now" was cannot delete the runs.
+        press(&mut a, KeyCode::Char('d'));
+        let lines = screen(&mut a, 100, 30);
+        assert!(!lines[29].contains("run now"), "{}", lines[29]);
+        assert!(
+            lines[29].contains("y delete, keep runs") && lines[29].contains("n no"),
+            "{}",
+            lines[29]
+        );
+        for (r, h) in &a.hits {
+            assert!(
+                matches!(h, Hit::Key('y' | 'r' | 'n')),
+                "{h:?} at {r:?} is live under the dialog"
+            );
+        }
+        let foot_r = a
+            .hits
+            .iter()
+            .find_map(|(r, h)| (*h == Hit::Key('r') && r.y == 29).then_some(*r))
+            .expect("the footer names r");
+        let label: String = lines[29]
+            .chars()
+            .skip(foot_r.x as usize)
+            .take(foot_r.width as usize)
+            .collect();
+        assert_eq!(label, "r delete with its runs");
+        // A click on a row or a tab under the dialog only closes it.
+        if a.hit_at(run_now.x, run_now.y).is_none() {
+            a.click(run_now.x, run_now.y);
+        } else {
+            a.click(row.x + 2, row.y);
+        }
+        assert!(matches!(a.mode, Mode::Normal));
+        assert!(a.routines.iter().any(|r| r.id == id), "nothing deleted");
+        assert!(a.run_count(&id) > 0, "its runs are still there");
+        assert_eq!(a.selected_routine().unwrap().id, id, "no row chosen");
+
+        // The same holds for every dialog: no row, tab or link of the
+        // list is live under it.
+        let openers: [&dyn Fn(&mut App); 5] = [
+            &|a| press(a, KeyCode::Char('?')),
+            &|a| press(a, KeyCode::Char('r')),
+            &|a| press(a, KeyCode::Char('q')),
+            &|a| press(a, KeyCode::Char('l')),
+            &|a| {
+                screen(a, 100, 30);
+                let r = hit_rect(a, Hit::Row(0));
+                a.right_click(r.x + 3, r.y);
+            },
+        ];
+        for (n, open) in openers.iter().enumerate() {
+            a.mode = Mode::Normal;
+            open(&mut a);
+            assert!(!matches!(a.mode, Mode::Normal), "dialog {n} opened");
+            for (w, h) in [(100, 30), (60, 20)] {
+                screen(&mut a, w, h);
+                for (r, hit) in &a.hits {
+                    assert!(
+                        !matches!(hit, Hit::Row(_) | Hit::View(_) | Hit::RunsOf(_)),
+                        "{hit:?} at {r:?} is live under dialog {n}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_cursor_stays_on_its_item_when_the_list_changes() {
+        let mut a = app("identity");
+        add_runs(&mut a, 8);
+        a.view = View::Runs;
+        a.sel_run = 5;
+        let on = a.runs[5].id.clone();
+        // A new run comes in on top: the cursor follows its run.
+        let mut run = Run::new(
+            "morning-report",
+            "Morning report",
+            "claude",
+            store::Trigger::Scheduled,
+            None,
+        );
+        run.id = "20261231-090000-000".into();
+        run.finish(store::Status::Finished, "");
+        run.save(&a.paths).unwrap();
+        a.reload();
+        assert_eq!(a.runs[0].id, "20261231-090000-000");
+        assert_eq!(a.runs[a.sel_run].id, on);
+        // Only one routine's runs, and back to all: still the same run.
+        press(&mut a, KeyCode::Char('h'));
+        assert!(a.run_filter.is_some());
+        assert_eq!(a.runs[a.sel_run].id, on);
+        press(&mut a, KeyCode::Char('h'));
+        assert!(a.run_filter.is_none());
+        assert_eq!(a.runs[a.sel_run].id, on);
+        // A deleted run leaves the cursor in the list.
+        let last = a.runs.len() - 1;
+        a.sel_run = last;
+        store::remove(&a.paths, &a.runs[last]);
+        a.reload();
+        assert_eq!(a.sel_run, a.runs.len() - 1);
+
+        // Routines: one that sorts first appears; the cursor stays on its
+        // routine.
+        a.view = View::Routines;
+        a.select_id("weekly-cleanup");
+        let mut f = Form::new("/tmp");
+        f.name = "A new one".into();
+        f.prompt = "Say hello.".into();
+        let (file, prompt) = f.build().unwrap();
+        Routine {
+            id: routine::new_id(&a.paths, "A new one"),
+            file,
+            prompt,
+            problem: None,
+            unreadable: false,
+            approved: true,
+        }
+        .save_approved(&a.paths)
+        .unwrap();
+        a.reload();
+        assert_eq!(a.routines[0].file.name, "A new one");
+        assert_eq!(a.selected_routine().unwrap().id, "weekly-cleanup");
+    }
+
+    #[test]
+    fn a_click_never_scrolls_and_the_wheel_moves_the_view() {
+        let mut a = app("scroll");
+        add_runs(&mut a, 30);
+        a.view = View::Runs;
+        a.sel_run = 0;
+        let all = a.runs.len();
+        let lines = screen(&mut a, 100, 24);
+        // The list says which rows show.
+        assert!(lines[2].contains(&format!("1–10 of {all}")), "{}", lines[2]);
+        // The cursor at the end scrolls the list there.
+        press(&mut a, KeyCode::End);
+        let lines = screen(&mut a, 100, 24);
+        let top = a.tops[2];
+        assert_eq!(top, all - 10);
+        assert!(lines[2].contains(&format!("{}–{all} of {all}", top + 1)));
+        // A click on a row in the middle marks it; no row moves.
+        let target = top + 4;
+        let before = hit_rect(&a, Hit::Row(target));
+        a.click(before.x + 5, before.y);
+        assert_eq!(a.sel_run, target);
+        screen(&mut a, 100, 24);
+        assert_eq!(a.tops[2], top);
+        assert_eq!(hit_rect(&a, Hit::Row(target)), before);
+        // So a second click lands on the same run and opens it.
+        a.click(before.x + 5, before.y);
+        assert!(matches!(a.mode, Mode::Log(_)), "{:?}", a.mode);
+        press(&mut a, KeyCode::Esc);
+        // The wheel moves the view, not the cursor.
+        for _ in 0..3 {
+            mouse(&mut a, MouseEventKind::ScrollUp, 10, 10);
+        }
+        screen(&mut a, 100, 24);
+        assert_eq!((a.tops[2], a.sel_run), (top - 3, target));
+        for _ in 0..40 {
+            mouse(&mut a, MouseEventKind::ScrollUp, 10, 10);
+        }
+        let lines = screen(&mut a, 100, 24);
+        assert_eq!((a.tops[2], a.sel_run), (0, target));
+        assert!(lines[2].contains(&format!("1–10 of {all}")));
+        for _ in 0..80 {
+            mouse(&mut a, MouseEventKind::ScrollDown, 10, 10);
+        }
+        screen(&mut a, 100, 24);
+        assert_eq!(a.tops[2], all - 10, "the view stops at the end");
+        // A key brings the cursor's row back into view.
+        for _ in 0..40 {
+            mouse(&mut a, MouseEventKind::ScrollUp, 10, 10);
+        }
+        press(&mut a, KeyCode::Up);
+        screen(&mut a, 100, 24);
+        let shown = a.tops[2]..a.tops[2] + 10;
+        assert!(shown.contains(&a.sel_run), "{shown:?} {}", a.sel_run);
+        // A reload while scrolled keeps the picture: a new run on top
+        // moves the offset along with the rows.
+        let (top, on) = (a.tops[2], a.runs[a.sel_run].id.clone());
+        let mut run = Run::new(
+            "morning-report",
+            "Morning report",
+            "claude",
+            store::Trigger::Scheduled,
+            None,
+        );
+        run.id = "20261231-090000-000".into();
+        run.finish(store::Status::Finished, "");
+        run.save(&a.paths).unwrap();
+        a.reload();
+        assert_eq!(a.runs[a.sel_run].id, on);
+        assert_eq!(a.tops[2], top + 1);
+    }
+
+    #[test]
+    fn a_narrow_window_keeps_the_status_the_off_marker_and_whole_tabs() {
+        let mut a = app("narrow");
+        a.icons.nerd = false;
+        // A name and a schedule that are longer than their columns.
+        let mut r = Routine::load(&a.paths, "weekly-cleanup").unwrap();
+        r.file.name = "Weekly cleanup of every old branch and stale build folder".into();
+        r.file.schedule = "15 8-18 * * 1-5".into();
+        r.save(&a.paths).unwrap();
+        a.reload();
+        for (w, h) in [
+            (160, 50),
+            (120, 40),
+            (100, 30),
+            (94, 30),
+            (80, 24),
+            (60, 20),
+        ] {
+            a.scheduler = None;
+            let lines = screen(&mut a, w, h);
+            let all = lines.join("\n");
+            // The warning that nothing runs stays, with a symbol of its own.
+            assert!(lines[0].contains("○ routines off"), "{w}: {}", lines[0]);
+            // The tabs are whole; with too little room for the warning
+            // beside them they lose their counts, never their names.
+            let tabs = if w >= 80 {
+                ["Routines (2)", "Cron jobs (0)", "Runs (1)"]
+            } else {
+                ["Routines", "Cron jobs", "Runs"]
+            };
+            for tab in tabs {
+                assert!(lines[0].contains(tab), "{w}: {}", lines[0]);
+            }
+            // How the last run went shows at every width.
+            assert!(all.contains("… Starting"), "{w}x{h}:\n{all}");
+            // Nothing runs off the edge: what is cut ends in "…".
+            for l in &lines[1..] {
+                assert!(l.ends_with(' ') || l.ends_with('…'), "{w}: {l:?}");
+            }
+            if w <= 100 {
+                assert!(
+                    lines
+                        .iter()
+                        .any(|l| l.contains("Weekly cleanup of") && l.contains('…')),
+                    "{w}x{h}:\n{all}"
+                );
+            }
+            a.scheduler = Some((1, String::new()));
+            let lines = screen(&mut a, w, h);
+            assert!(!lines[0].contains("routines off"), "{w}: {}", lines[0]);
+        }
+        // From 80 columns on the last run has its own column, with the
+        // link to the runs; the schedule column holds what it must.
+        let lines = screen(&mut a, 80, 24);
+        assert!(lines.iter().any(|l| l.contains("Last run")));
+        assert!(lines.iter().any(|l| l.contains("1 run ›")));
+        let lines = screen(&mut a, 160, 50);
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("Weekdays, hourly at :15 from 08:15 to 18:15")));
+        // Very narrow: the tabs get shorter names before anything is cut,
+        // and "off" still shows.
+        a.scheduler = None;
+        for w in [50, 44, 40] {
+            let lines = screen(&mut a, w, 20);
+            for tab in ["Routines", "Cron", "Runs"] {
+                assert!(lines[0].contains(tab), "{w}: {}", lines[0]);
+            }
+            assert!(lines[0].contains("off"), "{w}: {}", lines[0]);
+            assert!(lines.join("\n").contains("… Starting"), "{w}");
+        }
+    }
+
+    #[test]
+    fn messages_are_whole_and_problems_stay_until_a_key() {
+        let mut a = app("messages");
+        let text = "Starting; routines are off, so the run is not followed (S switches them on)";
+        a.flash(text, YELLOW);
+        for (w, h) in [(120, 30), (80, 24), (60, 20), (40, 20)] {
+            let lines = screen(&mut a, w, h);
+            // The footer grows; the message reads whole across its rows.
+            let foot: Vec<&str> = lines.iter().rev().take(3).rev().map(|l| l.trim()).collect();
+            let joined = foot.join(" ");
+            assert!(joined.contains(text), "{w}: {joined}");
+        }
+        // It does not go by itself, only with the next key or click.
+        assert!(a.flash.as_ref().unwrap().sticky);
+        press(&mut a, KeyCode::Down);
+        assert!(a.flash.is_none());
+        a.flash("Could not read the crontab", RED);
+        screen(&mut a, 80, 24);
+        a.click(40, 10);
+        assert!(a.flash.is_none());
+        // Good news goes after a moment, as before.
+        a.flash("Saved", GREEN);
+        assert!(!a.flash.as_ref().unwrap().sticky);
+        // One too long for three rows ends in "…".
+        a.flash("word ".repeat(80), RED);
+        let lines = screen(&mut a, 40, 20);
+        assert!(lines[19].trim_end().ends_with('…'), "{}", lines[19]);
+        assert!(lines[17].contains("word"));
+    }
+
+    #[test]
+    fn form_text_fields_have_a_cursor_and_scroll_sideways() {
+        let mut a = app("cursor");
+        press(&mut a, KeyCode::Char('n'));
+        press(&mut a, KeyCode::Enter);
+        for c in "Chck".chars() {
+            press(&mut a, KeyCode::Char(c));
+        }
+        press(&mut a, KeyCode::Left);
+        press(&mut a, KeyCode::Left);
+        press(&mut a, KeyCode::Char('e'));
+        assert_eq!(a.form.as_ref().unwrap().name, "Check");
+        let lines = screen(&mut a, 80, 24);
+        assert!(lines.iter().any(|l| l.contains("Che▏ck")), "{lines:#?}");
+        press(&mut a, KeyCode::Home);
+        press(&mut a, KeyCode::Delete);
+        assert_eq!(a.form.as_ref().unwrap().name, "heck");
+        press(&mut a, KeyCode::End);
+        press(&mut a, KeyCode::Backspace);
+        press(&mut a, KeyCode::Right);
+        press(&mut a, KeyCode::Char('!'));
+        assert_eq!(a.form.as_ref().unwrap().name, "hec!");
+        // q, ? and the digits are text here, not commands.
+        press(&mut a, KeyCode::Char('q'));
+        press(&mut a, KeyCode::Char('?'));
+        assert_eq!(a.form.as_ref().unwrap().name, "hec!q?");
+        assert!(matches!(a.mode, Mode::Normal));
+        // A value longer than its row shows the part around the cursor.
+        let form = a.form.as_mut().unwrap();
+        form.folder = "~/projects/a-very-long-folder-name/with/many/parts/inside/it".into();
+        form.select(Field::Folder);
+        form.cursor_end();
+        let lines = screen(&mut a, 60, 20);
+        let row = lines.iter().find(|l| l.contains(" Folder ")).unwrap();
+        assert!(row.contains('…') && row.contains("inside/it▏"), "{row}");
+        press(&mut a, KeyCode::Home);
+        let lines = screen(&mut a, 60, 20);
+        let row = lines.iter().find(|l| l.contains(" Folder ")).unwrap();
+        assert!(
+            row.contains("▏~/projects") && row.trim_end().ends_with('…'),
+            "{row}"
+        );
+        // The footer names the keys of the field the cursor is in.
+        assert!(lines[19].contains("← → cursor"), "{}", lines[19]);
+        a.form.as_mut().unwrap().select(Field::Repeat);
+        let lines = screen(&mut a, 80, 24);
+        assert!(lines[23].contains("← → change"), "{}", lines[23]);
+    }
+
+    #[test]
+    fn one_mouse_model_everywhere() {
+        let mut a = app("mouse-model");
+        add_runs(&mut a, 2);
+        a.icons.nerd = false;
+        a.sel_routine = 0;
+        screen(&mut a, 120, 30);
+        // One click marks a row; a click on the marked row opens it.
+        let second = hit_rect(&a, Hit::Row(1));
+        a.click(second.x + 4, second.y);
+        assert_eq!(a.sel_routine, 1);
+        assert!(a.form.is_none());
+        a.click(second.x + 4, second.y);
+        assert!(a.form.is_some(), "the marked row opens");
+        press(&mut a, KeyCode::Esc);
+        // Only the "n runs ›" text is a link; the cell beside it marks.
+        a.sel_routine = 1;
+        let lines = screen(&mut a, 120, 30);
+        let link = hit_rect(&a, Hit::RunsOf(0));
+        let label: String = lines[link.y as usize]
+            .chars()
+            .skip(link.x as usize)
+            .take(link.width as usize)
+            .collect();
+        assert_eq!(label, "3 runs ›");
+        a.click(link.x - 4, link.y);
+        assert_eq!((a.view, a.sel_routine), (View::Routines, 0));
+        a.click(link.x + 1, link.y);
+        assert_eq!(a.view, View::Runs);
+        assert_eq!(a.runs.len(), 3);
+        press(&mut a, KeyCode::Esc);
+        assert_eq!(a.view, View::Routines);
+
+        // The row under the mouse is lit.
+        mouse(&mut a, MouseEventKind::Moved, second.x + 4, second.y);
+        let buf = cells(&mut a, 120, 30);
+        assert_eq!(buf[(second.x + 4, second.y)].bg, crate::theme::HOVER_BG);
+        assert_eq!(
+            buf[(second.x + 4, second.y - 2)].bg,
+            crate::theme::SELECTED_BG
+        );
+
+        // In the form: a click on ‹ or › steps the choice at once.
+        press(&mut a, KeyCode::Enter);
+        screen(&mut a, 100, 30);
+        let repeat = a
+            .form
+            .as_ref()
+            .unwrap()
+            .fields()
+            .iter()
+            .position(|f| *f == Field::Repeat)
+            .unwrap();
+        let before = a.form.as_ref().unwrap().repeat;
+        let next = hit_rect(&a, Hit::Cycle(repeat, 1));
+        a.click(next.x, next.y);
+        assert_ne!(a.form.as_ref().unwrap().repeat, before);
+        assert_eq!(a.form.as_ref().unwrap().current(), Field::Repeat);
+        screen(&mut a, 100, 30);
+        let back = hit_rect(&a, Hit::Cycle(repeat, -1));
+        a.click(back.x, back.y);
+        assert_eq!(a.form.as_ref().unwrap().repeat, before);
+        // A click on a choice marks it, the next one opens its list, and a
+        // click on an entry chooses it.
+        a.form.as_mut().unwrap().select(Field::Name);
+        screen(&mut a, 100, 30);
+        let row = hit_rect(&a, Hit::Field(repeat));
+        a.click(row.x + 2, row.y);
+        assert!(matches!(a.mode, Mode::Normal));
+        a.click(row.x + 2, row.y);
+        let Mode::Pick(p) = a.mode.clone() else {
+            panic!("no list: {:?}", a.mode);
+        };
+        screen(&mut a, 100, 30);
+        let entry = hit_rect(&a, Hit::PickRow(1));
+        a.click(entry.x + 3, entry.y);
+        assert!(matches!(a.mode, Mode::Normal));
+        assert_eq!(a.form.as_ref().unwrap().repeat.label(), p.items[1].label);
+        // A click beside a dialog closes it and changes nothing.
+        let chosen = a.form.as_ref().unwrap().repeat;
+        screen(&mut a, 100, 30);
+        a.click(row.x + 2, row.y);
+        assert!(matches!(a.mode, Mode::Pick(_)));
+        screen(&mut a, 100, 30);
+        let d = a.dialog.expect("the list is a dialog");
+        a.click(d.x.saturating_sub(1), d.y + 1);
+        assert!(matches!(a.mode, Mode::Normal));
+        assert_eq!(a.form.as_ref().unwrap().repeat, chosen);
+        // "More settings" and the buttons act on the first click.
+        screen(&mut a, 100, 30);
+        let more = a
+            .form
+            .as_ref()
+            .unwrap()
+            .fields()
+            .iter()
+            .position(|f| *f == Field::More)
+            .unwrap();
+        let row = hit_rect(&a, Hit::Field(more));
+        a.click(row.x + 2, row.y);
+        assert!(a.form.as_ref().unwrap().more);
+    }
+
+    #[test]
+    fn questions_are_even_and_enter_confirms_only_what_loses_nothing() {
+        let mut a = app("confirm");
+        a.select_id("morning-report");
+        for mut run in store::runs_of(&a.paths, "morning-report") {
+            run.finish(store::Status::Finished, "");
+            run.save(&a.paths).unwrap();
+        }
+        a.reload();
+        // Deleting and running by hand need y: ⏎ is "no".
+        press(&mut a, KeyCode::Char('d'));
+        let Mode::Confirm(c) = a.mode.clone() else {
+            panic!("no question");
+        };
+        assert!(c.danger() && !c.enter_confirms());
+        let lines = screen(&mut a, 100, 30);
+        assert!(!lines.join("\n").contains("⏎"), "no ⏎ on a delete");
+        press(&mut a, KeyCode::Enter);
+        assert!(matches!(a.mode, Mode::Normal));
+        assert!(a.routines.iter().any(|r| r.id == "morning-report"));
+        press(&mut a, KeyCode::Char('r'));
+        let Mode::Confirm(c) = a.mode.clone() else {
+            panic!("no question");
+        };
+        assert!(!c.enter_confirms(), "running by hand asks for y");
+        assert_eq!(c.yes(), "run");
+        press(&mut a, KeyCode::Enter);
+        assert!(matches!(a.mode, Mode::Normal));
+        assert_eq!(a.run_count("morning-report"), 1, "nothing started");
+        // What the same key undoes is confirmed by ⏎ too, and says so.
+        a.scheduler = Some((1, String::new()));
+        press(&mut a, KeyCode::Char('S'));
+        let Mode::Confirm(c) = a.mode.clone() else {
+            panic!("no question");
+        };
+        assert!(c.enter_confirms() && !c.danger());
+        let lines = screen(&mut a, 100, 30);
+        assert!(lines.iter().any(|l| l.contains("y or ⏎ turn off")));
+        press(&mut a, KeyCode::Esc);
+        // A dialog that is taller than the window keeps its buttons.
+        press(&mut a, KeyCode::Char('d'));
+        for (w, h) in [(60, 9), (40, 8), (30, 6)] {
+            let all = screen(&mut a, w, h).join("\n");
+            assert!(all.contains("y delete"), "{w}x{h}:\n{all}");
+        }
+        press(&mut a, KeyCode::Esc);
+        // A note that does not fit scrolls, and says so.
+        a.mode = Mode::Message {
+            title: "How routines work".into(),
+            lines: INTRO.iter().map(|l| l.to_string()).collect(),
+        };
+        let all = screen(&mut a, 60, 12).join("\n");
+        assert!(all.contains("more lines") && all.contains("⏎ ok"), "{all}");
+        let before = a.help_scroll;
+        press(&mut a, KeyCode::Down);
+        screen(&mut a, 60, 12);
+        assert_eq!(a.help_scroll, before + 1);
+    }
+
+    #[test]
+    fn the_editor_can_discard_and_says_what_esc_does() {
+        let mut a = app("discard");
+        a.select_id("morning-report");
+        press(&mut a, KeyCode::Char('p'));
+        assert!(a.editor.is_some());
+        let lines = screen(&mut a, 100, 30);
+        // Esc saves a routine's prompt at once, and the footer says so.
+        assert!(lines[29].contains("Esc save and close"), "{}", lines[29]);
+        assert!(lines[29].contains("Ctrl+D discard"), "{}", lines[29]);
+        // Nothing written: Ctrl+D just leaves.
+        a.key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert!(a.editor.is_none() && matches!(a.mode, Mode::Normal));
+        // Something written: it asks, and y throws it away.
+        press(&mut a, KeyCode::Char('p'));
+        for c in "Extra".chars() {
+            press(&mut a, KeyCode::Char(c));
+        }
+        a.key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        let Mode::Confirm(c) = a.mode.clone() else {
+            panic!("no question: {:?}", a.mode);
+        };
+        assert_eq!(c.purpose, ConfirmFor::DiscardEditor);
+        assert!(!c.enter_confirms());
+        // "Keep editing" goes back to the text.
+        press(&mut a, KeyCode::Char('n'));
+        assert!(a.editor.is_some());
+        a.key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        press(&mut a, KeyCode::Char('y'));
+        assert!(a.editor.is_none());
+        let r = Routine::load(&a.paths, "morning-report").unwrap();
+        assert_eq!(r.prompt, "Do task 0.\nThen stop.");
+        // In a new routine's form, Esc only goes back to the form.
+        press(&mut a, KeyCode::Char('n'));
+        press(&mut a, KeyCode::Enter);
+        a.form.as_mut().unwrap().select(Field::Prompt);
+        press(&mut a, KeyCode::Enter);
+        let lines = screen(&mut a, 100, 30);
+        assert!(lines[29].contains("Esc back to the form"), "{}", lines[29]);
+    }
+
+    #[test]
+    fn keys_that_do_not_apply_say_so() {
+        let mut a = app("applies");
+        a.icons.nerd = false;
+        // `h`, `l` and `o` on a routine without runs.
+        a.select_id("weekly-cleanup");
+        let lines = screen(&mut a, 140, 30);
+        assert!(!lines[29].contains("l output"), "{}", lines[29]);
+        assert!(!lines[29].contains("its runs"), "{}", lines[29]);
+        press(&mut a, KeyCode::Char('h'));
+        assert_eq!(a.view, View::Routines, "no empty list of runs");
+        assert_eq!(a.flash.as_ref().unwrap().text, "No run yet");
+        for key in ['l', 'o'] {
+            press(&mut a, KeyCode::Char(key));
+            assert!(a.flash.is_some() && matches!(a.mode, Mode::Normal));
+        }
+        // The footer offers them where there is a run.
+        a.flash = None;
+        a.select_id("morning-report");
+        let lines = screen(&mut a, 140, 30);
+        for key in ["l output", "h its runs"] {
+            assert!(lines[29].contains(key), "{key}: {}", lines[29]);
+        }
+        // Going to its tab is offered while the run has one.
+        assert!(!lines[29].contains("go to its tab"), "{}", lines[29]);
+        // A job that is only in the crontab: the keys of a routine say
+        // what to do first, and the footer offers only what works.
+        fake_crontab(&a, "0 2 * * * /opt/jobs/backup.sh --all\n");
+        a.crontab_read = None;
+        a.reload();
+        press(&mut a, KeyCode::Char('2'));
+        let lines = screen(&mut a, 140, 30);
+        assert!(lines[29].contains("⏎ take it over"), "{}", lines[29]);
+        assert!(!lines[29].contains("run now"), "{}", lines[29]);
+        for key in ['r', ' ', 'd', 'l', 'h', 'e', 'p', 'c', 'o', 'a'] {
+            press(&mut a, KeyCode::Char(key));
+            assert!(matches!(a.mode, Mode::Normal), "{key}: {:?}", a.mode);
+            assert!(a.form.is_none() && a.editor.is_none(), "{key}");
+            let said = a.flash.as_ref().map(|f| f.text.clone()).unwrap_or_default();
+            assert!(said.contains("only in your crontab"), "{key}: {said:?}");
+            a.flash = None;
+        }
+        assert_eq!(a.crontab_jobs.len(), 1);
+        // The dialog is a list like any other: a click chooses.
+        press(&mut a, KeyCode::Enter);
+        screen(&mut a, 100, 30);
+        let copy = hit_rect(&a, Hit::Take(2));
+        mouse(&mut a, MouseEventKind::Moved, copy.x + 2, copy.y);
+        assert_eq!(a.take_sel, 2);
+        let keep = hit_rect(&a, Hit::Take(0));
+        a.click(keep.x + 2, keep.y);
+        let Mode::Confirm(c) = a.mode.clone() else {
+            panic!("keeping does not ask: {:?}", a.mode);
+        };
+        assert_eq!(c.question, "Take over 1 cron job?");
+        press(&mut a, KeyCode::Esc);
+        crate::crontab::use_fake(None);
+    }
+
+    #[test]
+    fn the_output_view_keeps_why_a_run_failed_above_its_output() {
+        let mut a = app("why");
+        let mut run = Run::new(
+            "morning-report",
+            "Morning report",
+            "shell",
+            store::Trigger::Scheduled,
+            None,
+        );
+        run.id = "20261231-090000-000".into();
+        run.finish(store::Status::Failed, "Ended with exit code 23");
+        run.save(&a.paths).unwrap();
+        let out: String = (1..=80).map(|i| format!("output line {i}\n")).collect();
+        std::fs::write(run.file(&a.paths, "out"), out).unwrap();
+        a.reload();
+        a.view = View::Runs;
+        a.sel_run = a.runs.iter().position(|r| r.id == run.id).unwrap();
+        // The list shows the reason and how it was started, once.
+        a.icons.nerd = false;
+        let lines = screen(&mut a, 120, 30);
+        let all = lines.join("\n");
+        assert!(all.contains("Ended with exit code 23"), "{all}");
+        assert_eq!(all.matches("By hand").count(), 1, "{all}");
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("✗") && l.contains("Failed")));
+        // The output opens at its end, where the answer is; the reason
+        // stays on top of it.
+        press(&mut a, KeyCode::Char('l'));
+        let lines = screen(&mut a, 100, 24);
+        assert!(lines[2].contains("Ended with exit code 23"), "{}", lines[2]);
+        assert!(lines.iter().any(|l| l.contains("output line 80")));
+        assert!(lines.iter().any(|l| l.contains("–80 of 80")));
+        assert!(!lines.iter().any(|l| l.contains("output line 1 ")));
+        // Scrolled to the start, the reason is still there.
+        press(&mut a, KeyCode::Home);
+        let lines = screen(&mut a, 100, 24);
+        assert!(lines[2].contains("Ended with exit code 23"), "{}", lines[2]);
+        assert!(lines.iter().any(|l| l.contains("output line 1 ")));
+        assert!(lines.iter().any(|l| l.contains("lines 1–")));
+    }
+
+    #[test]
+    fn the_details_say_what_the_list_says() {
+        let mut a = app("agree");
+        a.icons.nerd = false;
+        // A routine with a problem, one that waits, and one with a model
+        // and a mode.
+        let mut r = Routine::load(&a.paths, "morning-report").unwrap();
+        r.file.model = "opus".into();
+        r.file.permission_mode = "plan".into();
+        r.save_approved(&a.paths).unwrap();
+        a.reload();
+        a.select_id("morning-report");
+        let lines = screen(&mut a, 120, 40);
+        let about = "claude · Opus · Plan only";
+        assert_eq!(
+            lines.iter().filter(|l| l.contains(about)).count(),
+            2,
+            "list and details name model and mode in one order:\n{}",
+            lines.join("\n")
+        );
+        // Waiting for approval: no next time, in the list or below it.
+        a.select_id("weekly-cleanup");
+        let lines = screen(&mut a, 120, 40);
+        let head = lines
+            .iter()
+            .position(|l| l.contains(" Weekly cleanup ─"))
+            .unwrap();
+        let details = lines[head..].join("\n");
+        assert!(details.contains("waits for approval"), "{details}");
+        assert!(details.contains("a shows it for approval"), "{details}");
+        assert!(!details.contains("next "), "{details}");
+        assert!(lines.iter().any(|l| l.starts_with(" ◐ ")), "its own symbol");
+        // A problem: red, with its own symbol, and no next time either.
+        let mut r = Routine::load(&a.paths, "weekly-cleanup").unwrap();
+        r.file.folder = "/tmp/herdr-routines-no-such-folder".into();
+        r.save_approved(&a.paths).unwrap();
+        a.reload();
+        a.select_id("weekly-cleanup");
+        let lines = screen(&mut a, 120, 40);
+        let head = lines
+            .iter()
+            .position(|l| l.contains(" Weekly cleanup ─"))
+            .unwrap();
+        let details = lines[head..].join("\n");
+        assert!(details.contains("Problem"), "{details}");
+        assert!(details.contains("does not exist"), "{details}");
+        assert!(!details.contains("next "), "{details}");
+        assert!(lines.iter().any(|l| l.starts_with(" ! ")), "its own symbol");
+        // On and off differ by symbol, not only by colour.
+        a.select_id("morning-report");
+        press(&mut a, KeyCode::Char(' '));
+        let lines = screen(&mut a, 120, 40);
+        assert!(lines
+            .iter()
+            .any(|l| l.starts_with(" ○ ") && l.contains("Morning report")));
+        press(&mut a, KeyCode::Char(' '));
+        let lines = screen(&mut a, 120, 40);
+        assert!(lines
+            .iter()
+            .any(|l| l.starts_with(" ● ") && l.contains("Morning report")));
+    }
+
+    #[test]
+    fn the_help_names_every_key_and_wraps() {
+        let mut a = app("help");
+        press(&mut a, KeyCode::Char('?'));
+        for (w, h) in [(60, 20), (80, 24), (130, 45)] {
+            a.help_scroll = 0;
+            let mut seen = String::new();
+            loop {
+                let lines = screen(&mut a, w, h);
+                // Inside the frame, a line never reaches the border.
+                for l in &lines[2..h as usize - 2] {
+                    if let Some(body) = l.trim_end().strip_suffix('│') {
+                        assert!(body.ends_with(' '), "{w}: cut at the edge: {l}");
+                    }
+                }
+                seen.push_str(&lines.join("\n"));
+                if a.help_scroll >= a.help_max {
+                    break;
+                }
+                press(&mut a, KeyCode::PageDown);
+            }
+            // The list's basic keys come first.
+            let first = screen_at_top(&mut a, w, h);
+            assert!(
+                first.contains("↑ ↓  j k") && first.contains("move"),
+                "{first}"
+            );
+            for key in [
+                "PgUp",
+                "Home",
+                "Tab",
+                "Space",
+                "Ctrl+D",
+                "Ctrl+S",
+                "Ctrl+U",
+                "Ctrl+Z",
+                "Ctrl+O",
+                "Del",
+                "duplicate",
+                "Mouse",
+                "How it works",
+            ] {
+                assert!(seen.contains(key), "{w}x{h}: no {key}");
+            }
+        }
+    }
+
+    fn screen_at_top(a: &mut App, w: u16, h: u16) -> String {
+        a.help_scroll = 0;
+        screen(a, w, h).join("\n")
     }
 }

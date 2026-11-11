@@ -1,37 +1,59 @@
-//! Drawing: the routines and runs tables, the form, the prompt editor,
+//! Drawing: the routines and runs lists, the form, the prompt editor,
 //! dialogs and a footer, in the look of the other Herdr plugins of this
 //! author. Records clickable areas for the mouse.
+//!
+//! How it is put together:
+//! - `draw` lays out header, body and footer. While a dialog is open it
+//!   drops every clickable area of the header and body, so only the dialog
+//!   and its keys in the footer can be clicked.
+//! - The header is a title, the tabs and `chips` (a list of `Chip`s); it
+//!   gets shorter in a fixed order when the window is narrow (`plans`).
+//! - Lists go through `draw_list`: a scroll offset per list (`App::tops`),
+//!   a position such as "1–10 of 23", the marked row and the row under the
+//!   mouse. Every cell is cut with "…" (`clip_line`).
+//! - The footer shows the keys of what is in front (`footer_keys`), each
+//!   with a rank: the least important go first when it gets narrow. A
+//!   message takes the room it needs, up to the whole footer.
 
 use crate::agent;
-use crate::app::{App, Hit, LogView, Mode, View, INTRO};
+use crate::app::{App, EditTarget, Hit, LogView, Mode, View, INTRO, TAKES};
 use crate::cron::short_time;
 use crate::form::{Field, Form};
 use crate::routine::Routine;
 use crate::schedule::Schedule;
-use crate::store::Run;
+use crate::store::{Run, Status};
 use crate::theme::{
-    self, Icons, ACCENT, BAR_BG, BLUE, BORDER, FAINT, GREEN, MARK_BG, MUTED, RED, SELECTED_BG,
-    TEXT, YELLOW,
+    self, Icons, Mark, ACCENT, BAR_BG, BLUE, BORDER, FAINT, GREEN, HOVER_BG, MARK_BG, MUTED, RED,
+    SELECTED_BG, TEXT, YELLOW,
 };
-use chrono::Local;
+use chrono::{DateTime, Local};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Table};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui::Frame;
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     app.hits.clear();
-    let height = frame.area().height;
-    let spacer = if height >= 14 { 1 } else { 0 };
+    app.dialog = None;
+    let screen = frame.area();
+    if app.size != (screen.width, screen.height) {
+        // A window of another size: bring the cursor back into view.
+        app.size = (screen.width, screen.height);
+        app.follow = true;
+    }
+    let spacer = if screen.height >= 14 { 1 } else { 0 };
+    let foot = footer_height(app, screen.width)
+        .min(screen.height.saturating_sub(4))
+        .max(1);
     let [header, _, body, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(spacer),
         Constraint::Min(3),
-        Constraint::Length(1),
+        Constraint::Length(foot),
     ])
-    .areas(frame.area());
+    .areas(screen);
     let icons = Icons {
         nerd: app.icons.nerd,
     };
@@ -46,113 +68,273 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             View::Runs => draw_runs(frame, app, &icons, body),
         }
     }
-    draw_footer(frame, app, footer);
+    // A dialog owns the mouse: nothing of the header or the list under it
+    // can be clicked, only the dialog itself and its keys in the footer.
+    if !matches!(app.mode, Mode::Normal) {
+        app.hits.clear();
+    }
+    // Dialogs stay between the header and the footer.
+    let stage = Rect::new(
+        screen.x,
+        header.bottom(),
+        screen.width,
+        footer.y.saturating_sub(header.bottom()),
+    );
     match app.mode.clone() {
-        Mode::Help => draw_help(frame, app),
-        Mode::Pick(p) => draw_picker(frame, app, &p),
-        Mode::Input(i) => draw_input(frame, &i),
-        Mode::Confirm(c) => draw_confirm(frame, app, &c),
-        Mode::Message { title, lines } => draw_message(frame, app, &title, &lines),
-        Mode::Log(l) => draw_log(frame, app, l),
-        Mode::Cron(jobs) => draw_cron(frame, app, &jobs),
-        Mode::Menu(m) => draw_menu(frame, app, &m),
+        Mode::Help => draw_help(frame, app, stage),
+        Mode::Pick(p) => draw_picker(frame, app, stage, p),
+        Mode::Input(i) => draw_input(frame, app, stage, &i),
+        Mode::Confirm(c) => draw_confirm(frame, app, stage, &c),
+        Mode::Message { title, lines } => draw_message(frame, app, stage, &title, &lines),
+        Mode::Log(l) => draw_log(frame, app, stage, l),
+        Mode::Cron(jobs) => draw_take(frame, app, stage, &jobs),
+        Mode::Menu(m) => draw_menu(frame, app, stage, &m),
         Mode::Normal | Mode::AskQuit => {}
     }
+    draw_footer(frame, app, footer);
 }
 
 fn bold(color: Color) -> Style {
     Style::new().fg(color).add_modifier(Modifier::BOLD)
 }
 
+fn plain(text: impl Into<String>, color: Color) -> Span<'static> {
+    Span::styled(text.into(), Style::new().fg(color))
+}
+
+fn faint(t: impl Into<String>) -> Line<'static> {
+    Line::from(plain(t, FAINT))
+}
+
+// ---- header ----------------------------------------------------------------
+
+/// A switch in the header, such as "routines on". To add one, push it in
+/// `chips`: the header lays the list out by itself.
+pub struct Chip {
+    /// With its state, such as "● autostart on".
+    pub long: String,
+    /// What shows when the header is narrow. It still says what matters:
+    /// a switch whose off state is a warning keeps "off" in it.
+    pub short: String,
+    pub style: Style,
+    /// The key a click stands for.
+    pub key: Option<char>,
+    /// It is a warning: it stays when the other chips go.
+    pub keep: bool,
+}
+
+/// The header's chips, left to right. When room runs out, those without
+/// `keep` go first, from the left.
+pub fn chips(app: &App, icons: &Icons) -> Vec<Chip> {
+    let mut v = Vec::new();
+    // Whether Herdr starts at login (A switches it).
+    if crate::autostart::supported() {
+        let on = crate::autostart::is_on();
+        let sign = if on { icons.running() } else { icons.stopped() };
+        v.push(Chip {
+            long: format!("{sign} autostart {}", if on { "on" } else { "off" }),
+            short: format!("{sign} autostart"),
+            style: Style::new().fg(if on { GREEN } else { MUTED }),
+            key: Some('A'),
+            keep: false,
+        });
+    }
+    // Whether routines run at all (S switches them). Off is a warning:
+    // nothing runs, so it always shows.
+    let on = app.scheduler.is_some();
+    v.push(if on {
+        Chip {
+            long: format!("{} routines on", icons.running()),
+            short: format!("{} routines", icons.running()),
+            style: Style::new().fg(GREEN),
+            key: Some('S'),
+            keep: false,
+        }
+    } else {
+        Chip {
+            long: format!("{} routines off", icons.stopped()),
+            short: format!("{} off", icons.stopped()),
+            style: bold(RED),
+            key: Some('S'),
+            keep: true,
+        }
+    });
+    v
+}
+
+/// One way to fit the header: how much of the title (2 whole, 1 its icon,
+/// 0 none), how short the tabs (0 with counts, 1 without, 2 short names)
+/// and which chips, each long or short.
+struct Plan {
+    title: u8,
+    tabs: u8,
+    chips: Vec<(usize, bool)>,
+}
+
+/// The ways to fit the header, from everything to the least: the title
+/// goes first, then the chips that are no warning get short and go (from
+/// the left), then the tabs get shorter, and at last the warning gets
+/// short. A tab is never cut and a warning never goes.
+fn plans(all: &[Chip]) -> Vec<Plan> {
+    // A warning keeps its long label as long as anything else can give.
+    let every = |short: bool| -> Vec<(usize, bool)> {
+        (0..all.len()).map(|i| (i, short && !all[i].keep)).collect()
+    };
+    let kept = |short: bool| -> Vec<(usize, bool)> {
+        (0..all.len())
+            .filter(|i| all[*i].keep)
+            .map(|i| (i, short))
+            .collect()
+    };
+    let plan = |title: u8, tabs: u8, chips: Vec<(usize, bool)>| Plan { title, tabs, chips };
+    let mut v = vec![
+        plan(2, 0, every(false)),
+        plan(1, 0, every(false)),
+        plan(1, 0, every(true)),
+    ];
+    let mut rest = every(true);
+    while let Some(at) = rest.iter().position(|(i, _)| !all[*i].keep) {
+        rest.remove(at);
+        v.push(plan(1, 0, rest.clone()));
+    }
+    for (title, tabs) in [(1, 1), (1, 2), (0, 2)] {
+        v.push(plan(title, tabs, kept(false)));
+    }
+    v.push(plan(0, 2, kept(true)));
+    v
+}
+
+fn tab_label(view: View, count: usize, level: u8) -> String {
+    match (level, view) {
+        (0, _) => format!(" {} ({count}) ", view.name()),
+        (2, View::Cron) => " Cron ".to_string(),
+        _ => format!(" {} ", view.name()),
+    }
+}
+
 fn draw_header(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
     let line = Rect::new(area.x + 1, area.y, area.width.saturating_sub(2), 1);
-    let mut spans = Vec::new();
+    let room = line.width as usize;
+    let all = chips(app, icons);
     let in_list = app.editor.is_none() && app.form.is_none();
-    if let Some(ed) = &app.editor {
-        spans.push(Span::styled(
-            format!("{} {}", icons.title(), ed.title),
-            bold(ACCENT),
-        ));
-    } else if let Some(form) = &app.form {
-        let title = match &form.id {
-            Some(_) => format!("Edit {}", form.name.trim()),
-            None => "New routine".to_string(),
-        };
-        spans.push(Span::styled(
-            format!("{} {title}", icons.title()),
-            bold(ACCENT),
-        ));
-    } else {
-        let title = format!("{} Scheduled routines   ", icons.title());
-        let mut x = line.x + title.width() as u16;
-        spans.push(Span::styled(title, bold(ACCENT)));
-        for view in View::ORDER {
-            let count = match view {
-                View::Routines => app.routines.iter().filter(|r| !r.is_cron()).count(),
-                View::Cron => {
-                    app.routines.iter().filter(|r| r.is_cron()).count() + app.crontab_jobs.len()
+    if !in_list {
+        // The form and the editor: what is edited, and the warning chips.
+        let title = if let Some(ed) = &app.editor {
+            ed.title.clone()
+        } else {
+            match app.form.as_ref().map(|f| (f.id.is_some(), f.name.trim())) {
+                Some((true, name)) => format!("Edit {name}"),
+                Some((false, _)) if app.form.as_ref().is_some_and(|f| f.is_cron()) => {
+                    "New cron job".to_string()
                 }
-                // All runs: a filter only narrows the list in the view.
-                View::Runs => app.all_runs.len(),
-            };
-            let label = format!(" {} ({count}) ", view.name());
-            let style = if app.view == view {
-                Style::new()
-                    .fg(TEXT)
-                    .bg(SELECTED_BG)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::new().fg(MUTED)
-            };
-            let w = label.width() as u16;
-            app.hits.push((Rect::new(x, line.y, w, 1), Hit::View(view)));
-            x += w + 1;
-            spans.push(Span::styled(label, style));
-            spans.push(Span::raw(" "));
+                _ => "New routine".to_string(),
+            }
+        };
+        // Long where the title still has room beside it, else short.
+        let chip = all.iter().rfind(|c| c.keep).and_then(|c| {
+            [&c.long, &c.short]
+                .into_iter()
+                .find(|text| room >= text.width() + 2 + 12)
+                .map(|text| Span::styled(text.clone(), c.style))
+        });
+        let chip_w = chip.as_ref().map_or(0, |c| c.width() + 2);
+        let title_room = room.saturating_sub(if chip.is_some() { chip_w } else { 0 });
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                clip(&format!("{} {title}", icons.title()), title_room),
+                bold(ACCENT),
+            )),
+            line,
+        );
+        if let Some(chip) = chip {
+            frame.render_widget(
+                Paragraph::new(Line::from(chip)).alignment(Alignment::Right),
+                line,
+            );
         }
+        return;
     }
-    let left = Line::from(spans);
-    let used = left.width();
-    frame.render_widget(Paragraph::new(left), line);
+    let count = |view: View| match view {
+        View::Routines => app.routines.iter().filter(|r| !r.is_cron()).count(),
+        View::Cron => app.routines.iter().filter(|r| r.is_cron()).count() + app.crontab_jobs.len(),
+        // All runs: a filter only narrows the list in the view.
+        View::Runs => app.all_runs.len(),
+    };
+    let title = |level: u8| match level {
+        2 => format!("{} Scheduled routines   ", icons.title()),
+        1 => format!("{}  ", icons.title()),
+        _ => String::new(),
+    };
+    let chips_width = |picked: &[(usize, bool)]| -> usize {
+        let texts: usize = picked
+            .iter()
+            .map(|(i, short)| {
+                if *short {
+                    all[*i].short.width()
+                } else {
+                    all[*i].long.width()
+                }
+            })
+            .sum();
+        texts + 3 * picked.len().saturating_sub(1)
+    };
+    let width = |p: &Plan| -> usize {
+        let tabs: usize = View::ORDER
+            .iter()
+            .map(|v| tab_label(*v, count(*v), p.tabs).width() + 1)
+            .sum::<usize>()
+            - 1;
+        let chips = chips_width(&p.chips);
+        title(p.title).width() + tabs + if chips > 0 { chips + 2 } else { 0 }
+    };
+    let plans = plans(&all);
+    let plan = plans
+        .iter()
+        .find(|p| width(p) <= room)
+        .unwrap_or_else(|| plans.last().expect("there is always a plan"));
 
-    // Whether routines run at all (the scheduler); a click switches them.
-    let (chip, style) = match app.scheduler {
-        Some(_) => (
-            format!("{} routines on", icons.running()),
-            Style::new().fg(GREEN),
-        ),
-        None => ("○ routines off".to_string(), Style::new().fg(RED)),
-    };
-    // Left of it, whether Herdr starts at login (A switches it).
-    let login = if !in_list || !crate::autostart::supported() {
-        None
-    } else if crate::autostart::is_on() {
-        Some((
-            format!("{} autostart on", icons.running()),
-            Style::new().fg(GREEN),
-        ))
-    } else {
-        Some(("○ autostart off".to_string(), Style::new().fg(FAINT)))
-    };
-    let w = chip.width();
-    let login_w = login.as_ref().map_or(0, |(t, _)| t.width() + 3);
-    let right = line.x + line.width;
-    if used + w + 3 <= line.width as usize {
-        if in_list {
-            let x = right - w as u16;
-            app.hits
-                .push((Rect::new(x, line.y, w as u16, 1), Hit::Key('S')));
+    let mut spans = Vec::new();
+    let head = title(plan.title);
+    let mut x = line.x + head.width() as u16;
+    spans.push(Span::styled(head, bold(ACCENT)));
+    for view in View::ORDER {
+        let label = tab_label(view, count(view), plan.tabs);
+        let style = if app.view == view {
+            Style::new()
+                .fg(TEXT)
+                .bg(SELECTED_BG)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::new().fg(MUTED)
+        };
+        let w = label.width() as u16;
+        if x + w <= line.right() {
+            app.hits.push((Rect::new(x, line.y, w, 1), Hit::View(view)));
         }
-        let mut spans = Vec::new();
-        if let Some((text, style)) = login.filter(|_| used + w + login_w + 3 <= line.width as usize)
-        {
-            let lw = text.width() as u16;
-            let x = right - w as u16 - 3 - lw;
-            app.hits.push((Rect::new(x, line.y, lw, 1), Hit::Key('A')));
-            spans.push(Span::styled(text, style));
+        x += w + 1;
+        spans.push(Span::styled(label, style));
+        spans.push(Span::raw(" "));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), line);
+
+    // The chips sit at the right edge.
+    let mut x = line.right().saturating_sub(chips_width(&plan.chips) as u16);
+    let mut spans = Vec::new();
+    for (n, (i, short)) in plan.chips.iter().enumerate() {
+        let chip = &all[*i];
+        let text = if *short { &chip.short } else { &chip.long };
+        if n > 0 {
             spans.push(Span::raw("   "));
+            x += 3;
         }
-        spans.push(Span::styled(chip, style));
+        let w = text.width() as u16;
+        if let Some(key) = chip.key {
+            app.hits.push((Rect::new(x, line.y, w, 1), Hit::Key(key)));
+        }
+        x += w;
+        spans.push(Span::styled(text.clone(), chip.style));
+    }
+    if !spans.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::from(spans)).alignment(Alignment::Right),
             line,
@@ -160,7 +342,12 @@ fn draw_header(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
     }
 }
 
-// ---- tables --------------------------------------------------------------
+// ---- lists -------------------------------------------------------------------
+
+/// Rows per routine or run in the lists: name and details, no gap.
+const ROW_H: u16 = 2;
+/// The least a list's main column gets before other columns go.
+const NAME_MIN: u16 = 24;
 
 /// Room between columns: wider on wide panes.
 fn spacing(width: u16) -> u16 {
@@ -171,120 +358,304 @@ fn spacing(width: u16) -> u16 {
     }
 }
 
-/// The column headings on a bar of their own.
-fn heading_row<'a>(names: impl IntoIterator<Item = &'a str>) -> Row<'a> {
-    Row::new(names.into_iter().map(Cell::from)).style(
-        Style::new()
-            .fg(MUTED)
-            .bg(BAR_BG)
-            .add_modifier(Modifier::BOLD),
-    )
-}
-
-/// The first row to show so the selected one is visible.
-fn offset(selected: usize, rows: usize, visible: usize) -> usize {
-    if visible == 0 || rows <= visible {
-        return 0;
+/// `s` cut to `width` columns, with an ellipsis when cut.
+fn clip(s: &str, width: usize) -> String {
+    if s.width() <= width {
+        return s.to_string();
     }
-    selected.saturating_sub(visible - 1).min(rows - visible)
-}
-
-/// Columns that fit: the fixed ones drop from the right before the main
-/// column gets narrower than `min`.
-fn fit<C: Copy + PartialEq>(
-    mut cols: Vec<(C, &'static str, Constraint)>,
-    drop: &[C],
-    width: u16,
-    min: u16,
-) -> Vec<(C, &'static str, Constraint)> {
-    let gap = spacing(width);
-    for d in drop {
-        let fixed: u16 = cols
-            .iter()
-            .map(|(_, _, c)| match c {
-                Constraint::Length(n) => n + gap,
-                _ => gap,
-            })
-            .sum();
-        if width >= fixed + min {
+    let mut out = String::new();
+    for c in s.chars() {
+        if out.width() + c.width().unwrap_or(0) + 1 > width {
             break;
         }
-        cols.retain(|(c, _, _)| c != d);
+        out.push(c);
     }
-    cols
+    if width > 0 {
+        out.push('…');
+    }
+    out
 }
 
-fn empty_note(frame: &mut Frame, area: Rect, lines: &[(&str, Color)]) {
-    let text: Vec<Line> = lines
-        .iter()
-        .map(|(t, c)| Line::from(Span::styled(t.to_string(), Style::new().fg(*c))))
-        .collect();
+/// `s` cut at its start to `width` columns, with an ellipsis in front:
+/// for folders, whose end says the most.
+fn clip_start(s: &str, width: usize) -> String {
+    if s.width() <= width {
+        return s.to_string();
+    }
+    let mut tail: Vec<char> = Vec::new();
+    let mut used = 1;
+    for c in s.chars().rev() {
+        used += c.width().unwrap_or(0);
+        if used > width {
+            break;
+        }
+        tail.push(c);
+    }
+    let mut out = String::from("…");
+    out.extend(tail.into_iter().rev());
+    out
+}
+
+/// A line of several colours cut to `width` columns, with an ellipsis in
+/// the colour of the part that was cut. Nothing in a list or a dialog ends
+/// without one when it does not fit.
+fn clip_line(line: Line<'static>, width: usize) -> Line<'static> {
+    if line.width() <= width {
+        return line;
+    }
+    let room = width.saturating_sub(1);
+    let mut out: Vec<Span<'static>> = Vec::new();
+    let mut used = 0;
+    let mut cut_style = Style::new();
+    for span in line.spans {
+        cut_style = span.style;
+        let w = span.content.width();
+        if used + w <= room {
+            used += w;
+            out.push(span);
+            continue;
+        }
+        let mut text = String::new();
+        for c in span.content.chars() {
+            let cw = c.width().unwrap_or(0);
+            if used + cw > room {
+                break;
+            }
+            used += cw;
+            text.push(c);
+        }
+        if !text.is_empty() {
+            out.push(Span::styled(text, span.style));
+        }
+        break;
+    }
+    if width > 0 {
+        out.push(Span::styled("…", cut_style));
+    }
+    Line::from(out)
+}
+
+/// Faint text reads badly on the marked row's background: there it gets
+/// the next brighter grey.
+fn relight(mut line: Line<'static>) -> Line<'static> {
+    for span in &mut line.spans {
+        if span.style.fg == Some(FAINT) {
+            span.style.fg = Some(MUTED);
+        }
+    }
+    line
+}
+
+fn empty_note(frame: &mut Frame, area: Rect, lines: &[(String, Color)]) {
+    let width = area.width.saturating_sub(4) as usize;
+    let mut text: Vec<Line> = Vec::new();
+    for (t, c) in lines {
+        if t.is_empty() {
+            text.push(Line::from(""));
+        }
+        for l in wrap(t, width) {
+            text.push(Line::from(plain(l, *c)));
+        }
+    }
     frame.render_widget(
-        Paragraph::new(text).wrap(ratatui::widgets::Wrap { trim: true }),
-        Rect::new(
-            area.x + 2,
-            area.y,
-            area.width.saturating_sub(4),
-            area.height,
-        ),
+        Paragraph::new(text),
+        Rect::new(area.x + 2, area.y, width as u16, area.height),
     );
 }
 
-/// Draws a table of two-line rows with a gap, and records each row.
-fn draw_table(
+/// A column of a list: its heading and its width.
+struct Col {
+    head: &'static str,
+    width: u16,
+}
+
+/// One row of a list: two lines per column.
+type Cells = Vec<[Line<'static>; 2]>;
+
+/// Which list to draw (its index in `App::tops`), its columns and the gap
+/// between them.
+struct Table<'a> {
+    list: usize,
+    gap: u16,
+    cols: &'a [Col],
+}
+
+/// Where a list was drawn: the left edge of each column, and each visible
+/// row with its top line.
+struct Drawn {
+    xs: Vec<u16>,
+    rows: Vec<(usize, u16)>,
+}
+
+/// Draws a list of two-line rows under a bar with the headings and
+/// records each visible row as clickable.
+///
+/// The list has its own scroll offset (`App::tops[list]`): the wheel moves
+/// it, a click never does, and the cursor moves it only when a key took it
+/// out of view (`App::follow`). When not every row fits, the bar says
+/// which ones show, such as "1–10 of 23".
+fn draw_list(
     frame: &mut Frame,
     app: &mut App,
     area: Rect,
-    head: Vec<&str>,
-    widths: Vec<Constraint>,
-    rows: Vec<Vec<Text<'static>>>,
+    table: Table,
+    rows: Vec<Cells>,
     selected: usize,
-) {
-    let row_h = ROW_H;
-    let visible = (area.height.saturating_sub(1) / row_h).max(1) as usize;
-    let first = offset(selected, rows.len(), visible);
-    let mut table_rows = Vec::new();
-    for (i, cells) in rows.into_iter().enumerate().skip(first).take(visible) {
-        let mut row = Row::new(cells.into_iter().map(Cell::from)).height(2);
-        if i == selected {
-            row = row.style(Style::new().bg(SELECTED_BG));
-        }
-        table_rows.push(row);
-        let y = area.y + 1 + ((i - first) as u16) * row_h;
-        if y + 2 <= area.y + area.height {
-            app.hits
-                .push((Rect::new(area.x, y, area.width, 2), Hit::Row(i)));
-        }
+) -> Drawn {
+    let Table { list, gap, cols } = table;
+    let x0 = area.x + 1;
+    let width = area.width.saturating_sub(2);
+    let mut xs = Vec::new();
+    let mut x = x0;
+    for col in cols {
+        xs.push(x);
+        x += col.width + gap;
     }
-    let table = Table::new(table_rows, widths)
-        .header(heading_row(head))
-        .column_spacing(spacing(area.width.saturating_sub(2)));
-    frame.render_widget(
-        table,
-        Rect::new(
-            area.x + 1,
-            area.y,
-            area.width.saturating_sub(2),
-            area.height,
-        ),
-    );
+    let visible = (area.height.saturating_sub(1) / ROW_H).max(1) as usize;
+    let n = rows.len();
+    let mut top = app.tops[list].min(n.saturating_sub(visible));
+    if app.follow {
+        if selected < top {
+            top = selected;
+        } else if selected >= top + visible {
+            top = selected + 1 - visible;
+        }
+        app.follow = false;
+    }
+    app.tops[list] = top;
+
+    // The headings on a bar of their own.
+    let bar = Rect::new(x0, area.y, width, 1);
+    frame.render_widget(Block::new().style(Style::new().bg(BAR_BG)), bar);
+    let position = (n > visible).then(|| format!("{}–{} of {n} ", top + 1, (top + visible).min(n)));
+    let position_w = position.as_ref().map_or(0, |p| p.width() as u16 + 1);
+    for (col, x) in cols.iter().zip(&xs) {
+        // A heading gives way to the position when both do not fit.
+        let end = x + col.head.width() as u16;
+        if col.width == 0 || end > bar.right().saturating_sub(position_w) {
+            continue;
+        }
+        frame.render_widget(
+            Paragraph::new(Span::styled(col.head, bold(MUTED))),
+            Rect::new(*x, area.y, col.width.min(bar.right().saturating_sub(*x)), 1),
+        );
+    }
+    if let Some(position) = position {
+        frame.render_widget(
+            Paragraph::new(Span::styled(position, Style::new().fg(MUTED)))
+                .alignment(Alignment::Right),
+            bar,
+        );
+    }
+
+    let mut drawn = Vec::new();
+    let hover = matches!(app.mode, Mode::Normal)
+        .then_some(app.mouse)
+        .flatten();
+    for (i, cells) in rows.into_iter().enumerate().skip(top).take(visible) {
+        let y = area.y + 1 + ((i - top) as u16) * ROW_H;
+        if y + ROW_H > area.bottom() {
+            break;
+        }
+        let row = Rect::new(area.x, y, area.width, ROW_H);
+        let under_mouse = hover.is_some_and(|(mx, my)| {
+            mx >= row.x && mx < row.right() && my >= row.y && my < row.bottom()
+        });
+        let lit = i == selected || under_mouse;
+        if lit {
+            let bg = if i == selected { SELECTED_BG } else { HOVER_BG };
+            frame.render_widget(
+                Block::new().style(Style::new().bg(bg)),
+                Rect::new(x0, y, width, ROW_H),
+            );
+        }
+        for ((col, x), [first, second]) in cols.iter().zip(&xs).zip(cells) {
+            let w = col.width.min(bar.right().saturating_sub(*x));
+            if w == 0 {
+                continue;
+            }
+            let mut lines = vec![clip_line(first, w as usize), clip_line(second, w as usize)];
+            if lit {
+                lines = lines.into_iter().map(relight).collect();
+            }
+            frame.render_widget(
+                Paragraph::new(Text::from(lines)),
+                Rect::new(*x, y, w, ROW_H),
+            );
+        }
+        app.hits.push((row, Hit::Row(i)));
+        drawn.push((i, y));
+    }
+    Drawn { xs, rows: drawn }
 }
 
-fn faint(t: impl Into<String>) -> Line<'static> {
-    Line::from(Span::styled(t.into(), Style::new().fg(FAINT)))
+/// A routine's (or cron job's) row, in pieces the list puts together by
+/// how wide it is.
+struct RoutineRow {
+    mark: Span<'static>,
+    name: Line<'static>,
+    /// What it runs with and where, or what keeps it from running.
+    about: Line<'static>,
+    /// `about` says what keeps it from running: nothing goes before it.
+    blocked: bool,
+    /// The schedule in words, and the next time.
+    when: Line<'static>,
+    next: Line<'static>,
+    /// The last run, for a column of its own: status and the link to its
+    /// runs, then when and how long.
+    last: [Line<'static>; 2],
+    /// The link's place in the first of these lines: offset and width.
+    link: Option<(u16, u16)>,
+    /// The last run in a few words, for windows without that column.
+    brief: Option<Line<'static>>,
 }
 
-/// The second line under a routine's name: its agent settings and folder,
-/// or what keeps it from running.
-fn routine_detail(r: &Routine) -> Line<'static> {
+/// What a routine runs with and where, as the list and the details say
+/// it, always in this order: agent, model, permission mode, effort.
+fn runs_with(r: &Routine) -> String {
+    let f = &r.file;
+    if r.is_cron() {
+        return "a cron job, from your crontab (also when Herdr is closed)".into();
+    }
+    if r.is_shell() {
+        return "a shell command, in a Herdr tab".into();
+    }
+    let mut parts = vec![f.agent.clone()];
+    parts.push(if f.model.is_empty() {
+        "default model".to_string()
+    } else {
+        agent::label(agent::models(&f.agent), &f.model)
+    });
+    parts.push(if f.permission_mode.is_empty() {
+        "agent's own permissions".to_string()
+    } else {
+        agent::label(agent::modes(&f.agent), &f.permission_mode)
+    });
+    if !f.effort.is_empty() {
+        parts.push(format!(
+            "{} effort",
+            agent::label(agent::efforts(&f.agent), &f.effort).to_lowercase()
+        ));
+    }
+    parts.join(" · ")
+}
+
+/// The second line under a routine's name: what it runs with and its
+/// folder, or what keeps it from running.
+fn routine_about(app: &App, r: &Routine) -> (Line<'static>, bool) {
     if let Some(p) = &r.problem {
-        return Line::from(Span::styled(p.clone(), Style::new().fg(RED)));
+        return (Line::from(plain(p.clone(), RED)), true);
     }
     if !r.approved {
-        return Line::from(Span::styled(
-            "Changed outside the list · a approves",
-            Style::new().fg(YELLOW),
-        ));
+        let why = if app.known.contains(&r.id) {
+            "Changed outside the list"
+        } else {
+            "New, not approved yet"
+        };
+        return (
+            Line::from(plain(format!("{why} · a shows it for approval"), YELLOW)),
+            true,
+        );
     }
     let f = &r.file;
     if r.is_shell() {
@@ -292,13 +663,17 @@ fn routine_detail(r: &Routine) -> Line<'static> {
             .prompt
             .lines()
             .find(|l| !l.trim().is_empty())
-            .unwrap_or("");
-        let kind = if r.is_cron() { "cron job" } else { "shell" };
-        return faint(format!(
-            "{kind} · {} · {}",
-            clip(first.trim(), 40),
-            f.folder
-        ));
+            .unwrap_or("")
+            .trim();
+        // Cron starts its jobs in the home folder: nothing to show.
+        return (
+            faint(if r.is_cron() {
+                format!("cron job · {first}")
+            } else {
+                format!("shell command · {} · {}", clip(first, 40), f.folder)
+            }),
+            false,
+        );
     }
     let mut parts = vec![f.agent.clone()];
     if !f.model.is_empty() {
@@ -313,42 +688,219 @@ fn routine_detail(r: &Routine) -> Line<'static> {
             agent::label(agent::efforts(&f.agent), &f.effort).to_lowercase()
         ));
     }
-    // Extra arguments can change what the agent does: always in sight.
+    // Extra options can change what the agent does: always in sight.
     if !f.args.is_empty() {
         parts.push(clip(&f.args.join(" "), 40));
     }
     parts.push(f.folder.clone());
-    faint(parts.join(" · "))
+    (faint(parts.join(" · ")), false)
 }
 
-#[derive(Clone, Copy, PartialEq)]
-enum RCol {
-    Mark,
-    Routine,
-    Schedule,
-    Last,
+/// When a routine runs next, in the words the list and the details share:
+/// "next in 9 min", or why there is no next time.
+fn next_words(r: &Routine, now: &DateTime<Local>) -> Span<'static> {
+    if r.problem.is_some() {
+        return plain("–", FAINT);
+    }
+    if !r.approved {
+        return plain("waits for approval", YELLOW);
+    }
+    if !r.file.enabled {
+        return plain("off", MUTED);
+    }
+    match r.schedule() {
+        Some(Schedule::AtStart) if r.is_cron() => plain("next computer start", FAINT),
+        Some(Schedule::AtStart) => plain("next Herdr start", FAINT),
+        s => match s.and_then(|c| c.next_after(now)) {
+            Some(t) => plain(format!("next {}", crate::app::until(&t, now)), FAINT),
+            None => plain("done", FAINT),
+        },
+    }
 }
+
+fn routine_row(app: &App, icons: &Icons, r: &Routine, now: &DateTime<Local>) -> RoutineRow {
+    let mark = if r.problem.is_some() {
+        Mark::Problem
+    } else if !r.approved {
+        Mark::Waiting
+    } else if r.file.enabled {
+        Mark::On
+    } else {
+        Mark::Off
+    };
+    let (icon, color) = icons.routine(mark);
+    let on = r.file.enabled && r.can_run();
+    let (about, blocked) = routine_about(app, r);
+    let when = if r.unreadable {
+        "–".to_string()
+    } else {
+        r.schedule_text()
+    };
+    let (last, link, brief) = match app.latest_run(&r.id) {
+        Some(run) => {
+            let (icon, color) = icons.status(run.status);
+            let status = format!("{icon} {}", run.status.label());
+            let count = app.run_count(&r.id);
+            let runs = if count == 1 {
+                "1 run ›".to_string()
+            } else {
+                format!("{count} runs ›")
+            };
+            let ago = crate::app::ago(&run.started, now);
+            let link = (status.width() as u16 + 2, runs.width() as u16);
+            let (second, short) = if run.status.active() {
+                let t = crate::app::took(run);
+                (format!("{ago} · for {t}"), format!(" for {t}"))
+            } else {
+                (
+                    format!("{ago} · took {}", crate::app::took(run)),
+                    format!(" {ago}"),
+                )
+            };
+            (
+                [
+                    Line::from(vec![
+                        plain(status.clone(), color),
+                        Span::raw("  "),
+                        plain(runs, ACCENT),
+                    ]),
+                    faint(second),
+                ],
+                Some(link),
+                Some(Line::from(vec![plain(status, color), plain(short, FAINT)])),
+            )
+        }
+        None => ([faint("–"), faint("no run yet")], None, None),
+    };
+    RoutineRow {
+        mark: plain(icon, color),
+        name: Line::from(Span::styled(
+            r.file.name.clone(),
+            bold(if r.file.enabled { TEXT } else { MUTED }),
+        )),
+        about,
+        blocked,
+        when: Line::from(plain(when, if on { TEXT } else { MUTED })),
+        next: Line::from(next_words(r, now)),
+        last,
+        link,
+        brief,
+    }
+}
+
+/// A job that is only in the person's crontab: cron runs it, not this
+/// plugin, until it is taken over.
+fn job_row(job: &crate::crontab::CronJob, now: &DateTime<Local>) -> RoutineRow {
+    let when = Schedule::parse(&job.schedule).ok();
+    let next = match &when {
+        Some(Schedule::AtStart) => faint("next computer start"),
+        Some(s) => match s.next_after(now) {
+            Some(t) => faint(format!("next {}", crate::app::until(&t, now))),
+            None => faint("–"),
+        },
+        None => faint("–"),
+    };
+    let words = match &when {
+        Some(Schedule::AtStart) => "When the computer starts".to_string(),
+        Some(s) => s.describe(),
+        None => job.schedule.clone(),
+    };
+    RoutineRow {
+        mark: plain("◇", BLUE),
+        name: Line::from(Span::styled(
+            crate::crontab::name_for(&job.command),
+            bold(TEXT),
+        )),
+        about: faint(job.command.clone()),
+        blocked: false,
+        when: Line::from(plain(words, TEXT)),
+        next,
+        last: [
+            Line::from(plain("only in your crontab", MUTED)),
+            faint("⏎ takes it over"),
+        ],
+        link: None,
+        brief: Some(Line::from(plain("only in your crontab", MUTED))),
+    }
+}
+
+/// `first`, a dot and `second` on one line.
+fn joined(first: Line<'static>, second: Line<'static>) -> Line<'static> {
+    let mut spans = first.spans;
+    spans.push(plain(" · ", FAINT));
+    spans.extend(second.spans);
+    Line::from(spans)
+}
+
+/// How a list of routines is laid out at a width.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Shape {
+    /// Routine, schedule and last run side by side.
+    Full,
+    /// Routine and schedule; the last run goes in front of the second line.
+    Compact,
+    /// The routine alone; last run and next time on its second line.
+    Narrow,
+}
+
+/// The shape a list of routines takes in `inner` columns, with the gap
+/// between columns and the widths of the name and schedule columns.
+/// `name`, `sched` and `last` are what the rows would like.
+fn routine_shape(inner: u16, name: u16, sched: u16, last: u16) -> (Shape, u16, u16, u16) {
+    let floor = sched.min(22);
+    let mut gaps = vec![1];
+    if inner >= 80 {
+        gaps.insert(0, 3);
+    }
+    for gap in gaps {
+        // What is left for the name and the schedule.
+        let room = inner.saturating_sub(2 + 3 * gap + last);
+        if room >= NAME_MIN + floor {
+            let mut sched_w = sched;
+            if room.saturating_sub(sched_w) < name {
+                // The schedule gives way first, down to its floor.
+                sched_w = room.saturating_sub(name).clamp(floor, sched);
+            }
+            return (Shape::Full, gap, room - sched_w, sched_w);
+        }
+    }
+    let gap = 1;
+    let room = inner.saturating_sub(2 + 2 * gap);
+    let floor = sched.min(18);
+    if room >= NAME_MIN + floor {
+        let sched_w = room.saturating_sub(28).clamp(floor, sched.min(30));
+        return (Shape::Compact, gap, room - sched_w, sched_w);
+    }
+    (Shape::Narrow, gap, inner.saturating_sub(2 + gap), 0)
+}
+
+/// The selected routine's details show from this list height on when not
+/// every row fits, with at least DETAILS_MIN rows for them. When every row
+/// fits, they show in whatever is left below, from DETAILS_FREE rows on.
+const DETAILS_FROM: u16 = 24;
+const DETAILS_MIN: u16 = 11;
+const DETAILS_FREE: u16 = 5;
 
 fn draw_routines(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
     let cron_view = app.view == View::Cron;
     let routines: Vec<Routine> = app.listed().into_iter().cloned().collect();
-    let crontab_jobs = if cron_view {
+    let jobs = if cron_view {
         app.crontab_jobs.clone()
     } else {
         Vec::new()
     };
-    if routines.is_empty() && crontab_jobs.is_empty() {
+    if routines.is_empty() && jobs.is_empty() {
         let path = crate::paths::shorten(&app.paths.routines_dir());
         let lines: Vec<(String, Color)> = if cron_view {
             vec![
                 ("No cron jobs.".into(), TEXT),
                 (String::new(), TEXT),
                 (
-                    "n, then \"Classic cron job\", creates one: a command cron runs, also when Herdr is closed.".into(),
+                    "n, then \"Cron job\", creates one: a command that cron runs, also when Herdr is closed.".into(),
                     MUTED,
                 ),
                 (
-                    "Jobs already in your crontab show here too.".into(),
+                    "Jobs that are already in your crontab show here too.".into(),
                     FAINT,
                 ),
             ]
@@ -363,158 +915,135 @@ fn draw_routines(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
                 (format!("Routines are plain files in {path}."), FAINT),
             ]
         };
-        let refs: Vec<(&str, Color)> = lines.iter().map(|(t, c)| (t.as_str(), *c)).collect();
-        empty_note(frame, area, &refs);
+        empty_note(frame, area, &lines);
         return;
     }
-    let cols = fit(
-        vec![
-            (RCol::Mark, "", Constraint::Length(2)),
-            (
-                RCol::Routine,
-                if cron_view { "Cron job" } else { "Routine" },
-                Constraint::Fill(1),
-            ),
-            (RCol::Schedule, "Schedule", Constraint::Length(26)),
-            (RCol::Last, "Last run", Constraint::Length(LAST_W)),
-        ],
-        &[RCol::Last, RCol::Schedule],
-        area.width.saturating_sub(2),
-        24,
-    );
     let now = Local::now();
-    let rows: Vec<Vec<Text<'static>>> = routines
+    let mut rows: Vec<RoutineRow> = routines
         .iter()
+        .map(|r| routine_row(app, icons, r, &now))
+        .collect();
+    rows.extend(jobs.iter().map(|j| job_row(j, &now)));
+
+    // The columns are as wide as what they hold, within limits; the name
+    // takes the rest.
+    let most = |f: &dyn Fn(&RoutineRow) -> usize| rows.iter().map(f).max().unwrap_or(0) as u16;
+    let name = most(&|r| r.name.width()).clamp(NAME_MIN, 34);
+    let sched = most(&|r| r.when.width().max(r.next.width())).clamp(8, 46);
+    let last = most(&|r| r.last[0].width().max(r.last[1].width())).clamp(8, 30);
+    let inner = area.width.saturating_sub(2);
+    let (shape, gap, name_w, sched_w) = routine_shape(inner, name, sched, last);
+    let title = if cron_view { "Cron job" } else { "Routine" };
+    let cols: Vec<Col> = match shape {
+        Shape::Full => vec![
+            Col { head: "", width: 2 },
+            Col {
+                head: title,
+                width: name_w,
+            },
+            Col {
+                head: "Schedule",
+                width: sched_w,
+            },
+            Col {
+                head: "Last run",
+                width: last,
+            },
+        ],
+        Shape::Compact => vec![
+            Col { head: "", width: 2 },
+            Col {
+                head: title,
+                width: name_w,
+            },
+            Col {
+                head: "Schedule",
+                width: sched_w,
+            },
+        ],
+        Shape::Narrow => vec![
+            Col { head: "", width: 2 },
+            Col {
+                head: title,
+                width: name_w,
+            },
+        ],
+    };
+    let links: Vec<Option<(u16, u16)>> = rows.iter().map(|r| r.link).collect();
+    let cells: Vec<Cells> = rows
+        .into_iter()
         .map(|r| {
-            let on = r.file.enabled && r.can_run();
-            cols.iter()
-                .map(|(c, _, _)| match c {
-                    RCol::Mark => {
-                        let (icon, color) = icons.routine(r.file.enabled, !r.can_run());
-                        Text::from(Span::styled(icon, Style::new().fg(color)))
-                    }
-                    RCol::Routine => Text::from(vec![
-                        Line::from(Span::styled(
-                            r.file.name.clone(),
-                            bold(if r.file.enabled { TEXT } else { MUTED }),
-                        )),
-                        routine_detail(r),
-                    ]),
-                    RCol::Schedule => {
-                        let second = if r.problem.is_some() {
-                            faint("–")
-                        } else if !r.approved {
-                            Line::from(Span::styled("waits for approval", Style::new().fg(YELLOW)))
-                        } else if !r.file.enabled {
-                            Line::from(Span::styled("off", Style::new().fg(RED)))
-                        } else {
-                            match r.schedule() {
-                                Some(crate::schedule::Schedule::AtStart) if r.is_cron() => {
-                                    faint("next computer start")
-                                }
-                                Some(crate::schedule::Schedule::AtStart) => {
-                                    faint("next Herdr start")
-                                }
-                                s => match s.and_then(|c| c.next_after(&now)) {
-                                    Some(t) => {
-                                        faint(format!("next {}", crate::app::until(&t, &now)))
-                                    }
-                                    None => faint("done"),
-                                },
-                            }
-                        };
-                        Text::from(vec![
-                            Line::from(Span::styled(
-                                r.schedule_text(),
-                                Style::new().fg(if on { TEXT } else { MUTED }),
-                            )),
-                            second,
-                        ])
-                    }
-                    RCol::Last => match app.latest_run(&r.id) {
-                        Some(run) => last_run(icons, run, &now, app.run_count(&r.id)),
-                        None => Text::from(vec![faint("–"), faint("no run yet")]),
-                    },
-                })
-                .collect()
+            let mark = [Line::from(r.mark), Line::from("")];
+            // Without a column for the last run, it leads the second line.
+            let with_brief = |about: Line<'static>| match r.brief.clone() {
+                Some(brief) if !r.blocked => joined(brief, about),
+                _ => about,
+            };
+            match shape {
+                Shape::Full => vec![mark, [r.name, r.about], [r.when, r.next], r.last],
+                Shape::Compact => vec![mark, [r.name, with_brief(r.about)], [r.when, r.next]],
+                Shape::Narrow => {
+                    let second = if r.blocked {
+                        r.about
+                    } else {
+                        with_brief(r.next)
+                    };
+                    vec![mark, [r.name, second]]
+                }
+            }
         })
         .collect();
-    // The person's own cron jobs follow: cron runs them, not this plugin.
-    let mut rows = rows;
-    for job in &crontab_jobs {
-        let when = Schedule::parse(&job.schedule).ok();
-        let next = match &when {
-            Some(Schedule::AtStart) => faint("next computer start"),
-            Some(s) => match s.next_after(&now) {
-                Some(t) => faint(format!("next {}", crate::app::until(&t, &now))),
-                None => faint("–"),
-            },
-            None => faint("–"),
-        };
-        let words = match &when {
-            Some(Schedule::AtStart) => "When the computer starts".to_string(),
-            Some(s) => s.describe(),
-            None => job.schedule.clone(),
-        };
-        rows.push(
-            cols.iter()
-                .map(|(c, _, _)| match c {
-                    RCol::Mark => Text::from(Span::styled("◇", Style::new().fg(BLUE))),
-                    RCol::Routine => Text::from(vec![
-                        Line::from(Span::styled(
-                            crate::crontab::name_for(&job.command),
-                            bold(TEXT),
-                        )),
-                        faint(format!("in your crontab · {}", clip(&job.command, 50))),
-                    ]),
-                    RCol::Schedule => Text::from(vec![
-                        Line::from(Span::styled(words.clone(), Style::new().fg(TEXT))),
-                        next.clone(),
-                    ]),
-                    RCol::Last => Text::from(vec![
-                        Line::from(Span::styled("not followed here", Style::new().fg(MUTED))),
-                        faint("⏎ manage it here"),
-                    ]),
-                })
-                .collect(),
-        );
-    }
-    let head = cols.iter().map(|(_, h, _)| *h).collect();
-    let widths = cols.iter().map(|(_, _, w)| *w).collect();
+
     let sel = app.list_sel();
-    let n = rows.len();
-    // In a tall enough window the selected routine's details sit right
-    // under the list.
-    let table_h = 1 + ROW_H * n as u16;
-    let (list, details) = if area.height >= DETAILS_FROM && area.width >= 50 {
-        let list_h = table_h.min(area.height - DETAILS_MIN);
-        let details = Rect::new(
+    let n = cells.len() as u16;
+    // The selected routine's details sit under the list: in what is left
+    // when every row fits, else in a tall enough window.
+    let table_h = 1 + ROW_H * n;
+    let free = area.height.saturating_sub(table_h + 1);
+    let list_h = if area.width < 50 {
+        area.height
+    } else if free >= DETAILS_FREE {
+        table_h
+    } else if area.height >= DETAILS_FROM {
+        1 + ROW_H * ((area.height - DETAILS_MIN - 1) / ROW_H)
+    } else {
+        area.height
+    };
+    let details = (list_h < area.height).then(|| {
+        Rect::new(
             area.x,
             area.y + list_h + 1,
             area.width,
             area.height - list_h - 1,
-        );
-        (
-            Rect {
-                height: list_h,
-                ..area
-            },
-            Some(details),
         )
-    } else {
-        (area, None)
+    });
+    let list = Rect {
+        height: list_h,
+        ..area
     };
-    draw_table(frame, app, list, head, widths, rows, sel);
-    // The last-run cell links to the routine's runs: the column is the
-    // table's last one, LAST_W wide, flush right inside the side margins.
-    if cols.last().is_some_and(|(c, _, _)| *c == RCol::Last) {
-        let x = list.x + list.width.saturating_sub(1 + LAST_W);
-        let visible = (list.height.saturating_sub(1) / ROW_H).max(1) as usize;
-        let first = offset(sel, n, visible);
-        for (i, r) in routines.iter().enumerate().skip(first).take(visible) {
-            let y = list.y + 1 + ((i - first) as u16) * ROW_H;
-            if app.latest_run(&r.id).is_some() && y < list.y + list.height {
-                app.hits.push((Rect::new(x, y, LAST_W, 1), Hit::RunsOf(i)));
+    let index = App::list_index(app.view);
+    let drawn = draw_list(
+        frame,
+        app,
+        list,
+        Table {
+            list: index,
+            gap,
+            cols: &cols,
+        },
+        cells,
+        sel,
+    );
+    // Only the "n runs ›" text links to the routine's runs.
+    if shape == Shape::Full {
+        for (i, y) in &drawn.rows {
+            if let Some((offset, width)) = links[*i] {
+                if offset + width <= last {
+                    app.hits.push((
+                        Rect::new(drawn.xs[3] + offset, *y, width, 1),
+                        Hit::RunsOf(*i),
+                    ));
+                }
             }
         }
     }
@@ -522,13 +1051,32 @@ fn draw_routines(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
         if let Some(r) = routines.get(sel) {
             draw_details(frame, app, icons, r, area);
         } else if let Some(job) = app.selected_cron_job().cloned() {
-            draw_cron_details(frame, &job, area);
+            draw_job_details(frame, &job, area);
         }
     }
 }
 
-/// The person's own cron job in full, and what ⏎ does with it.
-fn draw_cron_details(frame: &mut Frame, job: &crate::crontab::CronJob, area: Rect) {
+/// The heading of a details panel: the name and a rule.
+fn details_title(name: &str, width: usize) -> Line<'static> {
+    let title = format!(" {}", clip(name, width.saturating_sub(4)));
+    let rule = width.saturating_sub(title.width() + 2);
+    Line::from(vec![
+        Span::styled(title, bold(ACCENT)),
+        plain(format!(" {}", "─".repeat(rule)), BORDER),
+    ])
+}
+
+/// The width of the labels in a details panel.
+const DETAIL_LABEL: usize = 16;
+
+fn detail_row(label: &str, value: Vec<Span<'static>>, width: usize) -> Line<'static> {
+    let mut spans = vec![plain(format!(" {label:<DETAIL_LABEL$}"), MUTED)];
+    spans.extend(value);
+    clip_line(Line::from(spans), width)
+}
+
+/// A crontab-only job in full, and what ⏎ does with it.
+fn draw_job_details(frame: &mut Frame, job: &crate::crontab::CronJob, area: Rect) {
     let inner = Rect::new(
         area.x + 1,
         area.y,
@@ -536,50 +1084,57 @@ fn draw_cron_details(frame: &mut Frame, job: &crate::crontab::CronJob, area: Rec
         area.height,
     );
     let w = inner.width as usize;
-    let title = format!(" {}", crate::crontab::name_for(&job.command));
-    let rule = w.saturating_sub(title.width() + 2);
-    let mut lines = vec![Line::from(vec![
-        Span::styled(title, bold(ACCENT)),
-        Span::styled(format!(" {}", "─".repeat(rule)), Style::new().fg(BORDER)),
-    ])];
-    const LW: usize = 15;
-    let room = w.saturating_sub(LW + 2).max(10);
-    let row = |label: &str, text: String, color: Color| {
-        Line::from(vec![
-            Span::styled(format!(" {label:<LW$}"), Style::new().fg(MUTED)),
-            Span::styled(text, Style::new().fg(color)),
-        ])
-    };
-    lines.push(row("Line", clip(job.line.trim(), room), TEXT));
+    let mut lines = vec![details_title(&crate::crontab::name_for(&job.command), w)];
+    lines.push(detail_row(
+        "Crontab line",
+        vec![plain(job.line.trim().to_string(), TEXT)],
+        w,
+    ));
     if !job.env.is_empty() {
         let vars: Vec<String> = job.env.iter().map(|(k, _)| k.clone()).collect();
-        lines.push(row("Variables", clip(&vars.join(", "), room), TEXT));
+        lines.push(detail_row(
+            "Variables",
+            vec![plain(vars.join(", "), TEXT)],
+            w,
+        ));
     }
     if let Some(note) = &job.note {
-        lines.push(row("Note", clip(note, room), YELLOW));
+        lines.push(detail_row("Note", vec![plain(note.clone(), YELLOW)], w));
     }
-    lines.push(Line::from(""));
-    for l in wrap(
-        "Cron runs this job, not Herdr, so this list does not see its runs. ⏎ manages it here: keep it as a cron job (it still runs when Herdr is closed) or move it to Herdr, and see its output, result and failures in Runs.",
+    let note = wrap(
+        "Only in your crontab: cron runs it, and this list does not see its runs. ⏎ takes it over, as a cron job or as a Herdr routine, with its output and failures in Runs.",
         w.saturating_sub(2),
-    ) {
-        lines.push(Line::from(Span::styled(
-            format!(" {l}"),
-            Style::new().fg(FAINT),
-        )));
+    );
+    // The gap above the note goes first when the rows are short.
+    if lines.len() + 1 + note.len() <= area.height as usize {
+        lines.push(Line::from(""));
+    }
+    for l in note {
+        lines.push(Line::from(plain(format!(" {l}"), MUTED)));
     }
     frame.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
-/// Rows per routine or run in the lists: name and details, no gap.
-const ROW_H: u16 = 2;
-/// The details of the selected routine show from this list height on,
-/// with at least DETAILS_MIN rows for them.
-const DETAILS_FROM: u16 = 24;
-const DETAILS_MIN: u16 = 11;
+/// A run in a few coloured words: status, when, why and what it came to.
+fn run_words(icons: &Icons, run: &Run, now: &DateTime<Local>) -> Vec<Span<'static>> {
+    let (icon, color) = icons.status(run.status);
+    let mut v = vec![
+        plain(format!("{icon} {}", run.status.label()), color),
+        plain(format!(" · {}", crate::app::ago(&run.started, now)), FAINT),
+    ];
+    if !run.message.trim().is_empty() {
+        v.push(plain(format!(" · {}", run.message.trim()), MUTED));
+    }
+    if let Some(first) = run.result.lines().find(|l| !l.trim().is_empty()) {
+        v.push(plain(format!(" · {}", first.trim()), TEXT));
+    }
+    v
+}
 
-/// The selected routine in full: everything the form sets, its last run
-/// and the start of its prompt or command.
+/// The selected routine in full: when it runs, how its last run went and
+/// why, what it runs with, its limits and the start of its prompt or
+/// command. It says what the list says: no next time for a routine that
+/// cannot run.
 fn draw_details(frame: &mut Frame, app: &App, icons: &Icons, r: &Routine, area: Rect) {
     let inner = Rect::new(
         area.x + 1,
@@ -590,128 +1145,104 @@ fn draw_details(frame: &mut Frame, app: &App, icons: &Icons, r: &Routine, area: 
     let w = inner.width as usize;
     let f = &r.file;
     let now = Local::now();
-    let mut lines: Vec<Line> = Vec::new();
-    let title = format!(" {}", r.file.name);
-    let rule = w.saturating_sub(title.width() + 2);
-    lines.push(Line::from(vec![
-        Span::styled(title, bold(ACCENT)),
-        Span::styled(format!(" {}", "─".repeat(rule)), Style::new().fg(BORDER)),
-    ]));
-    const LW: usize = 15;
-    let row = |label: &str, value: Vec<Span<'static>>| {
-        let mut spans = vec![Span::styled(
-            format!(" {label:<LW$}"),
-            Style::new().fg(MUTED),
-        )];
-        spans.extend(value);
-        Line::from(spans)
-    };
-    let text = |s: String| vec![Span::styled(s, Style::new().fg(TEXT))];
-    let room = w.saturating_sub(LW + 2);
-    if let Some(p) = &r.problem {
-        lines.push(row(
+    let mut lines: Vec<Line> = vec![details_title(&r.file.name, w)];
+    let text = |s: String| vec![plain(s, TEXT)];
+    let room = w.saturating_sub(DETAIL_LABEL + 2);
+    if r.unreadable {
+        // Nothing of it could be read: only what is wrong and what helps.
+        lines.push(detail_row(
             "Problem",
-            vec![Span::styled(clip(p, room), Style::new().fg(RED))],
+            vec![plain(r.problem.clone().unwrap_or_default(), RED)],
+            w,
         ));
+        lines.push(Line::from(""));
+        for l in wrap(
+            "Its routine.toml cannot be read, so it never runs. ⏎ opens the file to fix it; d deletes the routine.",
+            w.saturating_sub(2),
+        ) {
+            lines.push(Line::from(plain(format!(" {l}"), FAINT)));
+        }
+        frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+        return;
+    }
+    if let Some(p) = &r.problem {
+        lines.push(detail_row("Problem", vec![plain(p.clone(), RED)], w));
     } else if !r.approved {
-        lines.push(row(
+        let why = if app.known.contains(&r.id) {
+            "changed outside the list"
+        } else {
+            "new, not approved yet"
+        };
+        lines.push(detail_row(
             "Approval",
-            vec![Span::styled(
-                "changed outside the list · a shows it and approves",
-                Style::new().fg(YELLOW),
-            )],
+            vec![plain(format!("{why} · a shows it for approval"), YELLOW)],
+            w,
         ));
     }
-    // Schedule and when it runs next.
-    let mut when = vec![Span::styled(r.schedule_text(), Style::new().fg(TEXT))];
-    let next = if !f.enabled {
-        Some(Span::styled("off", Style::new().fg(RED)))
-    } else {
-        match r.schedule() {
-            Some(crate::schedule::Schedule::AtStart) => None,
-            s => s.and_then(|c| c.next_after(&now)).map(|t| {
-                Span::styled(
-                    format!("next {}", short_time(&t, &now)),
-                    Style::new().fg(FAINT),
-                )
-            }),
-        }
-    };
-    if let Some(next) = next {
-        when.push(Span::styled(" · ", Style::new().fg(FAINT)));
+    // The schedule, and when it runs next (or why it does not).
+    let mut when = vec![plain(r.schedule_text(), TEXT)];
+    let next = next_words(r, &now);
+    let at_start = matches!(r.schedule(), Some(Schedule::AtStart)) && r.can_run() && f.enabled;
+    if !at_start && next.content != "–" {
+        when.push(plain(" · ", FAINT));
         when.push(next);
     }
-    lines.push(row("Schedule", when));
-    if r.is_shell() {
-        lines.push(row(
-            "Runs",
-            text(if r.is_cron() {
-                "a classic cron job, from your crontab (also when Herdr is closed)".into()
-            } else {
-                "a shell command, in a Herdr tab".into()
-            }),
-        ));
-    } else {
-        let mode = if f.permission_mode.is_empty() {
-            "agent's own permissions".to_string()
-        } else {
-            agent::label(agent::modes(&f.agent), &f.permission_mode)
-        };
-        let model = if f.model.is_empty() {
-            "default model".to_string()
-        } else {
-            agent::label(agent::models(&f.agent), &f.model)
-        };
-        let mut agent_words = format!("{} · {mode} · {model}", f.agent);
-        if !f.effort.is_empty() {
-            agent_words.push_str(&format!(
-                " · {} effort",
-                agent::label(agent::efforts(&f.agent), &f.effort).to_lowercase()
-            ));
-        }
-        lines.push(row("Agent", text(clip(&agent_words, room))));
-    }
+    lines.push(detail_row("Schedule", when, w));
+    let last = match app.latest_run(&r.id) {
+        Some(run) => run_words(icons, run, &now),
+        None => vec![plain("no run yet", FAINT)],
+    };
+    lines.push(detail_row("Last run", last, w));
+    lines.push(detail_row("Runs with", text(runs_with(r)), w));
     if r.is_cron() {
         // The schedule as the crontab line has it; the command is below.
         let when = crate::crontab::when(r).unwrap_or_default();
-        lines.push(row(
-            "Crontab",
-            vec![
-                Span::styled(when, Style::new().fg(TEXT)),
-                Span::styled(
-                    clip(" and the command below", room.saturating_sub(12)),
-                    Style::new().fg(FAINT),
-                ),
-            ],
+        lines.push(detail_row(
+            "Crontab line",
+            vec![plain(when, TEXT), plain(" and the command below", FAINT)],
+            w,
         ));
     } else {
-        lines.push(row("Folder", text(clip(&f.folder, room))));
+        lines.push(detail_row("Folder", text(clip_start(&f.folder, room)), w));
     }
-    let mut limits = format!(
-        "{} minute{}, then {}",
-        f.time_limit_minutes,
-        if f.time_limit_minutes == 1 { "" } else { "s" },
-        if f.stop_at_limit || r.is_cron() {
-            "stops"
-        } else {
-            "keeps running"
-        }
-    );
-    limits.push_str(&match f.retries {
-        0 => " · no retry".to_string(),
-        1 => format!(" · retries once after {} min", f.retry_delay_minutes),
-        n => format!(" · retries {n}× after {} min", f.retry_delay_minutes),
-    });
-    if f.alert != crate::routine::Alert::Notification {
-        limits.push_str(&format!(" · {}", f.alert.label().to_lowercase()));
-    }
-    lines.push(row("Time limit", text(clip(&limits, room))));
-    lines.push(row(
-        "Keeps",
-        text(clip(
-            &crate::form::keep_text(f.keep_runs, f.keep_days).1,
-            room,
+    lines.push(detail_row(
+        "Time limit",
+        text(format!(
+            "{} minute{}, then the run {}",
+            f.time_limit_minutes,
+            if f.time_limit_minutes == 1 { "" } else { "s" },
+            if f.stop_at_limit || r.is_cron() {
+                "is stopped"
+            } else {
+                "keeps running"
+            }
         )),
+        w,
+    ));
+    if f.retries > 0 {
+        lines.push(detail_row(
+            "If it fails",
+            text(match f.retries {
+                1 => format!("tries once more after {} minutes", f.retry_delay_minutes),
+                n => format!(
+                    "tries up to {n} more times, {} minutes apart",
+                    f.retry_delay_minutes
+                ),
+            }),
+            w,
+        ));
+    }
+    if f.alert != crate::routine::Alert::Notification {
+        lines.push(detail_row(
+            "Alerts",
+            text(f.alert.label().to_lowercase()),
+            w,
+        ));
+    }
+    lines.push(detail_row(
+        "Run history",
+        text(crate::form::keep_text(f.keep_runs, f.keep_days).1),
+        w,
     ));
     if !r.is_shell() {
         let mut extras = Vec::new();
@@ -719,50 +1250,25 @@ fn draw_details(frame: &mut Frame, app: &App, icons: &Icons, r: &Routine, area: 
             extras.push(format!("checks first: {}", f.check_command));
         }
         if f.remember {
-            extras.push("uses earlier results".into());
+            extras.push("gets earlier results".into());
         }
         if !f.args.is_empty() {
-            extras.push(format!("options: {}", f.args.join(" ")));
+            extras.push(format!("extra options: {}", f.args.join(" ")));
         }
         if !extras.is_empty() {
-            lines.push(row("Extras", text(clip(&extras.join(" · "), room))));
+            lines.push(detail_row("Agent settings", text(extras.join(" · ")), w));
         }
     }
-    let last = match app.latest_run(&r.id) {
-        Some(run) => {
-            let (icon, color) = icons.status(run.status);
-            let mut v = vec![
-                Span::styled(
-                    format!("{icon} {}", run.status.label()),
-                    Style::new().fg(color),
-                ),
-                Span::styled(
-                    format!(" · {}", crate::app::ago(&run.started, &now)),
-                    Style::new().fg(FAINT),
-                ),
-            ];
-            let used = Line::from(v.clone()).width() + 3;
-            if let Some(first) = run.result.lines().find(|l| !l.trim().is_empty()) {
-                v.push(Span::styled(
-                    format!(" · {}", clip(first.trim(), room.saturating_sub(used))),
-                    Style::new().fg(TEXT),
-                ));
-            }
-            v
-        }
-        None => vec![Span::styled("none yet", Style::new().fg(FAINT))],
-    };
-    lines.push(row("Last run", last));
     // The prompt or command fills the rest.
     let label = if r.is_shell() { "Command" } else { "Prompt" };
     let left = (inner.height as usize).saturating_sub(lines.len());
     if left > 0 {
         let mut body: Vec<String> = Vec::new();
         for l in r.prompt.lines() {
-            if body.len() >= left {
+            if body.len() > left {
                 break;
             }
-            if l.trim().is_empty() && body.is_empty() {
+            if l.trim().is_empty() {
                 continue;
             }
             body.extend(wrap(l, room.max(10)));
@@ -771,91 +1277,93 @@ fn draw_details(frame: &mut Frame, app: &App, icons: &Icons, r: &Routine, area: 
         body.truncate(left);
         if more {
             if let Some(last) = body.last_mut() {
-                last.push('…');
+                *last = format!("{} …", clip(last, room.saturating_sub(2)));
             }
         }
         if body.is_empty() {
-            lines.push(row(
-                label,
-                vec![Span::styled("empty", Style::new().fg(FAINT))],
-            ));
+            lines.push(detail_row(label, vec![plain("empty", FAINT)], w));
         }
         for (i, b) in body.into_iter().enumerate() {
             let shown = if i == 0 { label } else { "" };
-            lines.push(row(shown, vec![Span::styled(b, Style::new().fg(MUTED))]));
+            lines.push(detail_row(shown, vec![plain(b, MUTED)], w));
         }
     }
     frame.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
-/// Width of the last-run column.
-const LAST_W: u16 = 28;
-
-/// The last run of a routine and how many runs it has (a link to them).
-fn last_run(
-    icons: &Icons,
-    run: &Run,
-    now: &chrono::DateTime<Local>,
-    count: usize,
-) -> Text<'static> {
-    let (icon, color) = icons.status(run.status);
-    let when = crate::app::ago(&run.started, now);
-    let runs = if count == 1 {
-        "1 run".to_string()
-    } else {
-        format!("{count} runs")
-    };
-    Text::from(vec![
-        Line::from(vec![
-            Span::styled(
-                format!("{icon} {}", run.status.label()),
-                Style::new().fg(color),
-            ),
-            Span::raw("  "),
-            Span::styled(format!("{runs} ›"), Style::new().fg(ACCENT)),
+/// The second line of a run's row: what went wrong and what it came to,
+/// else which agent ran. How it was started shows once, under its time.
+fn run_about(run: &Run) -> Line<'static> {
+    let result = run
+        .result
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .map(|l| l.trim().to_string());
+    let message = run.message.trim();
+    let failed = matches!(
+        run.status,
+        Status::Failed | Status::TimedOut | Status::Closed | Status::Skipped
+    );
+    match (failed && !message.is_empty(), result) {
+        (true, Some(r)) => Line::from(vec![
+            plain(message.to_string(), MUTED),
+            plain(format!(" · {r}"), FAINT),
         ]),
-        faint(if run.status.active() {
-            format!("{when} · for {}", crate::app::took(run))
-        } else {
-            format!("{when} · took {}", crate::app::took(run))
-        }),
-    ])
-}
-
-#[derive(Clone, Copy, PartialEq)]
-enum NCol {
-    Mark,
-    Run,
-    Started,
-    Status,
+        (true, None) => Line::from(plain(message.to_string(), MUTED)),
+        (false, Some(r)) => faint(r),
+        (false, None) if !message.is_empty() => faint(message.to_string()),
+        (false, None) if run.agent == crate::routine::SHELL => faint("shell command"),
+        (false, None) => faint(run.agent.clone()),
+    }
 }
 
 fn draw_runs(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
-    // A filter shows as a line on top, with a button that removes it.
+    // A filter shows as a line on top, with buttons that remove it.
     let mut area = area;
     if let Some(name) = app.filter_name().map(str::to_string) {
         let bar = Rect::new(area.x + 1, area.y, area.width.saturating_sub(2), 1);
-        let shown = app.runs.len();
-        let all = app.all_runs.len();
-        let button_text = " ✕ show all runs ";
-        let lead = "Only runs of ";
-        let tail = format!("  {shown} of {all}   ");
-        let room = (bar.width as usize)
-            .saturating_sub(lead.width() + tail.width() + button_text.width() + 1);
+        let lead = " Only runs of ";
+        let tail = format!("  {} of {}  ", app.runs.len(), app.all_runs.len());
+        // Esc goes back to the routine the filter came from; without one
+        // it shows all runs, which `h` always does.
+        let mut buttons: Vec<(&str, char)> = match app.filter_from {
+            Some(_) => vec![
+                (" Esc back to the routine ", '\u{1b}'),
+                (" h all runs ", 'h'),
+            ],
+            None => vec![(" Esc all runs ", '\u{1b}')],
+        };
+        let fixed = |b: &[(&str, char)]| {
+            lead.width() + tail.width() + b.iter().map(|(t, _)| t.width() + 1).sum::<usize>()
+        };
+        while buttons.len() > 1 && (bar.width as usize) < fixed(&buttons) + 12 {
+            buttons.pop();
+        }
+        if app.runs.is_empty() {
+            // `h` needs a run to stand on.
+            buttons.truncate(1);
+        }
+        let room = (bar.width as usize).saturating_sub(fixed(&buttons));
         let name = clip(&name, room.max(4));
-        let spans = vec![
-            Span::raw(" "),
-            Span::styled(lead, Style::new().fg(MUTED)),
-            Span::styled(name.clone(), bold(TEXT)),
-            Span::styled(tail.clone(), Style::new().fg(FAINT)),
-            Span::styled(button_text, Style::new().fg(TEXT).bg(SELECTED_BG)),
+        let mut x = bar.x + (lead.width() + name.width() + tail.width()) as u16;
+        let mut spans = vec![
+            plain(lead, MUTED),
+            Span::styled(name, bold(TEXT)),
+            plain(tail, MUTED),
         ];
-        let x = bar.x + (1 + lead.width() + name.width() + tail.width()) as u16;
-        app.hits.push((
-            Rect::new(x, bar.y, button_text.width() as u16, 1),
-            Hit::Key('\u{1b}'),
-        ));
-        frame.render_widget(Paragraph::new(Line::from(spans)), bar);
+        for (text, key) in buttons {
+            let w = text.width() as u16;
+            if x + w <= bar.right() {
+                app.hits.push((Rect::new(x, bar.y, w, 1), Hit::Key(key)));
+            }
+            x += w + 1;
+            spans.push(Span::styled(text, Style::new().fg(TEXT).bg(SELECTED_BG)));
+            spans.push(Span::raw(" "));
+        }
+        frame.render_widget(
+            Paragraph::new(clip_line(Line::from(spans), bar.width as usize)),
+            bar,
+        );
         area = Rect::new(
             area.x,
             area.y + 2,
@@ -868,196 +1376,266 @@ fn draw_runs(frame: &mut Frame, app: &mut App, icons: &Icons, area: Rect) {
             frame,
             area,
             &[
-                ("No runs yet.", TEXT),
-                ("", TEXT),
+                ("No runs yet.".into(), TEXT),
+                (String::new(), TEXT),
                 (
-                    "Runs show up here when a routine is due, or when you start one with r.",
+                    "Runs show up here when a routine is due, or when you start one with r.".into(),
                     MUTED,
                 ),
             ],
         );
         return;
     }
-    let cols = fit(
-        vec![
-            (NCol::Mark, "", Constraint::Length(2)),
-            (NCol::Run, "Run", Constraint::Fill(1)),
-            (NCol::Started, "Started", Constraint::Length(14)),
-            (NCol::Status, "Status", Constraint::Length(18)),
-        ],
-        &[NCol::Started, NCol::Status],
-        area.width.saturating_sub(2),
-        24,
-    );
     let now = Local::now();
     let runs = app.runs.clone();
-    let rows: Vec<Vec<Text<'static>>> = runs
+    struct RunRow {
+        mark: Span<'static>,
+        name: Line<'static>,
+        about: Line<'static>,
+        started: String,
+        how: String,
+        status: Span<'static>,
+        took: String,
+    }
+    let rows: Vec<RunRow> = runs
         .iter()
         .map(|run| {
             let (icon, color) = icons.status(run.status);
-            cols.iter()
-                .map(|(c, _, _)| match c {
-                    NCol::Mark => Text::from(Span::styled(icon, Style::new().fg(color))),
-                    NCol::Run => {
-                        let mut first = vec![Span::styled(run.routine_name.clone(), bold(TEXT))];
-                        // Runs kept when their routine was deleted.
-                        if !app.routines.iter().any(|r| r.id == run.routine_id) {
-                            first.push(Span::styled("  deleted routine", Style::new().fg(FAINT)));
-                        }
-                        let open = !run.tab_closed
-                            && !run.pane_id.is_empty()
-                            && run.status != crate::store::Status::Closed;
-                        if open {
-                            first.push(Span::styled(
-                                format!("  {} tab open", icons.tab_open()),
-                                Style::new().fg(ACCENT),
-                            ));
-                        }
-                        // What it came to, else what went wrong, else how
-                        // it started.
-                        let result = run.result.lines().find(|l| !l.trim().is_empty());
-                        let second = match result {
-                            Some(r) => r.trim().to_string(),
-                            None if !run.message.is_empty() => run.message.clone(),
-                            None => {
-                                format!("{} · {}", run.agent, run.trigger.label().to_lowercase())
-                            }
-                        };
-                        Text::from(vec![Line::from(first), faint(second)])
-                    }
-                    NCol::Started => Text::from(vec![
-                        Line::from(Span::styled(
-                            short_time(&run.started, &now),
-                            Style::new().fg(TEXT),
-                        )),
-                        faint(if run.attempt > 0 {
-                            format!("{} {}", run.trigger.label(), run.attempt)
-                        } else {
-                            run.trigger.label().to_string()
-                        }),
-                    ]),
-                    NCol::Status => Text::from(vec![
-                        Line::from(Span::styled(run.status.label(), Style::new().fg(color))),
-                        faint(if run.status.active() {
-                            format!("for {}", crate::app::took(run))
-                        } else {
-                            format!("took {}", crate::app::took(run))
-                        }),
-                    ]),
-                })
-                .collect()
+            let mut name = vec![Span::styled(run.routine_name.clone(), bold(TEXT))];
+            // Runs kept when their routine was deleted.
+            if !app.routines.iter().any(|r| r.id == run.routine_id) {
+                name.push(plain("  deleted routine", FAINT));
+            }
+            let open = !run.tab_closed && !run.pane_id.is_empty() && run.status != Status::Closed;
+            if open {
+                name.push(plain(format!("  {} tab open", icons.tab_open()), ACCENT));
+            }
+            RunRow {
+                mark: plain(icon, color),
+                name: Line::from(name),
+                about: run_about(run),
+                started: short_time(&run.started, &now),
+                how: if run.attempt > 0 {
+                    format!("{} {}", run.trigger.label(), run.attempt)
+                } else {
+                    run.trigger.label().to_string()
+                },
+                status: plain(run.status.label(), color),
+                took: match run.status {
+                    // A skipped run never started.
+                    Status::Skipped => String::new(),
+                    s if s.active() => format!("for {}", crate::app::took(run)),
+                    _ => format!("took {}", crate::app::took(run)),
+                },
+            }
         })
         .collect();
-    let head = cols.iter().map(|(_, h, _)| *h).collect();
-    let widths = cols.iter().map(|(_, _, w)| *w).collect();
+    let most = |f: &dyn Fn(&RunRow) -> usize| rows.iter().map(f).max().unwrap_or(0) as u16;
+    let started_w = most(&|r| r.started.width().max(r.how.width())).clamp(7, 14);
+    let inner = area.width.saturating_sub(2);
+    let gap = spacing(inner);
+    // The start time has a column of its own while the run keeps enough
+    // room; else it goes in front of how long the run took.
+    let with_started = {
+        let status_w = most(&|r| r.status.width().max(r.took.width())).clamp(6, 18);
+        inner >= 2 + 3 * gap + NAME_MIN + started_w + status_w
+    };
+    let status_line = |r: &RunRow| {
+        if with_started || r.took.is_empty() {
+            if with_started {
+                r.took.clone()
+            } else {
+                r.started.clone()
+            }
+        } else {
+            format!("{} · {}", r.started, r.took.trim_start_matches("took "))
+        }
+    };
+    let status_w = most(&|r| r.status.width().max(status_line(r).width())).clamp(6, 22);
+    let cols: Vec<Col> = if with_started {
+        vec![
+            Col { head: "", width: 2 },
+            Col {
+                head: "Run",
+                width: inner.saturating_sub(2 + 3 * gap + started_w + status_w),
+            },
+            Col {
+                head: "Started",
+                width: started_w,
+            },
+            Col {
+                head: "Status",
+                width: status_w,
+            },
+        ]
+    } else {
+        vec![
+            Col { head: "", width: 2 },
+            Col {
+                head: "Run",
+                width: inner.saturating_sub(2 + 2 * gap + status_w),
+            },
+            Col {
+                head: "Status",
+                width: status_w,
+            },
+        ]
+    };
+    let cells: Vec<Cells> = rows
+        .into_iter()
+        .map(|r| {
+            let second = faint(status_line(&r));
+            let mut v = vec![[Line::from(r.mark), Line::from("")], [r.name, r.about]];
+            if with_started {
+                v.push([Line::from(plain(r.started, TEXT)), faint(r.how)]);
+            }
+            v.push([Line::from(r.status), second]);
+            v
+        })
+        .collect();
     let sel = app.sel_run;
-    draw_table(frame, app, area, head, widths, rows, sel);
+    draw_list(
+        frame,
+        app,
+        area,
+        Table {
+            list: 2,
+            gap,
+            cols: &cols,
+        },
+        cells,
+        sel,
+    );
 }
 
 // ---- form ----------------------------------------------------------------
 
-const LABEL_W: usize = 18;
+/// The width of the form's labels.
+const LABEL_W: usize = 19;
 
-/// `s` cut to `width` columns, with an ellipsis when cut.
-fn clip(s: &str, width: usize) -> String {
-    if s.width() <= width {
-        return s.to_string();
-    }
-    let mut out = String::new();
-    for c in s.chars() {
-        if out.width() + c.to_string().width() + 1 > width {
-            break;
+/// A typed field's text. Without the cursor it is cut with "…" (a folder
+/// at its start, since its end says the most). With the cursor, the part
+/// around it shows, so what is typed is always in sight.
+fn text_value(
+    value: &str,
+    cursor: Option<usize>,
+    room: usize,
+    from_end: bool,
+) -> Vec<Span<'static>> {
+    let Some(cursor) = cursor else {
+        let shown = if from_end {
+            clip_start(value, room)
+        } else {
+            clip(value, room)
+        };
+        return vec![plain(shown, TEXT)];
+    };
+    let chars: Vec<char> = value.chars().collect();
+    let cursor = cursor.min(chars.len());
+    let width = |from: usize, to: usize| -> usize {
+        chars[from..to].iter().map(|c| c.width().unwrap_or(0)).sum()
+    };
+    // One column is the cursor's.
+    let room = room.saturating_sub(1).max(3);
+    let (mut from, mut to) = (0, chars.len());
+    if width(0, chars.len()) > room {
+        // Slide the window so the cursor is in it, with an ellipsis at
+        // each end that is cut.
+        while from < cursor && width(from, cursor) + 2 > room {
+            from += 1;
         }
-        out.push(c);
+        let lead = usize::from(from > 0);
+        to = cursor;
+        while to < chars.len() {
+            let tail = usize::from(to + 1 < chars.len());
+            if lead + width(from, to + 1) + tail > room {
+                break;
+            }
+            to += 1;
+        }
     }
-    out.push('…');
-    out
+    let text = |from: usize, to: usize| chars[from..to].iter().collect::<String>();
+    let mut v = Vec::new();
+    if from > 0 {
+        v.push(plain("…", FAINT));
+    }
+    v.push(plain(text(from, cursor), TEXT));
+    v.push(plain("▏", ACCENT));
+    v.push(plain(text(cursor, to), TEXT));
+    if to < chars.len() {
+        v.push(plain("…", FAINT));
+    }
+    v
 }
 
-/// A field's value; `room` is the width it has.
-fn field_value(form: &Form, f: Field, selected: bool, room: usize) -> Vec<Span<'static>> {
-    let text = |s: String| Span::styled(s, Style::new().fg(TEXT));
-    let cursor = || Span::styled("▏", Style::new().fg(ACCENT));
+/// A field's value; `room` is the width it has. For a choice it also
+/// gives where its ‹ and › are, counted from the value's start.
+fn field_value(
+    form: &Form,
+    f: Field,
+    selected: bool,
+    room: usize,
+) -> (Vec<Span<'static>>, Option<(u16, u16)>) {
     match f {
-        Field::Prompt => {
-            let first = form
-                .prompt
-                .lines()
-                .find(|l| !l.trim().is_empty())
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            if first.is_empty() {
-                return vec![Span::styled("empty · ⏎ writes it", Style::new().fg(YELLOW))];
-            }
-            let n = form.prompt.trim_end().lines().count();
-            let more = if n > 1 {
-                format!("  ({n} lines)")
+        Field::More => {
+            let (sign, words) = if form.more {
+                ("▾ ", "shown below".to_string())
             } else {
-                String::new()
+                ("▸ ", form.more_summary())
             };
-            vec![
-                text(clip(&first, room.saturating_sub(more.width()).max(10))),
-                Span::styled(more, Style::new().fg(FAINT)),
-            ]
+            (
+                vec![
+                    plain(sign, ACCENT),
+                    plain(clip(&words, room.saturating_sub(2)), FAINT),
+                ],
+                None,
+            )
         }
         f if f.is_choice() => {
-            // ‹ › show that ← → step through the choices.
-            let arrow = Style::new().fg(if selected { ACCENT } else { FAINT });
+            // ‹ › show that ← → (or a click on them) step through the
+            // choices.
+            let arrow = if selected { ACCENT } else { FAINT };
+            let shown = clip(&form.shown(f), room.saturating_sub(4));
             let value = if f == Field::Enabled {
-                Span::styled(
-                    form.shown(f),
-                    Style::new().fg(if form.enabled { GREEN } else { RED }),
-                )
+                plain(shown.clone(), if form.enabled { GREEN } else { MUTED })
             } else {
-                text(form.shown(f))
+                plain(shown.clone(), TEXT)
             };
-            let mut v = vec![Span::styled("‹ ", arrow), value, Span::styled(" ›", arrow)];
+            let right = 2 + shown.width() as u16;
+            let mut v = vec![plain("‹ ", arrow), value, plain(" ›", arrow)];
             let detail = form.detail(f);
             // The short detail only when it fits whole; the explanation
             // below the form says more.
-            let left = room.saturating_sub(form.shown(f).width() + 6);
+            let left = room.saturating_sub(shown.width() + 6);
             if !detail.is_empty() && detail.width() <= left {
-                v.push(Span::styled(format!("  {detail}"), Style::new().fg(FAINT)));
+                v.push(plain(format!("  {detail}"), FAINT));
             }
-            v
+            (v, Some((0, right)))
         }
         f => {
-            let value = match f {
-                Field::Name => form.name.clone(),
-                Field::Args => form.args.clone(),
-                Field::Folder => form.folder.clone(),
-                Field::Time => form.time.clone(),
-                Field::Cron => form.cron.clone(),
-                Field::Limit => form.limit.clone(),
-                Field::Date => form.date.clone(),
-                Field::Check => form.check.clone(),
-                _ => String::new(),
-            };
-            let value = if f == Field::Check {
-                clip(&value, room.saturating_sub(1).max(10))
-            } else {
-                value
-            };
-            let mut v = Vec::new();
-            if value.is_empty() && !selected {
+            let value = form.text(f).unwrap_or("").to_string();
+            let suffix = if f == Field::Limit { " minutes" } else { "" };
+            let room = room.saturating_sub(suffix.width());
+            let mut v = if value.is_empty() && !selected {
                 let empty = match f {
                     Field::Name => "required",
                     Field::Args => "none",
                     Field::Check => "none, always runs",
                     _ => "",
                 };
-                v.push(Span::styled(empty, Style::new().fg(FAINT)));
+                vec![plain(empty, FAINT)]
             } else {
-                v.push(text(value));
+                text_value(
+                    &value,
+                    selected.then_some(form.cursor),
+                    room,
+                    f == Field::Folder,
+                )
+            };
+            if !suffix.is_empty() {
+                v.push(plain(suffix, FAINT));
             }
-            if selected {
-                v.push(cursor());
-            }
-            if f == Field::Limit {
-                v.push(Span::styled(" minutes", Style::new().fg(FAINT)));
-            }
-            v
+            (v, None)
         }
     }
 }
@@ -1087,9 +1665,9 @@ enum FormRow {
     More(usize),
 }
 
-/// The schedule in words for the Schedule heading, such as "runs weekdays
-/// at 09:00 · next Wed 09:00", or what is wrong with it.
-fn schedule_summary(form: &crate::form::Form) -> Span<'static> {
+/// The schedule in words for the When heading, such as "runs weekdays at
+/// 09:00 · next Wed 09:00", or what is wrong with it.
+fn schedule_summary(form: &Form) -> Span<'static> {
     let now = Local::now();
     match form.schedule() {
         Ok(c) => {
@@ -1098,19 +1676,26 @@ fn schedule_summary(form: &crate::form::Form) -> Span<'static> {
                 .next_after(&now)
                 .map(|t| format!(" · next {}", short_time(&t, &now)))
                 .unwrap_or_default();
-            // "Weekdays at 09:00" reads "runs weekdays at 09:00".
+            // "Weekdays at 09:00" reads "runs weekdays at 09:00"; the name
+            // of a day keeps its capital.
             let words = schedule.describe();
+            let day = crate::form::WEEKDAYS
+                .iter()
+                .any(|d| words.starts_with(&d[..3]));
             let mut chars = words.chars();
             let words = match chars.next() {
-                Some(first) => first.to_lowercase().chain(chars).collect::<String>(),
-                None => words,
+                Some(first) if !day => first.to_lowercase().chain(chars).collect::<String>(),
+                _ => words,
             };
-            Span::styled(format!("runs {words}{next}"), Style::new().fg(GREEN))
+            plain(format!("runs {words}{next}"), GREEN)
         }
-        Err(e) => Span::styled(e, Style::new().fg(RED)),
+        Err(e) => plain(e, RED),
     }
 }
 
+/// The form: what the routine does, when and where it runs, then "More
+/// settings". The save button and the explanation of the current field
+/// stay in sight below the fields, however long the list above gets.
 fn draw_form(frame: &mut Frame, app: &mut App, area: Rect) {
     let Some(form) = app.form.as_deref().cloned() else {
         return;
@@ -1121,19 +1706,38 @@ fn draw_form(frame: &mut Frame, app: &mut App, area: Rect) {
         area.width.saturating_sub(2),
         area.height,
     );
+    let width = inner.width as usize;
     let fields = form.fields();
     let current = form.current();
-    // The rows: a heading at the start of each part of the form, and an
-    // empty row before the save button.
-    // An empty row closes each part, so the parts read apart; in a window
-    // too low for everything, only the one before the save button stays.
+    let save_at = fields.iter().position(|f| *f == Field::Save);
+
+    // Below the fields: what the current field means, set off by an accent
+    // bar like a tooltip. Up to four lines.
+    let mut hint = wrap(form.hint(current), width.saturating_sub(4));
+    let show_hint = inner.height >= 12;
+    if hint.len() > 4 {
+        hint.truncate(4);
+        if let Some(last) = hint.last_mut() {
+            *last = clip(&format!("{last} …"), width.saturating_sub(4));
+        }
+    }
+    // A row between fields and button (it says what is out of sight), the
+    // button, and the explanation with a gap above it.
+    let fixed = 2 + if show_hint { 2 + hint.len() } else { 0 };
+    let list_h = (inner.height as usize).saturating_sub(fixed).max(1);
+
+    // The rows: a heading at the start of each part. An empty row closes
+    // each part when the window is tall enough for all of it.
     let layout = |spaced: bool| {
         let mut rows: Vec<FormRow> = Vec::new();
-        let mut last = "";
+        let mut last = "-";
         for (i, f) in fields.iter().enumerate() {
+            if *f == Field::Save {
+                continue;
+            }
             let s = form.section(*f);
             if s != last {
-                if s.is_empty() || (spaced && !rows.is_empty()) {
+                if spaced && !rows.is_empty() {
                     rows.push(FormRow::Blank);
                 }
                 if !s.is_empty() {
@@ -1146,22 +1750,23 @@ fn draw_form(frame: &mut Frame, app: &mut App, area: Rect) {
         rows
     };
     let mut rows = layout(true);
-    // Room needed below the fields: gaps and the explanation (5 rows).
-    if rows.len() + 5 > inner.height as usize {
+    if rows.len() > list_h {
         rows = layout(false);
     }
     // The prompt shows its first lines, as many as fit (up to eight), and
     // ends in "…" when it goes on.
-    let value_w = (inner.width as usize).saturating_sub(LABEL_W + 2).max(10);
+    let value_x = inner.x + 1 + LABEL_W as u16;
+    let value_w = width.saturating_sub(LABEL_W + 2).max(10);
     let mut preview: Vec<String> = Vec::new();
     for l in form.prompt.trim_end().lines() {
-        if preview.is_empty() && l.trim().is_empty() {
+        if l.trim().is_empty() {
             continue;
         }
         preview.extend(wrap(&l.replace('\t', "    "), value_w));
     }
     let prompt_at = fields.iter().position(|f| *f == Field::Prompt);
-    let free = (inner.height as usize).saturating_sub(rows.len() + 3 + 2);
+    // One row stays empty, so the form does not touch what is below it.
+    let free = list_h.saturating_sub(rows.len() + 1);
     let extra = preview.len().saturating_sub(1).min(free).min(7);
     if let Some(p) = prompt_at {
         if let Some(at) = rows.iter().position(|r| *r == FormRow::Field(p)) {
@@ -1172,75 +1777,53 @@ fn draw_form(frame: &mut Frame, app: &mut App, area: Rect) {
     }
     let cut = preview.len() > extra + 1;
     let preview_line = |j: usize| -> Vec<Span<'static>> {
-        let mut line = preview.get(j).cloned().unwrap_or_default();
+        let line = preview.get(j).cloned().unwrap_or_default();
         if cut && j == extra {
-            // Room for the "…" that says it goes on.
-            let w = line.width();
-            if w + 2 > value_w {
-                line = clip(&line, value_w.saturating_sub(2));
-                line = line.trim_end_matches('…').to_string();
+            // One "…" says it goes on: its own, or the one of a line that
+            // has no room for it.
+            if line.width() + 2 > value_w {
+                return vec![plain(clip(&format!("{line}…"), value_w), TEXT)];
             }
-            return vec![
-                Span::styled(line, Style::new().fg(TEXT)),
-                Span::styled(" …", Style::new().fg(ACCENT)),
-            ];
+            return vec![plain(line, TEXT), plain(" …", ACCENT)];
         }
-        vec![Span::styled(line, Style::new().fg(TEXT))]
+        vec![plain(line, TEXT)]
     };
-    // Below the fields: what the current field means, set off by an accent
-    // bar like a tooltip. A click on a field selects it and so shows its
-    // explanation.
-    let mut hint = wrap(form.hint(current), inner.width.saturating_sub(4) as usize);
-    // Up to four lines, fewer when the fields would no longer all fit.
-    let spare = (inner.height as usize).saturating_sub(rows.len() + 3);
-    let hint_rows = spare.clamp(2, 4);
-    if hint.len() > hint_rows {
-        hint.truncate(hint_rows);
-        if let Some(last) = hint.last_mut() {
-            last.push('…');
+
+    // The list scrolls only when the current field would leave the
+    // window; the heading of its part stays in view with it.
+    let mut top = form.top.min(rows.len().saturating_sub(list_h));
+    if let Some(sel) = rows.iter().position(|r| *r == FormRow::Field(form.field)) {
+        if sel < top {
+            top = sel;
+            if sel > 0 && matches!(rows[sel - 1], FormRow::Head(_)) {
+                top -= 1;
+            }
+        } else if sel >= top + list_h {
+            top = sel + 1 - list_h;
         }
     }
-    let hint_shown = hint.len().min(hint_rows) as u16;
-    // gap, title, text, and a gap before the footer
-    let below = if inner.height >= 12 {
-        3 + hint_shown
-    } else {
-        0
-    };
-    let list_h = inner.height.saturating_sub(below);
-    let sel = rows
-        .iter()
-        .position(|r| *r == FormRow::Field(form.field))
-        .unwrap_or(0);
-    let mut first = offset(sel, rows.len(), list_h as usize);
-    // Keep the heading of the selected field's part in view.
-    if first == sel && sel > 0 && matches!(rows[sel - 1], FormRow::Head(_)) {
-        first -= 1;
+    if let Some(f) = app.form.as_mut() {
+        f.top = top;
     }
+
     let schedule_words = schedule_summary(&form);
-    for (r, layout_row) in rows.iter().enumerate() {
-        if r < first || r >= first + list_h as usize {
-            continue;
-        }
-        let y = inner.y + (r - first) as u16;
+    for (r, layout_row) in rows.iter().enumerate().skip(top).take(list_h) {
+        let y = inner.y + (r - top) as u16;
         let row = Rect::new(inner.x, y, inner.width, 1);
         let i = match layout_row {
             FormRow::Blank => continue,
             FormRow::Head(name) => {
                 let mut spans = vec![Span::styled(format!(" {name}"), bold(ACCENT))];
-                if *name == "Schedule" {
+                if *name == "When" {
                     spans.push(Span::raw("  "));
                     spans.push(schedule_words.clone());
                 }
                 let used = Line::from(spans.clone()).width();
-                let rule = (inner.width as usize).saturating_sub(used + 2);
+                let rule = width.saturating_sub(used + 2);
                 if rule > 2 {
-                    spans.push(Span::styled(
-                        format!(" {}", "─".repeat(rule)),
-                        Style::new().fg(BORDER),
-                    ));
+                    spans.push(plain(format!(" {}", "─".repeat(rule)), BORDER));
                 }
-                frame.render_widget(Paragraph::new(Line::from(spans)), row);
+                frame.render_widget(Paragraph::new(clip_line(Line::from(spans), width)), row);
                 continue;
             }
             FormRow::More(j) => {
@@ -1257,63 +1840,122 @@ fn draw_form(frame: &mut Frame, app: &mut App, area: Rect) {
             }
             FormRow::Field(i) => *i,
         };
-        let f = &fields[i];
+        let f = fields[i];
         let selected = i == form.field;
         if selected {
             frame.render_widget(Block::new().style(Style::new().bg(SELECTED_BG)), row);
         }
         app.hits.push((row, Hit::Field(i)));
-        let label = format!(" {:<w$}", form.label(*f), w = LABEL_W);
+        let label = format!(" {:<w$}", form.label(f), w = LABEL_W);
         let label_style = if selected {
             bold(TEXT)
         } else {
             Style::new().fg(MUTED)
         };
         let mut spans = vec![Span::styled(label, label_style)];
-        if *f == Field::Save {
-            let x = inner.x + 1 + LABEL_W as u16;
-            spans = vec![Span::raw(" ".repeat(LABEL_W + 1))];
-            spans.push(button("⏎ save", selected));
-            spans.push(Span::raw("  "));
-            spans.push(button("Esc back", false));
-            app.hits
-                .push((Rect::new(x + 10, y, 10, 1), Hit::Key('\u{1b}')));
-            // Whether it can be saved, right beside the button.
-            spans.push(Span::raw("   "));
-            spans.push(match form.build() {
-                Ok(_) => Span::styled("ready to save", Style::new().fg(GREEN)),
-                Err(e) => Span::styled(format!("not ready: {e}"), Style::new().fg(YELLOW)),
-            });
-        } else if *f == Field::Prompt && !preview.is_empty() {
-            spans.extend(preview_line(0));
+        if f == Field::Prompt {
+            if preview.is_empty() {
+                spans.push(plain("empty · ⏎ writes it", YELLOW));
+            } else {
+                spans.extend(preview_line(0));
+            }
         } else {
-            let room = (inner.width as usize).saturating_sub(LABEL_W + 2);
-            spans.extend(field_value(&form, *f, selected, room));
+            let (value, arrows) = field_value(&form, f, selected, value_w);
+            spans.extend(value);
+            // A click on ‹ or › steps like ← and →.
+            if let Some((left, right)) = arrows {
+                app.hits
+                    .push((Rect::new(value_x + left, y, 2, 1), Hit::Cycle(i, -1)));
+                app.hits
+                    .push((Rect::new(value_x + right, y, 2, 1), Hit::Cycle(i, 1)));
+            }
         }
-        frame.render_widget(Paragraph::new(Line::from(spans)), row);
+        let mut line = clip_line(Line::from(spans), width);
+        if selected {
+            line = relight(line);
+        }
+        frame.render_widget(Paragraph::new(line), row);
     }
-    if below == 0 || inner.height <= list_h {
+
+    // Right under the fields, so it reads as part of the form.
+    let shown = rows.len().saturating_sub(top).min(list_h) as u16;
+    let y = inner.y + shown;
+    if y + 1 >= inner.bottom() {
         return;
     }
-    // Right under the fields, so it reads as part of the form.
-    let shown = (rows.len() - first).min(list_h as usize) as u16;
-    let y = inner.y + shown - 1;
-    if below > 2 {
-        let bar = || Span::styled("▎ ", Style::new().fg(ACCENT));
-        let mut lines = vec![Line::from(vec![
-            bar(),
-            Span::styled(form.label(current), bold(TEXT)),
-        ])];
-        lines.extend(
-            hint.into_iter()
-                .take(hint_rows)
-                .map(|l| Line::from(vec![bar(), Span::styled(l, Style::new().fg(MUTED))])),
-        );
+    // What is out of sight above and below.
+    let hidden = |range: std::ops::Range<usize>| {
+        rows.get(range)
+            .map(|r| r.iter().filter(|r| matches!(r, FormRow::Field(_))).count())
+            .unwrap_or(0)
+    };
+    let (above, below) = (hidden(0..top), hidden(top + list_h..rows.len()));
+    let more = match (above, below) {
+        (0, 0) => String::new(),
+        (a, 0) => format!("↑ {a} more above"),
+        (0, b) => format!("↓ {b} more below"),
+        (a, b) => format!("↑ {a} above · ↓ {b} below"),
+    };
+    frame.render_widget(
+        Paragraph::new(plain(more.clone(), MUTED)).alignment(Alignment::Right),
+        Rect::new(inner.x, y, inner.width.saturating_sub(1), 1),
+    );
+    // The save button, always in sight, and whether it can be saved.
+    let on_save = save_at == Some(form.field);
+    let save = button("⏎ save", on_save);
+    let back = button("Esc back", false);
+    let x = inner.x + 1;
+    let (save_w, back_w) = (save.width() as u16, back.width() as u16);
+    if let Some(i) = save_at {
+        app.hits
+            .push((Rect::new(x, y + 1, save_w, 1), Hit::Field(i)));
+    }
+    app.hits.push((
+        Rect::new(x + save_w + 2, y + 1, back_w, 1),
+        Hit::Key('\u{1b}'),
+    ));
+    let status = match form.build() {
+        Ok(_) => plain("ready to save", GREEN),
+        Err(e) => plain(format!("not ready: {e}"), YELLOW),
+    };
+    let beside = width.saturating_sub((save_w + back_w) as usize + 7);
+    let mut buttons = vec![Span::raw(" "), save, Span::raw("  "), back];
+    if status.width() <= beside {
+        buttons.push(Span::raw("   "));
+        buttons.push(status);
+    } else {
+        // Too long to sit beside the buttons: on the row above them.
+        let room = width.saturating_sub(more.width() + 3);
         frame.render_widget(
-            Paragraph::new(Text::from(lines)),
-            Rect::new(inner.x + 1, y + 2, inner.width.saturating_sub(2), below - 2),
+            Paragraph::new(clip_line(Line::from(vec![Span::raw(" "), status]), room)),
+            Rect::new(inner.x, y, inner.width, 1),
         );
     }
+    frame.render_widget(
+        Paragraph::new(Line::from(buttons)),
+        Rect::new(inner.x, y + 1, inner.width, 1),
+    );
+    if !show_hint || y + 3 >= inner.bottom() {
+        return;
+    }
+    let bar = || plain("▎ ", ACCENT);
+    let mut lines = vec![Line::from(vec![
+        bar(),
+        Span::styled(form.label(current), bold(TEXT)),
+    ])];
+    lines.extend(
+        hint.into_iter()
+            .map(|l| Line::from(vec![bar(), plain(l, MUTED)])),
+    );
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)),
+        Rect::new(
+            inner.x + 1,
+            y + 3,
+            inner.width.saturating_sub(2),
+            inner.bottom() - (y + 3),
+        ),
+    );
 }
 
 // ---- editor --------------------------------------------------------------
@@ -1350,17 +1992,29 @@ fn draw_editor(frame: &mut Frame, app: &mut App, area: Rect) {
     }
     app.hits.push((text, Hit::Text));
     let rows = ed.text.rows();
-    if ed.text.lines.len() == 1 && ed.text.lines[0].is_empty() {
+    let empty = ed.text.lines.len() == 1 && ed.text.lines[0].is_empty();
+    if empty {
+        let what = if matches!(&ed.target, EditTarget::File(_)) {
+            "The file is empty."
+        } else {
+            "Write what the agent should do, as you would type it to the agent."
+        };
+        let lines: Vec<Line> = wrap(what, width.saturating_sub(1))
+            .into_iter()
+            .map(|l| Line::from(plain(l, FAINT)))
+            .collect();
         frame.render_widget(
-            Paragraph::new(Span::styled(
-                "Write what the agent should do, as you would type it to the agent.",
-                Style::new().fg(FAINT),
-            )),
-            Rect::new(text.x + 1, text.y, text.width.saturating_sub(1), 1),
+            Paragraph::new(Text::from(lines)),
+            Rect::new(
+                text.x + 1,
+                text.y,
+                text.width.saturating_sub(1),
+                text.height,
+            ),
         );
     }
     let marked = ed.text.selection();
-    let plain = Style::new().fg(TEXT);
+    let normal = Style::new().fg(TEXT);
     let mark = Style::new().fg(TEXT).bg(MARK_BG);
     let lines: Vec<Line> = rows
         .iter()
@@ -1375,7 +2029,7 @@ fn draw_editor(frame: &mut Frame, app: &mut App, area: Rect) {
                 let c = ed.text.lines[l][col];
                 let m = marked.is_some_and(|(a, b)| (l, col) >= a && (l, col) < b);
                 if m != run_marked && !run.is_empty() {
-                    let style = if run_marked { mark } else { plain };
+                    let style = if run_marked { mark } else { normal };
                     spans.push(Span::styled(std::mem::take(&mut run), style));
                 }
                 run_marked = m;
@@ -1389,7 +2043,7 @@ fn draw_editor(frame: &mut Frame, app: &mut App, area: Rect) {
             let next_marked = marked.is_some_and(|(a, b)| (l, e) >= a && (l, e) < b);
             let last_of_line = e == ed.text.lines[l].len();
             if !run.is_empty() {
-                let style = if run_marked { mark } else { plain };
+                let style = if run_marked { mark } else { normal };
                 spans.push(Span::styled(run, style));
             }
             if last_of_line && next_marked {
@@ -1398,7 +2052,7 @@ fn draw_editor(frame: &mut Frame, app: &mut App, area: Rect) {
             Line::from(spans)
         })
         .collect();
-    if !(ed.text.lines.len() == 1 && ed.text.lines[0].is_empty()) {
+    if !empty {
         frame.render_widget(Paragraph::new(Text::from(lines)), text);
     }
     let (cy, cx) = ed.text.cursor();
@@ -1412,7 +2066,7 @@ fn draw_editor(frame: &mut Frame, app: &mut App, area: Rect) {
         let w = label.width() as u16;
         if outer.width > w + 4 {
             frame.render_widget(
-                Paragraph::new(Span::styled(label, Style::new().fg(FAINT))),
+                Paragraph::new(plain(label, MUTED)),
                 Rect::new(outer.x + outer.width - w - 2, outer.bottom() - 1, w, 1),
             );
         }
@@ -1421,154 +2075,370 @@ fn draw_editor(frame: &mut Frame, app: &mut App, area: Rect) {
 
 // ---- footer ----------------------------------------------------------------
 
+/// A key in the footer: what it does, what a click on it sends, and how
+/// soon it gives way when the footer is narrow (0 stays longest).
+struct FootKey {
+    key: String,
+    what: String,
+    hit: Option<Hit>,
+    rank: u8,
+}
+
+fn foot(key: &str, what: impl Into<String>, hit: Option<Hit>, rank: u8) -> FootKey {
+    FootKey {
+        key: key.to_string(),
+        what: what.into(),
+        hit,
+        rank,
+    }
+}
+
+const ESC: Option<Hit> = Some(Hit::Key('\u{1b}'));
+const ENTER: Option<Hit> = Some(Hit::Key('\n'));
+
+fn hit(key: char) -> Option<Hit> {
+    Some(Hit::Key(key))
+}
+
+/// The keys of what is in front: the open dialog's, else the editor's,
+/// the form's or the list's. To offer a key in the footer, add it here,
+/// in the place it should show, with its rank.
+fn footer_keys(app: &App) -> Vec<FootKey> {
+    match &app.mode {
+        Mode::Help => vec![foot("↑ ↓", "scroll", None, 1), foot("Esc", "close", ESC, 0)],
+        Mode::Pick(p) => vec![
+            foot("⏎", "choose", ENTER, 0),
+            if p.filters() {
+                foot("type", "to narrow the list", None, 2)
+            } else {
+                foot("1–9", "choose by number", None, 2)
+            },
+            foot("Esc", "back", ESC, 0),
+        ],
+        Mode::Input(_) => vec![foot("⏎", "ok", ENTER, 0), foot("Esc", "cancel", ESC, 0)],
+        Mode::Confirm(c) => {
+            let mut v = vec![foot(
+                if c.enter_confirms() { "y ⏎" } else { "y" },
+                c.yes(),
+                hit('y'),
+                0,
+            )];
+            if matches!(c.purpose, crate::app::ConfirmFor::Delete(_, true)) {
+                v.push(foot("r", "delete with its runs", hit('r'), 0));
+            }
+            v.push(foot("n", c.no(), hit('n'), 0));
+            v
+        }
+        Mode::Message { .. } => {
+            let mut v = vec![foot("⏎", "ok", ENTER, 0)];
+            if app.help_max > 0 {
+                v.push(foot("↑ ↓", "scroll", None, 1));
+            }
+            v
+        }
+        Mode::Log(log) => {
+            let mut v = Vec::new();
+            if log.approve.is_some() {
+                v.push(if log.scroll >= log.max {
+                    foot("y", "approve", hit('y'), 0)
+                } else {
+                    foot("↓", "read to the end to approve", None, 0)
+                });
+            }
+            v.push(foot("Esc", "close", ESC, 0));
+            if log.file.is_some() {
+                v.push(foot("f", "open file", hit('f'), 2));
+            }
+            if log.max > 0 {
+                v.push(foot("↑ ↓", "scroll", None, 1));
+            }
+            v
+        }
+        Mode::Cron(_) => vec![
+            foot("⏎", "choose", ENTER, 1),
+            foot("k", "keep as a cron job", hit('k'), 2),
+            foot("m", "move to Herdr", hit('m'), 2),
+            foot("c", "copy", hit('c'), 2),
+            foot("Esc", "back", ESC, 0),
+        ],
+        Mode::Menu(_) => vec![foot("⏎", "choose", ENTER, 0), foot("Esc", "close", ESC, 0)],
+        Mode::AskQuit => Vec::new(),
+        Mode::Normal => {
+            if let Some(ed) = &app.editor {
+                editor_keys(ed)
+            } else if let Some(form) = &app.form {
+                form_keys(form)
+            } else {
+                list_keys(app)
+            }
+        }
+    }
+}
+
+fn editor_keys(ed: &crate::app::Editor) -> Vec<FootKey> {
+    vec![
+        foot(
+            "Esc",
+            // A routine's own prompt is written at once; the form's is
+            // kept until the form is saved.
+            if ed.target == EditTarget::Form {
+                "back to the form"
+            } else {
+                "save and close"
+            },
+            ESC,
+            0,
+        ),
+        foot("Ctrl+D", "discard", Some(Hit::Ctrl('d')), 1),
+        foot("Ctrl+Z", "undo", Some(Hit::Ctrl('z')), 2),
+        foot("Ctrl+Y", "redo", Some(Hit::Ctrl('y')), 3),
+        foot("Ctrl+O", "other editor", Some(Hit::Ctrl('o')), 4),
+    ]
+}
+
+fn form_keys(form: &Form) -> Vec<FootKey> {
+    let f = form.current();
+    let enter = match f {
+        Field::Prompt if form.is_shell() => "write the command",
+        Field::Prompt => "write the prompt",
+        Field::Save => "save",
+        Field::More if form.more => "hide",
+        Field::More => "show",
+        f if f.is_choice() => "choose",
+        _ => "next",
+    };
+    let mut v = vec![foot("⏎", enter, ENTER, 0)];
+    if f.is_choice() {
+        v.push(foot("← →", "change", None, 2));
+    }
+    if f.is_text() {
+        v.push(foot("← →", "cursor", None, 4));
+    }
+    v.push(foot("↑ ↓", "field", None, 3));
+    v.push(foot("Ctrl+S", "save", Some(Hit::Ctrl('s')), 0));
+    v.push(foot("Esc", "back", ESC, 0));
+    if f.is_text() {
+        v.push(foot("Ctrl+U", "clear", Some(Hit::Ctrl('u')), 5));
+    } else {
+        // In a text field `?` is typed.
+        v.push(foot("?", "all keys", hit('?'), 1));
+    }
+    v
+}
+
+fn list_keys(app: &App) -> Vec<FootKey> {
+    let help = foot("?", "all keys", hit('?'), 0);
+    let close = foot("q", "close", hit('q'), 2);
+    match app.view {
+        View::Cron if app.selected_cron_job().is_some() => vec![
+            foot("⏎", "take it over", ENTER, 0),
+            foot("n", "new", hit('n'), 1),
+            foot("C", "take over all", hit('C'), 3),
+            help,
+            close,
+        ],
+        View::Routines | View::Cron => {
+            let Some(r) = app.selected_routine() else {
+                // An empty list: only what works without a routine.
+                return vec![foot("n", "new", hit('n'), 0), help, close];
+            };
+            let pending = !r.approved && !r.unreadable;
+            let run = app.latest_run(&r.id);
+            let open = run
+                .is_some_and(|run| !run.tab_closed && run.cron_pid == 0 && !run.pane_id.is_empty());
+            let needs_you = run.is_some_and(|run| run.status == Status::NeedsYou);
+            let mut v = vec![foot("⏎", "edit", ENTER, 0), foot("n", "new", hit('n'), 1)];
+            v.push(if pending {
+                foot("a", "approve", hit('a'), 0)
+            } else {
+                foot("r", "run now", hit('r'), 1)
+            });
+            v.push(foot("space", "on/off", hit(' '), 2));
+            // The run that waits for the owner comes before the rest.
+            if open {
+                v.push(foot(
+                    "o",
+                    "go to its tab",
+                    hit('o'),
+                    if needs_you { 0 } else { 3 },
+                ));
+            }
+            if run.is_some() {
+                v.push(foot("l", "output", hit('l'), 3));
+                v.push(foot("h", "its runs", hit('h'), 4));
+            }
+            v.push(foot(
+                "p",
+                if r.is_shell() { "command" } else { "prompt" },
+                hit('p'),
+                5,
+            ));
+            v.push(foot("c", "duplicate", hit('c'), 6));
+            v.push(foot("d", "delete", hit('d'), 6));
+            v.push(help);
+            v.push(close);
+            v
+        }
+        View::Runs => {
+            let mut v = Vec::new();
+            let run = app.runs.get(app.sel_run);
+            if let Some(run) = run {
+                let open = !run.tab_closed && run.cron_pid == 0 && !run.pane_id.is_empty();
+                if open {
+                    v.push(foot("⏎", "go to its tab", ENTER, 0));
+                    v.push(foot("l", "output", hit('l'), 1));
+                } else {
+                    v.push(foot("⏎", "output", ENTER, 0));
+                }
+            }
+            match (app.run_filter.is_some(), app.filter_from) {
+                (true, Some(_)) => v.push(foot("Esc", "back to the routine", ESC, 1)),
+                (true, None) => v.push(foot("Esc", "all runs", ESC, 1)),
+                (false, _) if run.is_some() => v.push(foot("h", "only its runs", hit('h'), 3)),
+                _ => {}
+            }
+            if let Some(run) = run {
+                v.push(foot("f", "open file", hit('f'), 4));
+                if !run.status.active() {
+                    v.push(foot("d", "delete", hit('d'), 5));
+                }
+            }
+            v.push(help);
+            v.push(close);
+            v
+        }
+    }
+}
+
+/// How many rows the footer needs: one, or more when a message does not
+/// fit on one line (up to three).
+fn footer_height(app: &App, width: u16) -> u16 {
+    match (&app.flash, &app.mode) {
+        (_, Mode::AskQuit) | (None, _) => 1,
+        (Some(flash), _) => wrap(&flash.text, width.saturating_sub(2) as usize)
+            .len()
+            .clamp(1, 3) as u16,
+    }
+}
+
 fn draw_footer(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(Block::new().style(Style::new().bg(BAR_BG)), area);
+    let width = area.width as usize;
     if app.mode == Mode::AskQuit {
-        let question = " Close the list? Routines keep running. ";
-        let qw = question.width() as u16;
+        let question = if width >= 60 {
+            " Close the list? Routines keep running. "
+        } else {
+            " Close the list? "
+        };
+        let (yes, no) = (" y close ", " n stay ");
+        let x = area.x + question.width() as u16;
         let line = Line::from(vec![
             Span::styled(question, bold(TEXT)),
             Span::styled(
-                " y close ",
+                yes,
                 Style::new()
                     .fg(theme::on(RED))
                     .bg(RED)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" "),
-            Span::styled(" any other key stays ", Style::new().fg(TEXT).bg(BORDER)),
+            Span::styled(no, Style::new().fg(TEXT).bg(BORDER)),
         ]);
         app.hits
-            .push((Rect::new(area.x + qw, area.y, 9, 1), Hit::Key('y')));
-        app.hits
-            .push((Rect::new(area.x + qw + 10, area.y, 21, 1), Hit::Key('n')));
-        frame.render_widget(Paragraph::new(line), area);
+            .push((Rect::new(x, area.y, yes.width() as u16, 1), Hit::Key('y')));
+        app.hits.push((
+            Rect::new(x + yes.width() as u16 + 1, area.y, no.width() as u16, 1),
+            Hit::Key('n'),
+        ));
+        frame.render_widget(Paragraph::new(clip_line(line, width)), area);
         return;
     }
-    let right = if let Some((text, color, _)) = &app.flash {
-        Span::styled(format!("{text} "), Style::new().fg(*color))
-    } else if let Some(ed) = &app.editor {
-        Span::styled(
-            format!("line {} of {} ", ed.text.row + 1, ed.text.lines.len()),
-            Style::new().fg(FAINT),
-        )
-    } else {
-        Span::raw("")
-    };
-    let right_w = (right.width() as u16).min(area.width / 2);
-    let [left_area, right_area] =
-        Layout::horizontal([Constraint::Fill(1), Constraint::Length(right_w)]).areas(area);
-    frame.render_widget(
-        Paragraph::new(Line::from(right)).alignment(Alignment::Right),
-        right_area,
-    );
-
-    let keys: Vec<(&str, &str, Option<Hit>)> = if app.editor.is_some() {
-        vec![
-            ("Esc", "done", Some(Hit::Key('\u{1b}'))),
-            ("Ctrl+Z", "undo", Some(Hit::Ctrl('z'))),
-            ("Ctrl+Y", "redo", Some(Hit::Ctrl('y'))),
-        ]
-    } else if let Some(form) = &app.form {
-        let f = form.current();
-        let enter = match f {
-            Field::Prompt => "edit prompt",
-            Field::Save => "save",
-            f if f.is_choice() => "choose",
-            _ => "next",
-        };
-        let mut v = vec![("⏎", enter, Some(Hit::Key('\n')))];
-        if f.is_choice() {
-            v.push(("← →", "change", None));
-        }
-        v.extend([
-            ("↑ ↓", "field", None),
-            ("Ctrl+S", "save", Some(Hit::Ctrl('s'))),
-            ("Esc", "back", Some(Hit::Key('\u{1b}'))),
-        ]);
-        if !f.is_text() {
-            v.push(("?", "all keys", Some(Hit::Key('?'))));
-        }
-        v
-    } else {
-        let pending = app
-            .selected_routine()
-            .is_some_and(|r| !r.approved && !r.unreadable);
-        match app.view {
-            View::Cron if app.selected_cron_job().is_some() => vec![
-                ("⏎", "manage it here", Some(Hit::Key('\n'))),
-                ("n", "new", Some(Hit::Key('n'))),
-                ("C", "all cron jobs", Some(Hit::Key('C'))),
-                ("?", "all keys", Some(Hit::Key('?'))),
-                ("q", "close", Some(Hit::Key('q'))),
-            ],
-            View::Routines | View::Cron => vec![
-                ("⏎", "edit", Some(Hit::Key('\n'))),
-                ("n", "new", Some(Hit::Key('n'))),
-                if pending {
-                    ("a", "approve", Some(Hit::Key('a')))
-                } else {
-                    ("r", "run now", Some(Hit::Key('r')))
-                },
-                ("space", "on/off", Some(Hit::Key(' '))),
-                ("?", "all keys", Some(Hit::Key('?'))),
-                ("q", "close", Some(Hit::Key('q'))),
-            ],
-            View::Runs => {
-                let mut v = vec![
-                    ("⏎", "go to its tab", Some(Hit::Key('\n'))),
-                    ("l", "output", Some(Hit::Key('l'))),
-                ];
-                if app.run_filter.is_some() {
-                    v.push(("Esc", "all runs", Some(Hit::Key('\u{1b}'))));
-                } else {
-                    v.push(("h", "only this routine", Some(Hit::Key('h'))));
+    // A message gets the room it needs: beside the keys when it is short,
+    // the whole footer (over several rows) when it is long. It is never
+    // cut short of the footer's three rows, and then ends in "…".
+    let mut right_w = 0;
+    if let Some(flash) = &app.flash {
+        let mut lines = wrap(&flash.text, width.saturating_sub(2));
+        if lines.len() > 1 {
+            if lines.len() > area.height as usize {
+                lines.truncate(area.height as usize);
+                if let Some(last) = lines.last_mut() {
+                    *last = clip(&format!("{last} …"), width.saturating_sub(2));
                 }
-                v.extend([
-                    ("?", "all keys", Some(Hit::Key('?'))),
-                    ("q", "close", Some(Hit::Key('q'))),
-                ]);
-                v
             }
+            let text: Vec<Line> = lines
+                .into_iter()
+                .map(|l| Line::from(plain(format!(" {l}"), flash.color)))
+                .collect();
+            frame.render_widget(Paragraph::new(Text::from(text)), area);
+            return;
         }
-    };
-    let mut spans = vec![Span::raw(" ")];
-    let mut x = left_area.x + 1;
-    for (key, what, click) in keys {
-        let text = format!(" {what}  ");
-        let width = (key.width() + text.width()) as u16;
-        if x + width > left_area.x + left_area.width {
-            break;
-        }
-        if let Some(hit) = click {
-            app.hits.push((Rect::new(x, area.y, width - 2, 1), hit));
-        }
-        x += width;
-        spans.push(Span::styled(key, bold(MUTED)));
-        spans.push(Span::styled(text, Style::new().fg(FAINT)));
+        right_w = flash.text.width() + 3;
+        frame.render_widget(
+            Paragraph::new(plain(format!("{} ", flash.text), flash.color))
+                .alignment(Alignment::Right),
+            area,
+        );
+    } else if let (Some(ed), Mode::Normal) = (&app.editor, &app.mode) {
+        let text = format!("line {} of {} ", ed.text.row + 1, ed.text.lines.len());
+        right_w = text.width() + 2;
+        frame.render_widget(
+            Paragraph::new(plain(text, MUTED)).alignment(Alignment::Right),
+            area,
+        );
     }
-    frame.render_widget(Paragraph::new(Line::from(spans)), left_area);
+    // The keys take what is left; the least important go first.
+    let room = width.saturating_sub(1 + right_w);
+    let mut keys = footer_keys(app);
+    let need = |k: &FootKey| k.key.width() + 1 + k.what.width() + 2;
+    // (The last key's own gap may hang over; a column stays free.)
+    while keys.iter().map(need).sum::<usize>() > room + 1 && !keys.is_empty() {
+        let worst = keys.iter().map(|k| k.rank).max().unwrap_or(0);
+        let at = keys.iter().rposition(|k| k.rank == worst).unwrap_or(0);
+        keys.remove(at);
+    }
+    let mut spans = vec![Span::raw(" ")];
+    let mut x = area.x + 1;
+    for k in keys {
+        let text = format!(" {}  ", k.what);
+        let w = (k.key.width() + text.width()) as u16;
+        if let Some(hit) = k.hit {
+            app.hits.push((Rect::new(x, area.y, w - 2, 1), hit));
+        }
+        x += w;
+        spans.push(Span::styled(k.key, bold(TEXT)));
+        spans.push(plain(text, MUTED));
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)),
+        Rect::new(area.x, area.y, room as u16 + 1, 1),
+    );
 }
 
 // ---- dialogs ---------------------------------------------------------------
 
-fn centered(area: Rect, width: u16, height: u16) -> Rect {
+/// A box of this size in the middle of the stage (the screen between
+/// header and footer), made smaller when the stage is.
+fn centered(stage: Rect, width: u16, height: u16) -> Rect {
     let w = width
-        .min(area.width.saturating_sub(2))
-        .max(10.min(area.width));
-    let h = height
-        .min(area.height.saturating_sub(2))
-        .max(3.min(area.height));
+        .min(stage.width.saturating_sub(2))
+        .max(10.min(stage.width));
+    let h = height.min(stage.height).max(3.min(stage.height));
     Rect::new(
-        area.x + (area.width - w) / 2,
-        area.y + (area.height - h) / 2,
+        stage.x + (stage.width - w) / 2,
+        stage.y + (stage.height - h) / 2,
         w,
         h,
     )
 }
 
-fn dialog(frame: &mut Frame, area: Rect, title: &str) -> Rect {
+/// Draws a dialog's frame and returns the room inside it. Every dialog
+/// goes through here: it notes the dialog's place, so a click beside it
+/// closes it (`App::click`).
+fn dialog(frame: &mut Frame, app: &mut App, area: Rect, title: &str) -> Rect {
     frame.render_widget(Clear, area);
+    app.dialog = Some(area);
+    let title = clip(title, area.width.saturating_sub(6) as usize);
     let block = Block::new()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -1584,27 +2454,36 @@ fn dialog(frame: &mut Frame, area: Rect, title: &str) -> Rect {
     )
 }
 
-fn hints(spans: &[(&'static str, &'static str)]) -> Line<'static> {
-    let mut out = Vec::new();
-    for (k, w) in spans {
-        out.push(Span::styled(*k, bold(MUTED)));
-        out.push(Span::styled(*w, Style::new().fg(FAINT)));
+/// Which rows show, in the bottom border of a dialog whose list scrolls.
+fn position_note(frame: &mut Frame, area: Rect, top: usize, visible: usize, n: usize) {
+    if n <= visible || area.height < 3 {
+        return;
     }
-    Line::from(out)
+    let text = format!(" {}–{} of {n} ", top + 1, (top + visible).min(n));
+    let w = text.width() as u16;
+    if area.width > w + 4 {
+        frame.render_widget(
+            Paragraph::new(plain(text, MUTED)),
+            Rect::new(area.right() - w - 2, area.bottom() - 1, w, 1),
+        );
+    }
 }
 
-/// The right-click menu, at the mouse and moved inside the screen: each
+/// The right-click menu, at the mouse and moved inside the stage: each
 /// entry with the key that does the same on the right.
-fn draw_menu(frame: &mut Frame, app: &mut App, m: &crate::app::Menu) {
-    let screen = frame.area();
+fn draw_menu(frame: &mut Frame, app: &mut App, stage: Rect, m: &crate::app::Menu) {
     let label_w = m.items.iter().map(|i| i.label.width()).max().unwrap_or(0);
     let key_w = m.items.iter().map(|i| i.key.width()).max().unwrap_or(0);
-    let width = ((label_w + key_w + 7) as u16).min(screen.width);
-    let height = (m.items.len() as u16 + 2).min(screen.height);
-    let x = m.x.min(screen.x + screen.width.saturating_sub(width));
-    let y = m.y.min(screen.y + screen.height.saturating_sub(height));
+    let width = ((label_w + key_w + 7) as u16).min(stage.width);
+    let height = (m.items.len() as u16 + 2).min(stage.height);
+    let x = m.x.clamp(
+        stage.x,
+        stage.right().saturating_sub(width + 1).max(stage.x),
+    );
+    let y = m.y.clamp(stage.y, stage.bottom().saturating_sub(height));
     let area = Rect::new(x, y, width, height);
     frame.render_widget(Clear, area);
+    app.dialog = Some(area);
     let block = Block::new()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -1635,40 +2514,44 @@ fn draw_menu(frame: &mut Frame, app: &mut App, m: &crate::app::Menu) {
                 },
             ),
             Span::raw(" ".repeat(gap)),
-            Span::styled(format!("{} ", item.key), Style::new().fg(FAINT)),
+            plain(format!("{} ", item.key), MUTED),
         ]);
         frame.render_widget(Paragraph::new(line), row);
         app.hits.push((row, Hit::MenuRow(i)));
     }
 }
 
-fn draw_picker(frame: &mut Frame, app: &mut App, p: &crate::app::Picker) {
+/// A list to choose from. A click on an entry chooses it; its keys are in
+/// the footer.
+fn draw_picker(frame: &mut Frame, app: &mut App, stage: Rect, mut p: crate::app::Picker) {
     // Details on a line of their own, except in long lists (the agents),
-    // where they follow the name.
-    let any = p.items.iter().any(|i| !i.detail.is_empty());
-    let two = any && p.items.len() <= 8;
+    // where they follow the name. The whole list decides, so typing into
+    // the filter does not change the rows' shape.
+    let any = p.all.iter().any(|i| !i.detail.is_empty());
+    let two = any && p.all.len() <= 8;
     let per = if two { 2u16 } else { 1 };
     // Long lists get a filter line on top instead of number keys.
     let filter_h = u16::from(p.filters()) * 2;
-    let want_h = p.all.len() as u16 * per + 4 + filter_h;
-    let area = centered(frame.area(), 72, want_h);
-    let mut inner = dialog(frame, area, &p.title);
+    let want_h = p.all.len() as u16 * per + 2 + filter_h;
+    let area = centered(stage, 72, want_h);
+    let title = p.title.clone();
+    let mut inner = dialog(frame, app, area, &title);
     if p.filters() {
         let line = Line::from(vec![
-            Span::styled("Filter ", Style::new().fg(MUTED)),
+            plain("Filter ", MUTED),
             Span::styled(p.filter.clone(), bold(TEXT)),
-            Span::styled("▏", Style::new().fg(ACCENT)),
-            Span::styled(
+            plain("▏", ACCENT),
+            plain(
                 if p.filter.is_empty() {
                     "type to narrow the list"
                 } else {
                     ""
                 },
-                Style::new().fg(FAINT),
+                FAINT,
             ),
         ]);
         frame.render_widget(
-            Paragraph::new(line),
+            Paragraph::new(clip_line(line, inner.width as usize)),
             Rect::new(inner.x, inner.y, inner.width, 1),
         );
         inner = Rect::new(
@@ -1678,18 +2561,26 @@ fn draw_picker(frame: &mut Frame, app: &mut App, p: &crate::app::Picker) {
             inner.height.saturating_sub(2),
         );
     }
-    let list_h = inner.height.saturating_sub(2);
-    let visible = (list_h / per).max(1) as usize;
-    let first = offset(p.sel, p.items.len(), visible);
+    let visible = (inner.height / per).max(1) as usize;
+    let n = p.items.len();
+    // The list scrolls only when the marked entry would leave the window.
+    let mut top = p.top.min(n.saturating_sub(visible));
+    if p.sel < top {
+        top = p.sel;
+    } else if p.sel >= top + visible {
+        top = p.sel + 1 - visible;
+    }
+    p.top = top;
     if p.items.is_empty() {
         frame.render_widget(
-            Paragraph::new(Span::styled("Nothing matches", Style::new().fg(FAINT))),
+            Paragraph::new(plain("Nothing matches", FAINT)),
             Rect::new(inner.x, inner.y, inner.width, 1),
         );
     }
-    for (i, item) in p.items.iter().enumerate().skip(first).take(visible) {
-        let y = inner.y + ((i - first) as u16) * per;
-        let r = Rect::new(inner.x, y, inner.width, per.min(inner.y + list_h - y));
+    let width = inner.width as usize;
+    for (i, item) in p.items.iter().enumerate().skip(top).take(visible) {
+        let y = inner.y + ((i - top) as u16) * per;
+        let r = Rect::new(inner.x, y, inner.width, per.min(inner.bottom() - y));
         let style = if i == p.sel {
             Style::new().bg(SELECTED_BG)
         } else {
@@ -1701,80 +2592,68 @@ fn draw_picker(frame: &mut Frame, app: &mut App, p: &crate::app::Picker) {
             "  ".into()
         };
         let mut first = vec![
-            Span::styled(number, Style::new().fg(FAINT)),
+            plain(number, MUTED),
             Span::styled(item.label.clone(), bold(TEXT)),
         ];
         if !two && !item.detail.is_empty() {
-            first.push(Span::styled(
-                format!("  {}", item.detail),
-                Style::new().fg(MUTED),
-            ));
+            first.push(plain(format!("  {}", item.detail), MUTED));
         }
-        let mut lines = vec![Line::from(first)];
+        let mut lines = vec![clip_line(Line::from(first), width)];
         if two {
-            lines.push(Line::from(Span::styled(
-                format!("  {}", item.detail),
-                Style::new().fg(MUTED),
-            )));
+            lines.push(clip_line(
+                Line::from(plain(format!("  {}", item.detail), MUTED)),
+                width,
+            ));
         }
         frame.render_widget(Paragraph::new(Text::from(lines)).style(style), r);
         app.hits.push((r, Hit::PickRow(i)));
     }
-    let foot = Rect::new(
+    position_note(frame, area, top, visible, n);
+    app.mode = Mode::Pick(p);
+}
+
+fn draw_input(frame: &mut Frame, app: &mut App, stage: Rect, i: &crate::app::Input) {
+    let width = centered(stage, 72, 1).width;
+    let hint = wrap(&i.hint, width.saturating_sub(4) as usize);
+    let area = centered(stage, width, hint.len() as u16 + 6);
+    let inner = dialog(frame, app, area, &i.title);
+    let field = Rect::new(
         inner.x,
-        inner.y + inner.height.saturating_sub(1),
+        inner.y + 1.min(inner.height.saturating_sub(1)),
         inner.width,
         1,
     );
-    frame.render_widget(
-        Paragraph::new(hints(&[("⏎", " choose  "), ("Esc", " back")])),
-        foot,
-    );
-}
-
-fn draw_input(frame: &mut Frame, i: &crate::app::Input) {
-    let area = centered(frame.area(), 72, 9);
-    let inner = dialog(frame, area, &i.title);
-    let field = Rect::new(inner.x, inner.y + 1, inner.width, 1);
     frame.render_widget(Block::new().style(Style::new().bg(SELECTED_BG)), field);
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(format!(" {}", i.text), Style::new().fg(TEXT)),
-            Span::styled("▏", Style::new().fg(ACCENT)),
-        ])),
-        field,
-    );
+    let mut value = vec![Span::raw(" ")];
+    value.extend(text_value(
+        &i.text,
+        Some(i.text.chars().count()),
+        inner.width.saturating_sub(1) as usize,
+        false,
+    ));
+    frame.render_widget(Paragraph::new(Line::from(value)), field);
     if inner.height > 3 {
         frame.render_widget(
             Paragraph::new(Text::from(
-                wrap(&i.hint, inner.width as usize)
-                    .into_iter()
-                    .map(|l| Line::from(Span::styled(l, Style::new().fg(MUTED))))
+                hint.into_iter()
+                    .map(|l| Line::from(plain(l, MUTED)))
                     .collect::<Vec<_>>(),
             )),
             Rect::new(
                 inner.x,
                 inner.y + 3,
                 inner.width,
-                inner.height.saturating_sub(4),
+                inner.height.saturating_sub(3),
             ),
         );
     }
-    let foot = Rect::new(
-        inner.x,
-        inner.y + inner.height.saturating_sub(1),
-        inner.width,
-        1,
-    );
-    frame.render_widget(
-        Paragraph::new(hints(&[("⏎", " ok  "), ("Esc", " cancel")])),
-        foot,
-    );
 }
 
-fn draw_confirm(frame: &mut Frame, app: &mut App, c: &crate::app::Confirm) {
-    let width = centered(frame.area(), 76, 1).width;
-    let wrapped: Vec<Line> = c
+/// A question. `y` has its own button, named after what it does: red when
+/// something is lost, in the accent colour when ⏎ confirms it too.
+fn draw_confirm(frame: &mut Frame, app: &mut App, stage: Rect, c: &crate::app::Confirm) {
+    let width = centered(stage, 76, 1).width;
+    let mut wrapped: Vec<String> = c
         .lines
         .iter()
         .flat_map(|l| {
@@ -1785,109 +2664,166 @@ fn draw_confirm(frame: &mut Frame, app: &mut App, c: &crate::app::Confirm) {
                 wrap(l, width.saturating_sub(6) as usize)
             }
         })
-        .map(|l| Line::from(Span::styled(l, Style::new().fg(MUTED))))
         .collect();
-    let mut area = centered(frame.area(), width, wrapped.len() as u16 + 5);
-    if area.height < wrapped.len() as u16 + 5 {
-        area.y = frame.area().y;
-        area.height = frame.area().height;
-    }
-    let inner = dialog(frame, area, &c.question);
-    let (top, rest) = if inner.height < wrapped.len() as u16 + 3 {
+    let area = centered(stage, width, wrapped.len() as u16 + 5);
+    let inner = dialog(frame, app, area, &c.question);
+    // In a low window the gaps go first, then the end of the text.
+    let (top, rest) = if (inner.height as usize) < wrapped.len() + 3 {
         (0, 1)
     } else {
         (1, 3)
     };
+    let room = inner.height.saturating_sub(rest) as usize;
+    if wrapped.len() > room && room > 0 {
+        wrapped.truncate(room);
+        if let Some(last) = wrapped.last_mut() {
+            *last = clip(&format!("{last} …"), inner.width as usize);
+        }
+    }
+    let text: Vec<Line> = wrapped
+        .into_iter()
+        .map(|l| Line::from(plain(l, MUTED)))
+        .collect();
     frame.render_widget(
-        Paragraph::new(Text::from(wrapped)),
-        Rect::new(
-            inner.x,
-            inner.y + top,
-            inner.width,
-            inner.height.saturating_sub(rest),
-        ),
+        Paragraph::new(Text::from(text)),
+        Rect::new(inner.x, inner.y + top, inner.width, room as u16),
     );
     let y = inner.y + inner.height.saturating_sub(1);
-    // Deleting a routine with runs: keep them (y) or delete them too (r).
-    let with_runs = matches!(c.purpose, crate::app::ConfirmFor::Delete(_, true));
+    let strong = |bg: Color| {
+        Style::new()
+            .fg(theme::on(bg))
+            .bg(bg)
+            .add_modifier(Modifier::BOLD)
+    };
+    let yes_style = if c.danger() {
+        strong(RED)
+    } else if c.enter_confirms() {
+        strong(ACCENT)
+    } else {
+        strong(GREEN)
+    };
     let mut buttons: Vec<(String, char, Style)> = vec![(
-        if with_runs {
-            " y delete, keep runs ".into()
+        if c.enter_confirms() {
+            format!(" y or ⏎ {} ", c.yes())
         } else {
-            " y yes ".into()
+            format!(" y {} ", c.yes())
         },
         'y',
-        Style::new()
-            .fg(theme::on(GREEN))
-            .bg(GREEN)
-            .add_modifier(Modifier::BOLD),
+        yes_style,
     )];
-    if with_runs {
-        buttons.push((
-            " r delete with runs ".into(),
-            'r',
-            Style::new().fg(TEXT).bg(BORDER),
-        ));
+    // Deleting a routine with runs: keep them (y) or delete them too (r).
+    if matches!(c.purpose, crate::app::ConfirmFor::Delete(_, true)) {
+        buttons.push((" r delete with its runs ".into(), 'r', strong(RED)));
     }
-    buttons.push((" n no ".into(), 'n', Style::new().fg(TEXT).bg(BORDER)));
+    buttons.push((
+        format!(" n {} ", c.no()),
+        'n',
+        Style::new().fg(TEXT).bg(BORDER),
+    ));
     let mut spans = Vec::new();
     let mut x = inner.x;
     for (text, key, style) in buttons {
         let w = text.width() as u16;
-        app.hits.push((Rect::new(x, y, w, 1), Hit::Key(key)));
+        if x + w <= inner.right() {
+            app.hits.push((Rect::new(x, y, w, 1), Hit::Key(key)));
+        }
         x += w + 1;
         spans.push(Span::styled(text, style));
         spans.push(Span::raw(" "));
     }
     frame.render_widget(
-        Paragraph::new(Line::from(spans)),
+        Paragraph::new(clip_line(Line::from(spans), inner.width as usize)),
         Rect::new(inner.x, y, inner.width, 1),
     );
 }
 
-fn draw_message(frame: &mut Frame, app: &mut App, title: &str, text: &[String]) {
-    let width = 78u16.min(frame.area().width.saturating_sub(2)).max(24);
+/// A note to read. One that is longer than the window scrolls.
+fn draw_message(frame: &mut Frame, app: &mut App, stage: Rect, title: &str, text: &[String]) {
+    let width = 78u16.min(stage.width.saturating_sub(2)).max(24);
     let mut lines: Vec<Line> = Vec::new();
     for (i, t) in text.iter().enumerate() {
         if i > 0 {
             lines.push(Line::from(""));
         }
-        let style = Style::new().fg(if i == 0 { TEXT } else { MUTED });
+        let color = if i == 0 { TEXT } else { MUTED };
         for l in wrap(t, width.saturating_sub(6) as usize) {
-            lines.push(Line::from(Span::styled(l, style)));
+            lines.push(Line::from(plain(l, color)));
         }
     }
-    let area = centered(frame.area(), width, lines.len() as u16 + 5);
-    let inner = dialog(frame, area, title);
+    let area = centered(stage, width, lines.len() as u16 + 5);
+    let inner = dialog(frame, app, area, title);
+    // A gap above the text, one below it and the button; in a low window
+    // only the button.
+    let fits = inner.height as usize >= lines.len() + 3;
+    let (top, rest) = if fits { (1, 3) } else { (0, 1) };
+    let visible = inner.height.saturating_sub(rest);
+    let total = lines.len() as u16;
+    app.help_max = total.saturating_sub(visible);
+    app.help_scroll = app.help_scroll.min(app.help_max);
     frame.render_widget(
-        Paragraph::new(Text::from(lines)),
-        Rect::new(
-            inner.x,
-            inner.y + 1,
-            inner.width,
-            inner.height.saturating_sub(3),
-        ),
+        Paragraph::new(Text::from(lines)).scroll((app.help_scroll, 0)),
+        Rect::new(inner.x, inner.y + top, inner.width, visible),
     );
     let y = inner.y + inner.height.saturating_sub(1);
+    let ok = " ⏎ ok ";
+    let mut spans = vec![Span::styled(
+        ok,
+        Style::new()
+            .fg(theme::on(ACCENT))
+            .bg(ACCENT)
+            .add_modifier(Modifier::BOLD),
+    )];
+    if app.help_max > 0 {
+        spans.push(plain(
+            if app.help_scroll >= app.help_max {
+                "  ↑ ↓ scroll · end".to_string()
+            } else {
+                format!(
+                    "  ↑ ↓ scroll · {} more lines",
+                    app.help_max - app.help_scroll
+                )
+            },
+            MUTED,
+        ));
+    }
     frame.render_widget(
-        Paragraph::new(Line::from(vec![Span::styled(
-            " ⏎ ok ",
-            Style::new()
-                .fg(theme::on(ACCENT))
-                .bg(ACCENT)
-                .add_modifier(Modifier::BOLD),
-        )])),
+        Paragraph::new(clip_line(Line::from(spans), inner.width as usize)),
         Rect::new(inner.x, y, inner.width, 1),
     );
-    app.hits.push((Rect::new(inner.x, y, 6, 1), Hit::Key('\n')));
+    app.hits
+        .push((Rect::new(inner.x, y, ok.width() as u16, 1), Hit::Key('\n')));
 }
 
-/// The jobs in the crontab, and the choice to move or copy them here.
-fn draw_cron(frame: &mut Frame, app: &mut App, jobs: &[crate::crontab::CronJob]) {
-    let screen = frame.area();
-    let width = screen.width.saturating_sub(4).min(110);
+/// The jobs that are only in the crontab, and the ways to take them over,
+/// as a list to choose from like any other.
+fn draw_take(frame: &mut Frame, app: &mut App, stage: Rect, jobs: &[crate::crontab::CronJob]) {
+    let width = stage.width.saturating_sub(4).min(100);
     let text_w = width.saturating_sub(4) as usize;
-    let mut lines: Vec<Line> = Vec::new();
+    // The ways, each with what it means on the lines below it.
+    let ways: Vec<Vec<Line>> = TAKES
+        .iter()
+        .map(|(key, _, label, detail)| {
+            let mut lines = vec![Line::from(vec![
+                plain(format!(" {key}  "), MUTED),
+                Span::styled(*label, bold(TEXT)),
+            ])];
+            for l in wrap(detail, text_w.saturating_sub(5)) {
+                lines.push(Line::from(plain(format!("    {l}"), MUTED)));
+            }
+            lines
+        })
+        .collect();
+    let ways_h: usize = ways.iter().map(Vec::len).sum();
+    let warning: Vec<String> = if crate::autostart::is_on() {
+        Vec::new()
+    } else {
+        wrap(
+            "Autostart is off: a job moved to Herdr runs only while Herdr runs; kept as a cron job it always runs.",
+            text_w,
+        )
+    };
+    // The jobs get what is left, at least one row.
+    let mut job_lines: Vec<Line> = Vec::new();
     for job in jobs {
         let when = match Schedule::parse(&job.schedule) {
             // In the crontab, `@reboot` means the computer's start.
@@ -1895,89 +2831,93 @@ fn draw_cron(frame: &mut Frame, app: &mut App, jobs: &[crate::crontab::CronJob])
             Ok(s) => s.describe(),
             Err(_) => job.schedule.clone(),
         };
-        lines.push(Line::from(vec![
-            Span::styled(format!("{when}  "), bold(TEXT)),
-            Span::styled(
-                clip(
-                    &job.command,
-                    text_w.saturating_sub(when.width() + 2).max(10),
-                ),
-                Style::new().fg(MUTED),
-            ),
-        ]));
-        if let Some(note) = &job.note {
-            lines.push(Line::from(Span::styled(
-                format!("  {note}"),
-                Style::new().fg(YELLOW),
-            )));
-        }
-    }
-    lines.push(Line::from(""));
-    for l in wrap(
-        "Keep as cron job: cron still runs it, also when Herdr is closed, but you see, edit and switch it here, with its output and result in Runs. Move to Herdr: Herdr runs it in a tab instead. Both comment the old line in your crontab out (a backup is kept), so nothing runs twice. Copy: added to Herdr switched off; your crontab stays as it is.",
-        text_w,
-    ) {
-        lines.push(Line::from(Span::styled(l, Style::new().fg(FAINT))));
-    }
-    if !crate::autostart::is_on() {
-        for l in wrap(
-            "Autostart is off: jobs moved to Herdr run only while Herdr runs; kept as cron jobs they always run. Turn autostart on at the top for Herdr to start at login.",
+        job_lines.push(clip_line(
+            Line::from(vec![
+                Span::styled(format!("{when}  "), bold(TEXT)),
+                plain(job.command.clone(), MUTED),
+            ]),
             text_w,
-        ) {
-            lines.push(Line::from(Span::styled(l, Style::new().fg(YELLOW))));
+        ));
+        if let Some(note) = &job.note {
+            job_lines.push(clip_line(
+                Line::from(plain(format!("  {note}"), YELLOW)),
+                text_w,
+            ));
         }
     }
-    let height = (lines.len() as u16 + 4).min(screen.height.saturating_sub(2));
-    let area = centered(screen, width, height);
-    let title = if jobs.len() == 1 {
-        "1 cron job in your crontab".to_string()
-    } else {
-        format!("{} cron jobs in your crontab", jobs.len())
-    };
-    let inner = dialog(frame, area, &title);
-    frame.render_widget(
-        Paragraph::new(Text::from(lines)),
-        Rect::new(
-            inner.x,
-            inner.y,
-            inner.width,
-            inner.height.saturating_sub(2),
-        ),
-    );
-    let y = inner.y + inner.height.saturating_sub(1);
-    let mut x = inner.x;
-    let mut spans = Vec::new();
-    for (key, what) in [
-        ("k", "keep as cron job"),
-        ("m", "move to Herdr"),
-        ("c", "copy, off"),
-        ("Esc", "back"),
-    ] {
-        let w = (key.width() + what.width() + 3) as u16;
-        let hit = if key == "Esc" {
-            '\u{1b}'
+    let fixed = 2
+        + 1
+        + ways_h
+        + if warning.is_empty() {
+            0
         } else {
-            key.chars().next().unwrap_or(' ')
+            warning.len() + 1
         };
-        app.hits.push((Rect::new(x, y, w, 1), Hit::Key(hit)));
-        x += w;
-        spans.push(Span::styled(key, bold(MUTED)));
-        spans.push(Span::styled(format!(" {what}  "), Style::new().fg(FAINT)));
+    let room = (stage.height as usize).saturating_sub(fixed).max(1);
+    if job_lines.len() > room {
+        let hidden = job_lines.len() - (room - 1);
+        job_lines.truncate(room - 1);
+        job_lines.push(Line::from(plain(
+            format!("… and {hidden} more lines"),
+            FAINT,
+        )));
     }
+    let height = (job_lines.len() + fixed) as u16;
+    let area = centered(stage, width, height);
+    let title = if jobs.len() == 1 {
+        "Take over 1 cron job from your crontab".to_string()
+    } else {
+        format!("Take over {} cron jobs from your crontab", jobs.len())
+    };
+    let inner = dialog(frame, app, area, &title);
+    let mut y = inner.y;
+    let shown = job_lines.len() as u16;
     frame.render_widget(
-        Paragraph::new(Line::from(spans)),
-        Rect::new(inner.x, y, inner.width, 1),
+        Paragraph::new(Text::from(job_lines)),
+        Rect::new(inner.x, y, inner.width, shown.min(inner.height)),
     );
+    y += shown + 1;
+    for (i, lines) in ways.into_iter().enumerate() {
+        let h = lines.len() as u16;
+        if y + h > inner.bottom() {
+            break;
+        }
+        let row = Rect::new(inner.x, y, inner.width, h);
+        if i == app.take_sel {
+            frame.render_widget(Block::new().style(Style::new().bg(SELECTED_BG)), row);
+        }
+        frame.render_widget(Paragraph::new(Text::from(lines)), row);
+        app.hits.push((row, Hit::Take(i)));
+        y += h;
+    }
+    if !warning.is_empty() && y + 1 < inner.bottom() {
+        let lines: Vec<Line> = warning
+            .into_iter()
+            .map(|l| Line::from(plain(l, YELLOW)))
+            .collect();
+        frame.render_widget(
+            Paragraph::new(Text::from(lines)),
+            Rect::new(inner.x, y + 1, inner.width, inner.bottom() - (y + 1)),
+        );
+    }
 }
 
-fn draw_log(frame: &mut Frame, app: &mut App, mut log: LogView) {
-    let screen = frame.area();
-    let area = centered(
-        screen,
-        screen.width.saturating_sub(4).min(140),
-        screen.height.saturating_sub(2),
-    );
-    let inner = dialog(frame, area, &log.title);
+/// A run's output, or a routine to approve. How the run went and why
+/// stays above the text; the keys are in the footer.
+fn draw_log(frame: &mut Frame, app: &mut App, stage: Rect, mut log: LogView) {
+    let area = centered(stage, stage.width.saturating_sub(4).min(140), stage.height);
+    let title = log.title.clone();
+    let mut inner = dialog(frame, app, area, &title);
+    if !log.note.is_empty() && inner.height > 4 {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                clip(&log.note, inner.width as usize),
+                bold(TEXT),
+            )),
+            Rect::new(inner.x, inner.y, inner.width, 1),
+        );
+        inner = Rect::new(inner.x, inner.y + 2, inner.width, inner.height - 2);
+    }
     let visible = inner.height.saturating_sub(1);
     // Long lines wrap, so nothing hides past the right edge.
     let mut rows: Vec<String> = log
@@ -2013,52 +2953,40 @@ fn draw_log(frame: &mut Frame, app: &mut App, mut log: LogView) {
     );
     let y = inner.y + inner.height.saturating_sub(1);
     let mut foot = Vec::new();
-    let mut x = inner.x;
     if log.approve.is_some() {
         if log.scroll >= log.max {
+            let text = " y approve ";
             foot.push(Span::styled(
-                " y approve ",
+                text,
                 Style::new()
                     .fg(theme::on(GREEN))
                     .bg(GREEN)
                     .add_modifier(Modifier::BOLD),
             ));
-            foot.push(Span::raw("  "));
-            app.hits.push((Rect::new(x, y, 11, 1), Hit::Key('y')));
-            x += 13;
+            app.hits
+                .push((Rect::new(inner.x, y, text.width() as u16, 1), Hit::Key('y')));
         } else {
-            foot.push(Span::styled("↓", bold(MUTED)));
-            foot.push(Span::styled(
-                " read to the end to approve  ",
-                Style::new().fg(FAINT),
-            ));
-            x += 30;
+            foot.push(Span::styled("↓", bold(TEXT)));
+            foot.push(plain(" read to the end to approve", MUTED));
         }
     }
-    foot.push(Span::styled("Esc", bold(MUTED)));
-    foot.push(Span::styled(" close  ", Style::new().fg(FAINT)));
-    app.hits.push((Rect::new(x, y, 3, 1), Hit::Key('\u{1b}')));
-    if log.file.is_some() {
-        app.hits.push((Rect::new(x + 9, y, 13, 1), Hit::Key('f')));
-        foot.push(Span::styled("f", bold(MUTED)));
-        foot.push(Span::styled(" open file  ", Style::new().fg(FAINT)));
-    }
-    if log.max > 0 {
-        foot.push(Span::styled("↑ ↓", bold(MUTED)));
-        foot.push(Span::styled(
-            format!(
-                " scroll · lines {}–{} of {}",
-                log.scroll + 1,
-                (log.scroll + visible).min(total),
-                total
-            ),
-            Style::new().fg(FAINT),
-        ));
-    }
     frame.render_widget(
-        Paragraph::new(Line::from(foot)),
+        Paragraph::new(clip_line(Line::from(foot), inner.width as usize)),
         Rect::new(inner.x, y, inner.width, 1),
     );
+    if log.max > 0 {
+        let position = format!(
+            "lines {}–{} of {}",
+            log.scroll + 1,
+            (log.scroll + visible).min(total),
+            total
+        );
+        let w = (position.width() as u16).min(inner.width);
+        frame.render_widget(
+            Paragraph::new(plain(position, MUTED)).alignment(Alignment::Right),
+            Rect::new(inner.right() - w, y, w, 1),
+        );
+    }
     app.mode = Mode::Log(log);
 }
 
@@ -2066,7 +2994,6 @@ fn draw_log(frame: &mut Frame, app: &mut App, mut log: LogView) {
 /// character (unlike `wrap`, which joins words): it breaks after the last
 /// space that fits, or inside a word that is longer than a row.
 pub fn hard_wrap(text: &str, width: usize) -> Vec<String> {
-    use unicode_width::UnicodeWidthChar;
     let width = width.max(1);
     let mut rest: Vec<char> = text.chars().collect();
     let mut out = Vec::new();
@@ -2109,7 +3036,7 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
         }
         // A word longer than the line (a path) is split, never cut off.
         for c in word.chars() {
-            if line.width() + c.to_string().width() > width {
+            if line.width() + c.width().unwrap_or(0) > width {
                 out.push(std::mem::take(&mut line));
             }
             line.push(c);
@@ -2121,107 +3048,175 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
     out
 }
 
-fn draw_help(frame: &mut Frame, app: &mut App) {
-    let groups: [(&str, &[(&str, &str)]); 5] = [
-        (
-            "Routines",
-            &[
-                ("⏎  e", "edit the routine"),
-                (
-                    "n",
-                    "new: Herdr routine, classic cron job, or describe it to Claude",
-                ),
-                ("p", "write the prompt or command"),
-                (
-                    "r",
-                    "run now (asks first); a cron job runs in the background, as cron would",
-                ),
-                ("a", "approve what changed outside the list (asks first)"),
-                ("Space", "on / off"),
-                ("c", "copy it (the copy starts switched off)"),
-                ("o", "go to the tab of its last run"),
-                ("l", "result and output of its last run"),
-                ("h", "its runs (or click \"n runs\")"),
-("d", "delete (asks: keep its runs, or delete them too)"),
-            ],
-        ),
-        (
-            "Runs",
-            &[
-                ("⏎", "go to the run's tab, or its output once closed"),
-                ("l", "result and output of the run"),
-                ("f", "open the output file"),
-                (
-                    "h",
-                    "only this routine's runs; Esc or \"✕ show all runs\" shows all",
-                ),
-                ("d", "delete the run (asks first)"),
-            ],
-        ),
-        (
-            "Form",
-            &[
-                ("↑ ↓  Tab", "field"),
-                ("⏎  Space", "choose from the list, edit the prompt, save"),
-                ("← →", "next / previous choice"),
-                ("Ctrl+S", "save the routine"),
-                ("Ctrl+U", "clear the field"),
-                ("Esc", "back (asks when something changed)"),
-            ],
-        ),
-        (
-            "Prompt editor",
-            &[
-                ("Esc", "done, keeps what you wrote"),
-                ("Ctrl+Z  Ctrl+Y", "undo / redo"),
-                ("Shift+arrows", "mark text; or drag with the mouse"),
-                ("Double click", "mark a word"),
-                ("Ctrl+A", "mark everything"),
-                ("Ctrl+C  X  V", "copy, cut, paste"),
-                ("arrows  Mouse", "move; ⏎ starts a new line"),
-                ("Ctrl+O", "open in another editor ($VISUAL, $EDITOR)"),
-            ],
-        ),
-        (
-            "List",
-            &[
-                ("↑ ↓  j k", "move"),
-                ("← →  Tab  1 2 3", "routines / cron jobs / runs"),
-                (
-                    "Mouse",
-                    "click to choose, double click to open, right click for a menu",
-                ),
-                (
-                    "S",
-                    "all routines and cron jobs on or off (or click \"routines\" at the top)",
-                ),
-                (
-                    "A",
-                    "autostart: Herdr starts at login (routines run after a restart), or not",
-                ),
-                (
-                    "C",
-                    "your crontab's jobs (◇ under Cron jobs): keep as cron job, move to Herdr or copy",
-                ),
-                ("i", "Nerd Font icons / plain symbols"),
-                ("Esc", "close a dialog (never the list)"),
-                ("q", "close the list (asks first)"),
-            ],
-        ),
-    ];
+/// Every key the list handles, by where it works. Keep it in step with
+/// `App::key`, `list_key`, `form_key`, `editor_key` and the editor's own
+/// keys: a key that is not here does not exist for the owner.
+const HELP: [(&str, &[(&str, &str)]); 7] = [
+    (
+        "List",
+        &[
+            ("↑ ↓  j k", "move"),
+            ("PgUp PgDn  g G", "a page up or down; first, last (also Home, End)"),
+            ("← →  Tab  1 2 3", "routines / cron jobs / runs"),
+            (
+                "Mouse",
+                "a click marks a row, a click on the marked row opens it; the wheel scrolls; a right click opens a menu; the keys in the footer and the buttons can be clicked; a click beside a dialog closes it",
+            ),
+            (
+                "S",
+                "all routines and cron jobs on or off (or click \"routines\" at the top)",
+            ),
+            (
+                "A",
+                "autostart: Herdr starts at login, so routines run after a restart, or not",
+            ),
+            (
+                "C",
+                "take over the jobs that are only in your crontab (◇ under Cron jobs)",
+            ),
+            ("i", "Nerd Font icons / plain symbols"),
+            ("?", "these keys"),
+            ("Esc", "close a dialog (never the list)"),
+            ("q  Ctrl+C", "close the list (asks first)"),
+        ],
+    ),
+    (
+        "Routines and cron jobs",
+        &[
+            ("⏎  e", "edit"),
+            ("n", "new: Herdr routine, cron job, or describe it to Claude"),
+            ("p", "write the prompt or command"),
+            (
+                "r",
+                "run now (asks first); a cron job runs in the background, as cron would",
+            ),
+            (
+                "a",
+                "approve one that is new or was changed outside the list: shows it, y approves at the end",
+            ),
+            ("Space", "switch on / off"),
+            ("c", "duplicate (the copy starts switched off)"),
+            ("o", "go to the tab of its last run"),
+            ("l", "output of its last run"),
+            ("h", "its runs (or click \"n runs ›\"); Esc comes back"),
+            ("d  Del", "delete (asks: keep its runs, or delete them too)"),
+            (
+                "⏎ on ◇",
+                "take over a job that is only in your crontab: k keep as a cron job, m move to Herdr, c copy",
+            ),
+        ],
+    ),
+    (
+        "Runs",
+        &[
+            ("⏎", "go to the run's tab, or its output once the tab is closed"),
+            ("l", "output of the run"),
+            ("f", "open the output file"),
+            ("h", "only its runs; again for all runs"),
+            ("Esc", "leave \"only its runs\": back to the routine, or all runs"),
+            ("d  Del", "delete the run (asks first)"),
+        ],
+    ),
+    (
+        "Form",
+        &[
+            ("↑ ↓  Tab", "field (PgUp, PgDn: several)"),
+            (
+                "⏎  Space",
+                "choose from the list, write the prompt, show or hide More settings, save",
+            ),
+            (
+                "← →",
+                "next / previous choice; in a text field they move the cursor",
+            ),
+            (
+                "Home  End",
+                "start / end of the text; on a choice, first / last field",
+            ),
+            ("Backspace  Del", "delete before / at the cursor"),
+            ("Ctrl+U", "clear the field"),
+            ("Ctrl+S", "save"),
+            ("Esc", "back (asks when something changed)"),
+        ],
+    ),
+    (
+        "Prompt editor",
+        &[
+            (
+                "Esc  Ctrl+S",
+                "done: keeps what you wrote (a routine's prompt is saved at once)",
+            ),
+            ("Ctrl+D", "discard what you wrote (asks first)"),
+            ("Ctrl+Z  Ctrl+Y", "undo / redo"),
+            ("arrows", "move; with Ctrl or Alt by word; ⏎ starts a new line"),
+            (
+                "Home  End",
+                "start / end of the line (Ctrl+E: end); with Ctrl of the text",
+            ),
+            ("PgUp  PgDn", "a page up or down"),
+            ("Shift+arrows", "mark text; or drag with the mouse"),
+            ("Double click", "mark a word"),
+            ("Ctrl+A", "mark everything"),
+            ("Ctrl+C  X  V", "copy, cut, paste"),
+            ("Ctrl+W", "delete the word before the cursor"),
+            ("Ctrl+O", "open in another editor ($VISUAL, $EDITOR)"),
+        ],
+    ),
+    (
+        "Output and approval",
+        &[
+            (
+                "↑ ↓  PgUp PgDn",
+                "scroll (Space: a page down; g, G: start, end)",
+            ),
+            ("f", "open the output file"),
+            ("y", "approve, once read to the end"),
+            ("Esc  ⏎  q", "close"),
+        ],
+    ),
+    (
+        "Lists to choose from and questions",
+        &[
+            ("↑ ↓  ⏎", "mark and choose; a click chooses"),
+            ("1–9", "choose by number"),
+            ("typing", "narrows a long list (such as the agents)"),
+            (
+                "y",
+                "yes; ⏎ too where nothing is lost. Deleting, discarding and running by hand need y",
+            ),
+            ("r", "when deleting a routine: delete its runs too"),
+            ("any other key", "no"),
+        ],
+    ),
+];
+
+/// The width of the keys in the help.
+const HELP_KEYS: usize = 17;
+
+/// The keys as lines that fit `width`: a long explanation wraps under
+/// itself, so none is cut at the edge.
+fn help_lines(width: usize) -> Vec<Line<'static>> {
+    let room = width.saturating_sub(HELP_KEYS).max(10);
     let mut lines: Vec<Line> = Vec::new();
-    for (gi, (title, keys)) in groups.iter().enumerate() {
+    for (gi, (title, keys)) in HELP.iter().enumerate() {
         if gi > 0 {
             lines.push(Line::from(""));
         }
         lines.push(Line::from(Span::styled(*title, bold(ACCENT))));
         for (k, what) in keys.iter() {
-            lines.push(Line::from(vec![
-                Span::styled(format!("{k:<18}"), bold(TEXT)),
-                Span::styled(*what, Style::new().fg(MUTED)),
-            ]));
+            for (n, part) in wrap(what, room).into_iter().enumerate() {
+                let key = if n == 0 { *k } else { "" };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{key:<HELP_KEYS$}"), bold(TEXT)),
+                    plain(part, MUTED),
+                ]));
+            }
         }
     }
+    lines
+}
+
+fn draw_help(frame: &mut Frame, app: &mut App, stage: Rect) {
     let how = |width: usize| -> Vec<Line<'static>> {
         let mut out = vec![Line::from(Span::styled("How it works", bold(ACCENT)))];
         for (i, p) in INTRO.iter().enumerate() {
@@ -2229,27 +3224,31 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
                 out.push(Line::from(""));
             }
             for l in wrap(p, width) {
-                out.push(Line::from(Span::styled(l, Style::new().fg(MUTED))));
+                out.push(Line::from(plain(l, MUTED)));
             }
         }
         out
     };
-    let screen = frame.area();
-    let width = 78u16.min(screen.width.saturating_sub(2)).max(24);
-    let one_column = how(width.saturating_sub(6) as usize);
+    let width = 78u16.min(stage.width.saturating_sub(2)).max(24);
+    let text_w = width.saturating_sub(4) as usize;
+    let mut lines = help_lines(text_w);
+    let one_column = how(text_w);
+    // In a wide window that is too low for one column, the note on how it
+    // works goes beside the keys.
     let two_columns =
-        screen.width >= 124 && (screen.height as usize) < lines.len() + 1 + one_column.len() + 3;
+        stage.width >= 124 && (stage.height as usize) < lines.len() + 1 + one_column.len() + 2;
     let (area, columns): (Rect, Vec<Vec<Line<'static>>>) = if two_columns {
+        lines = help_lines(64);
         let right = how(52);
-        let height = lines.len().max(right.len()) as u16 + 3;
-        (centered(screen, 124, height), vec![lines, right])
+        let height = lines.len().max(right.len()) as u16 + 2;
+        (centered(stage, 124, height), vec![lines, right])
     } else {
         lines.push(Line::from(""));
         lines.extend(one_column);
-        let height = lines.len() as u16 + 3;
-        (centered(screen, width, height), vec![lines])
+        let height = lines.len() as u16 + 2;
+        (centered(stage, width, height), vec![lines])
     };
-    let inner = dialog(frame, area, "Keys");
+    let inner = dialog(frame, app, area, "Keys");
     app.hits.push((area, Hit::Key('?')));
     // The version in the bottom border, linked to the repository.
     if area.height >= 3 {
@@ -2315,7 +3314,7 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
             format!("↑ ↓ scroll · {} more lines", app.help_max - app.help_scroll)
         };
         frame.render_widget(
-            Paragraph::new(Span::styled(hint, Style::new().fg(FAINT))),
+            Paragraph::new(plain(hint, MUTED)),
             Rect::new(inner.x, inner.y + visible, inner.width, 1),
         );
     }
@@ -2326,10 +3325,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn offsets_and_wrap() {
-        assert_eq!(offset(0, 10, 3), 0);
-        assert_eq!(offset(5, 10, 3), 3);
-        assert_eq!(offset(9, 10, 3), 7);
+    fn wrap_keeps_words_whole() {
         assert_eq!(wrap("a bb ccc dddd", 10), vec!["a bb ccc", "dddd"]);
     }
 
@@ -2343,15 +3339,122 @@ mod tests {
         assert_eq!(hard_wrap(&long, 20).concat(), long);
     }
 
+    fn text(line: &Line) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
     #[test]
-    fn columns_drop_when_narrow() {
-        let cols = vec![
-            (1, "", Constraint::Length(2)),
-            (2, "", Constraint::Fill(1)),
-            (3, "", Constraint::Length(26)),
-            (4, "", Constraint::Length(24)),
-        ];
-        assert_eq!(fit(cols.clone(), &[4, 3], 120, 24).len(), 4);
-        assert_eq!(fit(cols, &[4, 3], 50, 24).len(), 2);
+    fn what_is_cut_ends_in_an_ellipsis() {
+        assert_eq!(
+            clip("Monthly on the 1st at 09:00", 26).chars().last(),
+            Some('…')
+        );
+        assert_eq!(clip("short", 26), "short");
+        assert_eq!(clip_start("~/code/site/docs", 10), "…site/docs");
+        // A line of several colours keeps them and gets the ellipsis in
+        // the colour of the part that was cut.
+        let line = Line::from(vec![plain("✗ Failed", RED), plain("  13 runs ›", ACCENT)]);
+        let cut = clip_line(line.clone(), 12);
+        assert_eq!(text(&cut), "✗ Failed  1…");
+        assert_eq!(cut.width(), 12);
+        assert_eq!(cut.spans.last().unwrap().style.fg, Some(ACCENT));
+        assert_eq!(text(&clip_line(line, 40)), "✗ Failed  13 runs ›");
+    }
+
+    #[test]
+    fn a_text_field_shows_the_part_around_its_cursor() {
+        let value = "~/projects/a-very-long-folder/with/many/parts/inside";
+        let shown = |cursor| -> String {
+            text_value(value, Some(cursor), 20, false)
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect()
+        };
+        // At the end: the end shows, cut at its start.
+        let end = shown(value.chars().count());
+        assert!(end.starts_with('…') && end.ends_with("inside▏"), "{end}");
+        // At the start: the start shows, cut at its end.
+        let start = shown(0);
+        assert!(
+            start.starts_with("▏~/projects") && start.ends_with('…'),
+            "{start}"
+        );
+        // In the middle: cut at both ends, the cursor in it.
+        let middle = shown(25);
+        assert!(
+            middle.starts_with('…') && middle.ends_with('…') && middle.contains('▏'),
+            "{middle}"
+        );
+        for s in [end, start, middle] {
+            assert!(s.width() <= 20, "{s}");
+        }
+        // Without the cursor a folder keeps its end.
+        let folder: String = text_value(value, None, 20, true)
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(
+            folder.starts_with('…') && folder.ends_with("inside"),
+            "{folder}"
+        );
+    }
+
+    #[test]
+    fn the_list_of_routines_takes_the_shape_that_fits() {
+        // Wide: everything side by side, with wide gaps.
+        let (shape, gap, name, sched) = routine_shape(118, 34, 40, 25);
+        assert_eq!((shape, gap), (Shape::Full, 3));
+        assert_eq!(name + sched, 118 - 2 - 9 - 25);
+        assert_eq!(sched, 40);
+        // 80 columns: still all three, with narrow gaps and a shorter
+        // schedule column.
+        let (shape, gap, name, sched) = routine_shape(78, 34, 40, 25);
+        assert_eq!((shape, gap), (Shape::Full, 1));
+        assert!(name >= NAME_MIN && sched >= 22, "{name} {sched}");
+        // A split pane: the last run moves into the routine's second line.
+        assert_eq!(routine_shape(58, 34, 40, 25).0, Shape::Compact);
+        // Very narrow: the routine alone.
+        assert_eq!(routine_shape(38, 34, 40, 25).0, Shape::Narrow);
+    }
+
+    #[test]
+    fn the_header_drops_things_in_order_and_keeps_the_warning() {
+        let chip = |keep: bool| Chip {
+            long: "● chip on".into(),
+            short: "● chip".into(),
+            style: Style::new(),
+            key: None,
+            keep,
+        };
+        let all = vec![chip(false), chip(false), chip(true)];
+        let plans = plans(&all);
+        // First everything, then without the title.
+        assert_eq!((plans[0].title, plans[0].chips.len()), (2, 3));
+        assert_eq!((plans[1].title, plans[1].chips[0].1), (1, false));
+        // Then the chips that are no warning get short, and go from the
+        // left; the warning stays as it is.
+        assert_eq!(plans[2].chips, vec![(0, true), (1, true), (2, false)]);
+        assert_eq!(plans[3].chips, vec![(1, true), (2, false)]);
+        assert_eq!(plans[4].chips, vec![(2, false)]);
+        // Then the tabs get shorter, and only at the very end the warning
+        // does. It never goes.
+        for p in &plans[4..plans.len() - 1] {
+            assert_eq!(p.chips, vec![(2, false)]);
+        }
+        let last = plans.last().unwrap();
+        assert_eq!((last.title, last.tabs), (0, 2));
+        assert_eq!(last.chips, vec![(2, true)]);
+        assert!(plans.windows(2).all(|w| w[0].tabs <= w[1].tabs));
+        // A chip that drops in later (a third one) takes its turn by its
+        // place in the list.
+        let four = vec![chip(false), chip(false), chip(false), chip(true)];
+        let plans = super::plans(&four);
+        assert_eq!(plans[3].chips.len(), 3);
+        assert_eq!(plans[5].chips, vec![(3, false)]);
+        // The help lists a key once per place, and wraps instead of
+        // cutting.
+        for line in help_lines(40) {
+            assert!(line.width() <= 40, "{}", text(&line));
+        }
     }
 }
