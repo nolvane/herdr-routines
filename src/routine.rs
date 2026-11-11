@@ -134,7 +134,7 @@ impl RunsIn {
     pub fn detail(self) -> &'static str {
         match self {
             RunsIn::Herdr => "In a tab in Herdr, while Herdr runs",
-            RunsIn::Cron => "A classic cron job, also when Herdr is closed",
+            RunsIn::Cron => "A cron job, also when Herdr is closed",
         }
     }
 }
@@ -381,7 +381,7 @@ impl Routine {
             }
         }
         if file.args.iter().any(|a| has_hidden(a, false)) {
-            return Some("the extra arguments have hidden characters".into());
+            return Some("the extra options have hidden characters".into());
         }
         if has_hidden(prompt, true) {
             return Some(if file.agent == SHELL {
@@ -419,7 +419,7 @@ impl Routine {
             return Some("a cron job's command is one line (for more, call a script)".into());
         }
         if file.agent == SHELL && !file.args.is_empty() {
-            return Some("a shell command takes no extra arguments".into());
+            return Some("a shell command takes no extra options".into());
         }
         if file.time_limit_minutes == 0 {
             return Some("the time limit is 0 minutes".into());

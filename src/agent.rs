@@ -473,7 +473,7 @@ fn permission_arg(agent: &str, args: &[String]) -> Option<String> {
 pub fn check(file: &RoutineFile) -> Option<String> {
     if let Some(arg) = permission_arg(&file.agent, &file.args) {
         return Some(format!(
-            "the extra arguments change permissions ({arg}); use the permission mode instead"
+            "the extra options change permissions ({arg}); use the permission mode instead"
         ));
     }
     if file.model.starts_with('-') {
@@ -485,7 +485,7 @@ pub fn check(file: &RoutineFile) -> Option<String> {
     }
     if !file.model.is_empty() && models(&file.agent).is_empty() {
         return Some(format!(
-            "no model can be set for {} here; use extra arguments",
+            "no model can be set for {} here; use extra options",
             file.agent
         ));
     }
