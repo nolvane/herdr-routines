@@ -2782,6 +2782,21 @@ fn centered(stage: Rect, width: u16, height: u16) -> Rect {
 /// closes it (`App::click`).
 fn dialog(frame: &mut Frame, app: &mut App, area: Rect, title: &str) -> Rect {
     frame.render_widget(Clear, area);
+    // A dialog nearly as wide as the window leaves a strip of a few
+    // columns on each side, where single letters of the page behind it
+    // would show: those strips are cleared too.
+    let window = frame.area();
+    let right_edge = area.x + area.width;
+    let (left, right) = (
+        area.x.saturating_sub(window.x),
+        (window.x + window.width).saturating_sub(right_edge),
+    );
+    if left <= 3 {
+        frame.render_widget(Clear, Rect::new(window.x, area.y, left, area.height));
+    }
+    if right <= 3 {
+        frame.render_widget(Clear, Rect::new(right_edge, area.y, right, area.height));
+    }
     app.dialog = Some(area);
     let title = clip(title, area.width.saturating_sub(6) as usize);
     let block = Block::new()
