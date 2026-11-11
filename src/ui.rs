@@ -20,6 +20,7 @@ use crate::app::{
     App, Attention, EditTarget, Hit, LogView, Mode, RunFilter, RunPage, Sort, View, INTRO, TAKES,
 };
 use crate::cron::short_time;
+use crate::diff::Diff;
 use crate::form::{Field, Form};
 use crate::routine::Routine;
 use crate::schedule::Schedule;
@@ -1168,6 +1169,76 @@ fn detail_row(label: &str, value: Vec<Span<'static>>, width: usize) -> Line<'sta
     clip_line(Line::from(spans), width)
 }
 
+/// A details row whose setting was changed outside the list since the
+/// last approval: `▌` before the label, and all of it yellow.
+fn changed_row(label: &str, value: Vec<Span<'static>>, width: usize) -> Line<'static> {
+    let mut spans = vec![plain(format!("▌{label:<DETAIL_LABEL$}"), YELLOW)];
+    spans.extend(value.into_iter().map(|s| {
+        let style = s.style.fg(YELLOW);
+        s.style(style)
+    }));
+    clip_line(Line::from(spans), width)
+}
+
+/// What differs from the routine as it was approved last (`was`), by the
+/// label of its row in the details. "Name" and "On/off" have no row there.
+/// The approval view (`a`) is the whole truth; this says where to look.
+fn changed_details(was: &Routine, r: &Routine) -> Vec<&'static str> {
+    let (a, b) = (&was.file, &r.file);
+    [
+        ("Name", a.name != b.name),
+        ("On/off", a.enabled != b.enabled),
+        ("Schedule", was.schedule_text() != r.schedule_text()),
+        ("Runs with", runs_with(was) != runs_with(r)),
+        (
+            "Crontab line",
+            r.is_cron() && crate::crontab::when(was) != crate::crontab::when(r),
+        ),
+        ("Folder", !r.is_cron() && a.folder != b.folder),
+        (
+            "Time limit",
+            a.time_limit_minutes != b.time_limit_minutes
+                || (a.stop_at_limit || was.is_cron()) != (b.stop_at_limit || r.is_cron()),
+        ),
+        (
+            "If it fails",
+            a.retries != b.retries
+                || (b.retries > 0 && a.retry_delay_minutes != b.retry_delay_minutes),
+        ),
+        (
+            "If missed",
+            a.missed != b.missed || a.more.late_hours != b.more.late_hours,
+        ),
+        (
+            "Switches off",
+            a.more.off_after_failures != b.more.off_after_failures,
+        ),
+        (
+            "After the run",
+            a.more.after_command.trim() != b.more.after_command.trim()
+                || a.more.after_always != b.more.after_always,
+        ),
+        ("Account", a.more.account != b.more.account),
+        ("Alerts", a.alert != b.alert),
+        (
+            "Run history",
+            a.keep_runs != b.keep_runs || a.keep_days != b.keep_days,
+        ),
+        (
+            "Agent settings",
+            a.check_command != b.check_command || a.remember != b.remember || a.args != b.args,
+        ),
+        (
+            if r.is_shell() { "Command" } else { "Prompt" },
+            was.prompt != r.prompt,
+        ),
+    ]
+    .into_iter()
+    .filter(|(_, differs)| *differs)
+    .map(|(label, _)| label)
+    .collect()
+}
+
 /// A crontab-only job in full, and what ⏎ does with it.
 fn draw_job_details(frame: &mut Frame, job: &crate::crontab::CronJob, area: Rect) {
     let inner = Rect::new(
@@ -1241,6 +1312,17 @@ fn draw_details(frame: &mut Frame, app: &App, icons: &Icons, r: &Routine, area: 
     let mut lines: Vec<Line> = vec![details_title(&r.file.name, w)];
     let text = |s: String| vec![plain(s, TEXT)];
     let room = w.saturating_sub(DETAIL_LABEL + 2);
+    // A routine that was changed outside the list and waits: what differs
+    // from its last approval is marked, so it shows before `a` is pressed.
+    let was = app.before.get(&r.id).filter(|_| !r.approved);
+    let changed = was.map(|was| changed_details(was, r)).unwrap_or_default();
+    let row = |label: &str, value: Vec<Span<'static>>| -> Line<'static> {
+        if changed.contains(&label) {
+            changed_row(label, value, w)
+        } else {
+            detail_row(label, value, w)
+        }
+    };
     if r.unreadable {
         // Nothing of it could be read: only what is wrong and what helps.
         lines.push(detail_row(
@@ -1266,9 +1348,25 @@ fn draw_details(frame: &mut Frame, app: &App, icons: &Icons, r: &Routine, area: 
         } else {
             "new, not approved yet"
         };
+        // Which settings, also those that have no row below.
+        let what = if changed.is_empty() {
+            String::new()
+        } else {
+            format!(
+                ": {}",
+                changed
+                    .iter()
+                    .map(|l| l.to_lowercase())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
         lines.push(detail_row(
             "Approval",
-            vec![plain(format!("{why} · a shows it for approval"), YELLOW)],
+            vec![plain(
+                format!("{why}{what} · a shows it for approval"),
+                YELLOW,
+            )],
             w,
         ));
     }
@@ -1280,7 +1378,7 @@ fn draw_details(frame: &mut Frame, app: &App, icons: &Icons, r: &Routine, area: 
         when.push(plain(" · ", FAINT));
         when.push(next);
     }
-    lines.push(detail_row("Schedule", when, w));
+    lines.push(row("Schedule", when));
     let last = match app.latest_run(&r.id) {
         Some(run) => {
             let mut words = run_words(icons, run, &now);
@@ -1293,19 +1391,18 @@ fn draw_details(frame: &mut Frame, app: &App, icons: &Icons, r: &Routine, area: 
         None => vec![plain("no run yet", FAINT)],
     };
     lines.push(detail_row("Last run", last, w));
-    lines.push(detail_row("Runs with", text(runs_with(r)), w));
+    lines.push(row("Runs with", text(runs_with(r))));
     if r.is_cron() {
         // The schedule as the crontab line has it; the command is below.
         let when = crate::crontab::when(r).unwrap_or_default();
-        lines.push(detail_row(
+        lines.push(row(
             "Crontab line",
             vec![plain(when, TEXT), plain(" and the command below", FAINT)],
-            w,
         ));
     } else {
-        lines.push(detail_row("Folder", text(clip_start(&f.folder, room)), w));
+        lines.push(row("Folder", text(clip_start(&f.folder, room))));
     }
-    lines.push(detail_row(
+    lines.push(row(
         "Time limit",
         text(format!(
             "{} minute{}, then the run {}",
@@ -1317,10 +1414,9 @@ fn draw_details(frame: &mut Frame, app: &App, icons: &Icons, r: &Routine, area: 
                 "keeps running"
             }
         )),
-        w,
     ));
     if f.retries > 0 {
-        lines.push(detail_row(
+        lines.push(row(
             "If it fails",
             text(match f.retries {
                 1 => format!("tries once more after {} minutes", f.retry_delay_minutes),
@@ -1329,11 +1425,10 @@ fn draw_details(frame: &mut Frame, app: &App, icons: &Icons, r: &Routine, area: 
                     f.retry_delay_minutes
                 ),
             }),
-            w,
         ));
     }
     if f.missed == crate::routine::Missed::RunOnce && f.more.late_hours > 0 {
-        lines.push(detail_row(
+        lines.push(row(
             "If missed",
             text(
                 crate::form::late_text(f.more.late_hours)
@@ -1341,17 +1436,15 @@ fn draw_details(frame: &mut Frame, app: &App, icons: &Icons, r: &Routine, area: 
                     .to_lowercase()
                     .replacen("run once", "runs once", 1),
             ),
-            w,
         ));
     }
     if f.more.off_after_failures > 0 {
-        lines.push(detail_row(
+        lines.push(row(
             "Switches off",
             text(format!(
                 "after {}",
                 crate::form::off_after_text(f.more.off_after_failures).0
             )),
-            w,
         ));
     }
     if !f.more.after_command.trim().is_empty() {
@@ -1360,33 +1453,23 @@ fn draw_details(frame: &mut Frame, app: &App, icons: &Icons, r: &Routine, area: 
         } else {
             "after a run that went wrong"
         };
-        lines.push(detail_row(
+        lines.push(row(
             "After the run",
             vec![
                 plain(f.more.after_command.trim().to_string(), TEXT),
                 plain(format!(" · {when}"), FAINT),
             ],
-            w,
         ));
     }
     if !f.more.account.is_empty() && !r.is_shell() {
-        lines.push(detail_row(
-            "Account",
-            text(app.account_name(&f.more.account)),
-            w,
-        ));
+        lines.push(row("Account", text(app.account_name(&f.more.account))));
     }
     if f.alert != crate::routine::Alert::Notification {
-        lines.push(detail_row(
-            "Alerts",
-            text(f.alert.label().to_lowercase()),
-            w,
-        ));
+        lines.push(row("Alerts", text(f.alert.label().to_lowercase())));
     }
-    lines.push(detail_row(
+    lines.push(row(
         "Run history",
         text(crate::form::keep_text(f.keep_runs, f.keep_days).1),
-        w,
     ));
     if !r.is_shell() {
         let mut extras = Vec::new();
@@ -1400,14 +1483,18 @@ fn draw_details(frame: &mut Frame, app: &App, icons: &Icons, r: &Routine, area: 
             extras.push(format!("extra options: {}", f.args.join(" ")));
         }
         if !extras.is_empty() {
-            lines.push(detail_row("Agent settings", text(extras.join(" · ")), w));
+            lines.push(row("Agent settings", text(extras.join(" · "))));
         }
     }
     // The prompt or command fills the rest.
     let label = if r.is_shell() { "Command" } else { "Prompt" };
     let left = (inner.height as usize).saturating_sub(lines.len());
     if left > 0 {
-        let mut body: Vec<String> = Vec::new();
+        // Of a changed prompt, the lines it did not have before.
+        let lines_before: Option<std::collections::HashSet<&str>> = was
+            .filter(|_| changed.contains(&label))
+            .map(|was| was.prompt.lines().map(str::trim).collect());
+        let mut body: Vec<(String, bool)> = Vec::new();
         for l in r.prompt.lines() {
             if body.len() > left {
                 break;
@@ -1415,21 +1502,31 @@ fn draw_details(frame: &mut Frame, app: &App, icons: &Icons, r: &Routine, area: 
             if l.trim().is_empty() {
                 continue;
             }
-            body.extend(wrap(l, room.max(10)));
+            let new = lines_before
+                .as_ref()
+                .is_some_and(|before| !before.contains(l.trim()));
+            body.extend(wrap(l, room.max(10)).into_iter().map(|row| (row, new)));
         }
         let more = body.len() > left;
         body.truncate(left);
         if more {
-            if let Some(last) = body.last_mut() {
+            if let Some((last, _)) = body.last_mut() {
                 *last = format!("{} …", clip(last, room.saturating_sub(2)));
             }
         }
         if body.is_empty() {
-            lines.push(detail_row(label, vec![plain("empty", FAINT)], w));
+            lines.push(row(label, vec![plain("empty", FAINT)]));
         }
-        for (i, b) in body.into_iter().enumerate() {
-            let shown = if i == 0 { label } else { "" };
-            lines.push(detail_row(shown, vec![plain(b, MUTED)], w));
+        for (i, (b, new)) in body.into_iter().enumerate() {
+            // The sign at the label says the text changed, also when the
+            // changed lines are further down than the panel shows.
+            let lead = match i {
+                0 if changed.contains(&label) => plain(format!("▌{label:<DETAIL_LABEL$}"), YELLOW),
+                0 => plain(format!(" {label:<DETAIL_LABEL$}"), MUTED),
+                _ => plain(" ".repeat(DETAIL_LABEL + 1), MUTED),
+            };
+            let value = plain(b, if new { YELLOW } else { MUTED });
+            lines.push(clip_line(Line::from(vec![lead, value]), w));
         }
     }
     frame.render_widget(Paragraph::new(Text::from(lines)), inner);
@@ -2457,6 +2554,9 @@ fn footer_keys(app: &App) -> Vec<FootKey> {
                     foot("↓", "read to the end to approve", None, 0)
                 });
             }
+            if !log.stops.is_empty() {
+                v.push(foot("n", "next change", hit('n'), 1));
+            }
             v.push(foot("Esc", "close", ESC, 0));
             if log.file.is_some() {
                 v.push(foot("f", "open file", hit('f'), 2));
@@ -3318,6 +3418,55 @@ fn draw_take(frame: &mut Frame, app: &mut App, stage: Rect, jobs: &[crate::cront
     }
 }
 
+/// One row of the output or approval view: a piece of line `line` that
+/// starts at its character `from`.
+struct LogRow {
+    text: String,
+    line: usize,
+    from: usize,
+}
+
+/// A row as it is drawn. In the approval view (`gutter`), a new or changed
+/// row has `▌` before it and what is new in it in yellow (all of it, when
+/// the whole line is new); a row from before has `−` and is grey, with
+/// what is gone crossed out. Colour never says it alone.
+fn log_row(row: LogRow, mark: Option<&Diff>, gutter: bool) -> Line<'static> {
+    let text = Style::new().fg(TEXT);
+    let grey = Style::new().fg(MUTED);
+    let none: &[(usize, usize)] = &[];
+    // The sign, the row's own style, and the style of the marked ranges.
+    let (sign, base, strong, ranges) = match mark {
+        Some(Diff::Changed(r)) => (plain("▌ ", YELLOW), text, bold(YELLOW), r.as_slice()),
+        Some(Diff::Removed(r)) => (
+            plain("− ", MUTED),
+            grey,
+            grey.add_modifier(Modifier::CROSSED_OUT),
+            r.as_slice(),
+        ),
+        _ => (plain("  ", MUTED), text, text, none),
+    };
+    let mut spans = Vec::new();
+    if gutter {
+        spans.push(sign);
+    }
+    let marked = |at: usize| ranges.iter().any(|(a, b)| (*a..*b).contains(&at));
+    let (mut piece, mut piece_marked) = (String::new(), false);
+    for (k, c) in row.text.chars().enumerate() {
+        let m = marked(row.from + k);
+        if m != piece_marked && !piece.is_empty() {
+            let style = if piece_marked { strong } else { base };
+            spans.push(Span::styled(std::mem::take(&mut piece), style));
+        }
+        piece_marked = m;
+        piece.push(c);
+    }
+    spans.push(Span::styled(
+        piece,
+        if piece_marked { strong } else { base },
+    ));
+    Line::from(spans)
+}
+
 /// A run's output, or a routine to approve. How the run went and why
 /// stays above the text; the keys are in the footer.
 fn draw_log(frame: &mut Frame, app: &mut App, stage: Rect, mut log: LogView) {
@@ -3335,12 +3484,22 @@ fn draw_log(frame: &mut Frame, app: &mut App, stage: Rect, mut log: LogView) {
         inner = Rect::new(inner.x, inner.y + 2, inner.width, inner.height - 2);
     }
     let visible = inner.height.saturating_sub(1);
-    // Long lines wrap, so nothing hides past the right edge.
-    let mut rows: Vec<String> = log
-        .lines
-        .iter()
-        .flat_map(|l| hard_wrap(&l.replace('\t', "    "), inner.width as usize))
-        .collect();
+    // With marks, a column at the left says which rows changed.
+    let gutter = !log.marks.is_empty();
+    let text_w = (inner.width as usize)
+        .saturating_sub(if gutter { 2 } else { 0 })
+        .max(1);
+    // Long lines wrap, so nothing hides past the right edge. Each row
+    // knows its line and where in it it starts, for the marks.
+    let mut rows: Vec<LogRow> = Vec::new();
+    for (line, l) in log.lines.iter().enumerate() {
+        let mut from = 0;
+        for text in hard_wrap(&l.replace('\t', "    "), text_w) {
+            let len = text.chars().count();
+            rows.push(LogRow { text, line, from });
+            from += len;
+        }
+    }
     // The view scrolls over at most 65,535 rows; of more, it shows the
     // end. A routine that long cannot be read in full here, so it cannot
     // be approved here either: `y` must never approve rows nobody could
@@ -3348,20 +3507,36 @@ fn draw_log(frame: &mut Frame, app: &mut App, stage: Rect, mut log: LogView) {
     if rows.len() > u16::MAX as usize && log.approve.take().is_some() {
         let note = "It is too long to show in full (more than 65,535 rows), so it cannot be approved here. Shorten its prompt or command first.";
         log.lines.extend([String::new(), note.to_string()]);
-        rows.push(String::new());
-        rows.extend(hard_wrap(note, inner.width as usize));
+        // Past the last mark: plain rows.
+        let row = |text: String| LogRow {
+            text,
+            line: usize::MAX,
+            from: 0,
+        };
+        rows.push(row(String::new()));
+        rows.extend(hard_wrap(note, text_w).into_iter().map(row));
         log.scroll = u16::MAX;
     }
     let over = rows.len().saturating_sub(u16::MAX as usize);
-    let rows: Vec<String> = rows.into_iter().skip(over).collect();
+    let rows: Vec<LogRow> = rows.into_iter().skip(over).collect();
     let total = rows.len().min(u16::MAX as usize) as u16;
     log.max = total.saturating_sub(visible);
     log.scroll = log.scroll.min(log.max);
+    let differs = |row: &LogRow| log.marks.get(row.line).is_some_and(Diff::differs);
+    log.stops = rows
+        .iter()
+        .enumerate()
+        .filter(|(k, row)| differs(row) && (*k == 0 || !differs(&rows[k - 1])))
+        .map(|(k, _)| k as u16)
+        .collect();
     let lines: Vec<Line> = rows
         .into_iter()
         .skip(log.scroll as usize)
         .take(visible as usize)
-        .map(|l| Line::from(Span::styled(l, Style::new().fg(TEXT))))
+        .map(|row| {
+            let mark = log.marks.get(row.line);
+            log_row(row, mark, gutter)
+        })
         .collect();
     frame.render_widget(
         Paragraph::new(Text::from(lines)),
@@ -3782,6 +3957,10 @@ const HELP: [(&str, &[(&str, &str)]); 7] = [
             ),
             ("f", "open the output file"),
             ("y", "approve, once read to the end"),
+            (
+                "n",
+                "to approve a routine that was approved before: go to the next change (▌ yellow: new or changed, − grey: gone)",
+            ),
             ("Esc  ⏎  q", "close"),
         ],
     ),

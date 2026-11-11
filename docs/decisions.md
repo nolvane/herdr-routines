@@ -1080,3 +1080,25 @@ exactly that, so it gets paths and a warning instead of the text, and
 does nothing without the owner's yes. Starting a new session with the
 files (not resuming the run's own session) works the same for every
 agent kind, for shell commands and after the run's tab is closed.
+
+## 2026-11-11: The approval view marks what changed, from an own small diff
+
+For a routine that was approved before, the approval view compares its
+text (settings and prompt, as shown) with the same text of the approved
+version (`Approvals::routine`) and marks the difference: new and changed
+lines with `▌` and the new words in yellow, the line as it was above them
+in grey with `−` and what is gone crossed out. The details under the list
+name the changed settings and mark their rows the same way. The view
+still shows everything that would run, `y` still needs the end of it, and
+the marks never decide anything: they only say where to look. `diff.rs`
+does it with a plain longest-common-subsequence over lines and, inside a
+line that was edited, over words; past four million cells it gives up on
+the fine picture and marks the whole part as replaced.
+
+Why: after an agent changed one sentence of a long prompt, the owner had
+to read all of it again to find that sentence, which invites approving
+without reading. An own diff of about 150 lines is enough for texts of
+this size and avoids a dependency. The old line is shown and not only the
+new one, since a change that only removes words ("never delete" to
+"delete") would otherwise leave nothing to mark. A sign stands beside the
+colour so the marks also read without it.

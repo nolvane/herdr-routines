@@ -132,7 +132,12 @@ always stays).
   approved yet" or "Changed outside the list", until you press `a`, read
   what it would run (every setting, every
   option and the whole prompt or command) to the end and approve it with
-  `y`. When a waiting routine's time comes, Herdr tells you once. So an
+  `y`. For a routine you approved before, what changed since is marked:
+  under the list, the changed settings are named and their rows are
+  yellow with `▌` in front; in the view, new or changed lines have `▌`
+  and the new words in yellow, the line as it was stands above in grey
+  with `−` and what is gone crossed out, and `n` jumps to the next
+  change. When a waiting routine's time comes, Herdr tells you once. So an
   agent that writes routine files the normal way cannot make the
   scheduler run something you have not seen, such as a stronger
   permission mode or a shell command. A cron job that waits keeps the
@@ -327,7 +332,7 @@ their runs.
 | `n` | New: a Herdr routine, a cron job, or describe it to Claude |
 | `p` | Write the prompt or command |
 | `r` | Run now (asks first) |
-| `a` | Approve a routine that is new or was changed outside the list (shows it first) |
+| `a` | Approve a routine that is new or was changed outside the list (shows it first, with what changed marked; `n` there goes to the next change) |
 | `space` | Switch on or off |
 | `c` | Duplicate the routine; the copy starts switched off |
 | `o` | Go to the tab of the last run (in Runs: of the run, or its output once the tab is closed) |

@@ -33,7 +33,8 @@ each run in its own tab. What it does and how users install it:
   list. `alert.rs`: notifications and the popup pane about a run.
   `crontab.rs`: the user's crontab, managed cron jobs and their wrapper.
   `awake.rs`: keeping the computer awake. `accounts.rs`: the Multiaccount
-  plugin's accounts.
+  plugin's accounts. `diff.rs`: what changed between two texts, for the
+  marks in the approval view.
 - `app.rs`: the list's state, keys and mouse. `ui.rs`: drawing, in the look
   of the Git Panel and Multiaccount plugins (keep them alike).
   `form.rs`: the edit form. `editor.rs`: the prompt editor. `pane.rs`: the

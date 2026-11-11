@@ -29,6 +29,7 @@ mod awake;
 mod clipboard;
 mod cron;
 mod crontab;
+mod diff;
 mod editor;
 mod form;
 mod herdr;

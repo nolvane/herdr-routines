@@ -320,6 +320,12 @@ pub struct LogView {
     pub approve: Option<(String, crate::approval::Snapshot)>,
     /// A line that stays above the scrolled text: how a run went and why.
     pub note: String,
+    /// In the approval view of a routine that was approved before: how
+    /// each line differs from that approval. Empty everywhere else.
+    pub marks: Vec<crate::diff::Diff>,
+    /// The rows where a changed place begins, set when drawn; `n` goes to
+    /// the next one.
+    pub stops: Vec<u16>,
 }
 
 /// One run on a page of its own: how it went, its result and the end of
@@ -541,6 +547,9 @@ pub struct App {
     /// Routines that were approved at least once: one that waits again
     /// was changed, any other is new.
     pub known: HashSet<String>,
+    /// Of each routine that was changed outside the list and waits: what
+    /// it was when it was approved last, to show what changed.
+    pub before: HashMap<String, Routine>,
     /// The marked way in the dialog that takes over cron jobs.
     pub take_sel: usize,
     /// The size the list was last drawn at.
@@ -603,6 +612,7 @@ impl App {
             dialog: None,
             filter_from: None,
             known: HashSet::new(),
+            before: HashMap::new(),
             take_sel: 0,
             size: (0, 0),
             quit: false,
@@ -640,10 +650,14 @@ impl App {
             self.cron_pull();
         }
         self.routines = routine::load_all(&self.paths);
-        self.known = crate::approval::Approvals::load(&self.paths)
-            .0
-            .into_keys()
+        let approvals = crate::approval::Approvals::load(&self.paths);
+        self.before = self
+            .routines
+            .iter()
+            .filter(|r| !r.approved && !r.unreadable)
+            .filter_map(|r| approvals.routine(&r.id).map(|was| (r.id.clone(), was)))
             .collect();
+        self.known = approvals.0.into_keys().collect();
         self.all_runs = store::all_runs(&self.paths);
         // A filter stays while its routine or any of its runs is there
         // (runs can outlive a deleted routine).
@@ -1623,6 +1637,8 @@ impl App {
             file,
             approve: None,
             note,
+            marks: Vec::new(),
+            stops: Vec::new(),
         });
     }
 
@@ -2028,15 +2044,20 @@ impl App {
             self.reload();
             return self.flash("It is approved: it runs as saved", MUTED);
         }
+        // What it was when the owner approved it last, to mark what changed.
+        let before = approvals.routine(&r.id);
+        let (lines, marks) = approval_view(&self.paths, &now, before.as_ref());
         self.mode = Mode::Log(LogView {
             title: visible_text(&format!("Approve {}?", now.file.name)),
-            lines: approval_lines(&self.paths, &now),
+            lines,
             scroll: 0,
             // Unknown until drawn, so `y` cannot approve unseen text.
             max: u16::MAX,
             file: None,
             approve: Some((r.id, files)),
             note: String::new(),
+            marks,
+            stops: Vec::new(),
         });
     }
 
@@ -2666,6 +2687,17 @@ impl App {
                     }
                     KeyCode::Home | KeyCode::Char('g') => log.scroll = 0,
                     KeyCode::End | KeyCode::Char('G') => log.scroll = log.max,
+                    // The next changed place, with a row above it for
+                    // context; after the last one, the first again.
+                    KeyCode::Char('n') if !log.stops.is_empty() => {
+                        let at = |stop: &u16| stop.saturating_sub(1).min(log.max);
+                        log.scroll = log
+                            .stops
+                            .iter()
+                            .map(at)
+                            .find(|row| *row > log.scroll)
+                            .unwrap_or_else(|| at(&log.stops[0]));
+                    }
                     KeyCode::Char('f') => {
                         if let Some(path) = log.file.clone() {
                             if !(self.opener)(OPENER, &path.to_string_lossy()) {
@@ -3582,6 +3614,56 @@ fn approval_lines(paths: &Paths, r: &Routine) -> Vec<String> {
     lines.push(String::new());
     lines.push("y approves exactly this. Esc leaves it waiting.".into());
     lines.iter().map(|l| visible_text(l)).collect()
+}
+
+/// The approval view of a routine, and for one that was approved before
+/// (`before`) how each line differs from that approval: what is new or
+/// changed, and, shown before it, what is gone. A routine that was never
+/// approved has no marks: all of it is new.
+fn approval_view(
+    paths: &Paths,
+    now: &Routine,
+    before: Option<&Routine>,
+) -> (Vec<String>, Vec<crate::diff::Diff>) {
+    use crate::diff::Diff;
+    // Tabs as the view draws them, so a marked place is where it shows.
+    let text = |r: &Routine| -> Vec<String> {
+        approval_lines(paths, r)
+            .into_iter()
+            .map(|l| l.replace('\t', "    "))
+            .collect()
+    };
+    let new = text(now);
+    let Some(before) = before else {
+        return (new, Vec::new());
+    };
+    let (mut lines, marks): (Vec<String>, Vec<Diff>) =
+        crate::diff::lines(&text(before), &new).into_iter().unzip();
+    let places = marks
+        .iter()
+        .enumerate()
+        .filter(|(i, m)| m.differs() && (*i == 0 || !marks[i - 1].differs()))
+        .count();
+    let gone = marks.iter().any(|m| matches!(m, Diff::Removed(_)));
+    let what = match places {
+        0 => "Its files were changed outside the list (by an agent or an editor) since you approved it, but nothing of what is shown here differs from what you approved: only spacing or comments in a file did.".to_string(),
+        n => format!(
+            "It was changed outside the list (by an agent or an editor) since you approved it, in {n} {}. ▌ and yellow: new or changed.{} n goes to the next change.",
+            if n == 1 { "place" } else { "places" },
+            if gone {
+                " − and grey: what was there before and is gone."
+            } else {
+                ""
+            }
+        ),
+    };
+    // The first line is the same sentence for every routine: this one
+    // says more.
+    if marks.first() == Some(&Diff::Same) {
+        lines[0] =
+            format!("{what} It runs on schedule only once you approve exactly what follows.");
+    }
+    (lines, marks)
 }
 
 /// What happens with a missed time, with the hours a catch-up run may be
@@ -6556,6 +6638,229 @@ mod tests {
         ] {
             assert!(brief.contains(word), "{word}");
         }
+    }
+
+    #[test]
+    fn the_approval_view_marks_what_changed_since_the_last_approval() {
+        use crate::diff::Diff;
+        use ratatui::style::Modifier;
+        let mut a = app("approve-marks");
+        // "Morning report" is approved. Something outside the list gives
+        // it another folder and a longer prompt.
+        let mut r = Routine::load(&a.paths, "morning-report").unwrap();
+        // Folders that are there, so no problem line changes along.
+        r.file.folder = "/usr".into();
+        let filler: Vec<String> = (0..60)
+            .map(|i| format!("Step {i} stays as it was."))
+            .collect();
+        r.prompt = format!("Do task 0.\n{}\nThen stop.", filler.join("\n"));
+        r.save_approved(&a.paths).unwrap();
+        r.file.folder = "/usr/bin".into();
+        r.prompt = format!(
+            "Do task 0.\n{}\nThen delete the folder and stop.\nTell nobody.",
+            filler.join("\n")
+        );
+        r.save(&a.paths).unwrap();
+        a.reload();
+        a.select_id("morning-report");
+        // Before `a`: the details under the list say what changed and
+        // mark those rows.
+        let all = screen(&mut a, 140, 44).join("\n");
+        for part in [
+            "changed outside the list: folder, prompt · a shows it for approval",
+            "▌Folder          /usr/bin",
+            "▌Prompt          Do task 0.",
+            " Time limit      120 minutes",
+        ] {
+            assert!(all.contains(part), "no {part:?} in\n{all}");
+        }
+        press(&mut a, KeyCode::Char('a'));
+        let Mode::Log(v) = a.mode.clone() else {
+            panic!("no approval view: {:?}", a.mode);
+        };
+        assert_eq!(v.lines.len(), v.marks.len());
+        assert!(v.lines[0].contains("in 2 places"), "{}", v.lines[0]);
+        assert!(v.lines[0].contains("only once you approve exactly what follows"));
+        let mark = |text: &str| {
+            let i = v.lines.iter().position(|l| l == text);
+            i.map(|i| v.marks[i].clone())
+                .unwrap_or_else(|| panic!("no line {text:?} in {:#?}", v.lines))
+        };
+        // The folder: the old line, then the new one with what was added.
+        assert_eq!(mark("Folder: /usr"), Diff::Removed(vec![]));
+        assert_eq!(mark("Folder: /usr/bin"), Diff::Changed(vec![(12, 16)]));
+        assert_eq!(mark("Name: Morning report"), Diff::Same);
+        assert_eq!(mark("  Step 7 stays as it was."), Diff::Same);
+        // The prompt: an edited line and a new one.
+        assert_eq!(mark("  Then stop."), Diff::Removed(vec![]));
+        assert_eq!(
+            mark("  Then delete the folder and stop."),
+            Diff::Changed(vec![(7, 29)])
+        );
+        assert_eq!(mark("  Tell nobody."), Diff::Changed(vec![(0, 14)]));
+
+        // Drawn: a sign in front, the new words yellow, the rest as ever.
+        let draw = |a: &mut App| {
+            let mut t = Terminal::new(TestBackend::new(100, 24)).unwrap();
+            t.draw(|f| ui::draw(f, a)).unwrap();
+            t.backend().buffer().clone()
+        };
+        let find = |buf: &ratatui::buffer::Buffer, word: &str| -> Option<(u16, u16)> {
+            (0..24u16).find_map(|y| {
+                let row: Vec<String> = (0..100u16)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect();
+                let line = row.concat();
+                // Columns, not bytes: every cell here is one column wide.
+                line.find(word)
+                    .map(|at| (line[..at].chars().count() as u16, y))
+            })
+        };
+        let buf = draw(&mut a);
+        let (x, y) = find(&buf, "/usr/bin").expect("the new folder shows");
+        assert_eq!(buf[(x, y)].fg, crate::theme::TEXT, "what stayed is plain");
+        assert_eq!(buf[(x + 5, y)].fg, YELLOW, "what is new is yellow");
+        let row: String = (0..x).map(|i| buf[(i, y)].symbol()).collect();
+        assert!(row.contains("▌ Folder: "), "{row:?}");
+        // The line from before stands above it, grey, with a minus.
+        let above: String = (0..100u16).map(|i| buf[(i, y - 1)].symbol()).collect();
+        assert!(above.contains("− Folder: /usr "), "{above:?}");
+        assert_eq!(buf[(x, y - 1)].fg, MUTED);
+
+        // `n` goes from change to change and around; `y` still needs the end.
+        let Mode::Log(drawn) = a.mode.clone() else {
+            panic!()
+        };
+        assert_eq!(drawn.stops.len(), 2, "{:?}", drawn.stops);
+        assert!(footer(&mut a, 100, 24).contains("n next change"));
+        press(&mut a, KeyCode::Char('y'));
+        assert!(matches!(a.mode, Mode::Log(_)), "not read to the end yet");
+        // To the folder near the top, then to the prompt's end.
+        press(&mut a, KeyCode::Char('n'));
+        let Mode::Log(first) = a.mode.clone() else {
+            panic!()
+        };
+        assert_eq!(first.scroll, drawn.stops[0] - 1);
+        press(&mut a, KeyCode::Char('n'));
+        let buf = draw(&mut a);
+        let (x, y) = find(&buf, "Then delete the folder").expect("the changed prompt line shows");
+        assert_eq!(buf[(x, y)].fg, crate::theme::TEXT);
+        assert_eq!(buf[(x + 5, y)].fg, YELLOW);
+        let (x, y) = find(&buf, "Then stop.").expect("the line from before shows");
+        assert_eq!(buf[(x, y)].fg, MUTED);
+        assert!(!buf[(x, y)].modifier.contains(Modifier::CROSSED_OUT));
+        let (x, y) = find(&buf, "Tell nobody.").unwrap();
+        assert_eq!(buf[(x, y)].fg, YELLOW);
+        let Mode::Log(second) = a.mode.clone() else {
+            panic!()
+        };
+        assert!(second.scroll > first.scroll);
+        press(&mut a, KeyCode::Char('n'));
+        let Mode::Log(around) = a.mode.clone() else {
+            panic!()
+        };
+        assert_eq!(around.scroll, first.scroll, "back at the first change");
+        // Read to the end, approve: the routine is approved as shown.
+        press(&mut a, KeyCode::End);
+        draw(&mut a);
+        press(&mut a, KeyCode::Char('y'));
+        assert!(matches!(a.mode, Mode::Normal));
+        assert!(
+            a.routines
+                .iter()
+                .find(|r| r.id == "morning-report")
+                .unwrap()
+                .approved
+        );
+    }
+
+    #[test]
+    fn the_approval_view_has_no_marks_for_a_new_routine_and_says_when_nothing_shown_changed() {
+        let mut a = app("approve-new");
+        // "Weekly cleanup" was never approved: all of it is new.
+        a.select_id("weekly-cleanup");
+        press(&mut a, KeyCode::Char('a'));
+        let Mode::Log(v) = a.mode.clone() else {
+            panic!("{:?}", a.mode);
+        };
+        assert!(v.marks.is_empty());
+        assert!(v.lines[0].starts_with("It was created or changed outside the list"));
+        assert!(!footer(&mut a, 100, 24).contains("next change"));
+        press(&mut a, KeyCode::Esc);
+        // A comment added to an approved routine's file: it waits again,
+        // and the view says that nothing it shows differs.
+        let file = a.paths.routine_dir("morning-report").join("routine.toml");
+        let text = std::fs::read_to_string(&file).unwrap();
+        std::fs::write(&file, format!("{text}\n# a note\n")).unwrap();
+        a.reload();
+        a.select_id("morning-report");
+        press(&mut a, KeyCode::Char('a'));
+        let Mode::Log(v) = a.mode.clone() else {
+            panic!("{:?}", a.mode);
+        };
+        assert!(!v.marks.is_empty() && v.marks.iter().all(|m| !m.differs()));
+        assert!(
+            v.lines[0].contains("nothing of what is shown here differs"),
+            "{}",
+            v.lines[0]
+        );
+        press(&mut a, KeyCode::Esc);
+        let all = screen(&mut a, 140, 44).join("\n");
+        assert!(
+            all.contains("Approval        changed outside the list · a shows it for approval"),
+            "{all}"
+        );
+        assert!(!all.contains('▌'), "{all}");
+    }
+
+    #[test]
+    fn the_details_name_a_change_that_has_no_row() {
+        let mut a = app("details-marks");
+        let mut r = Routine::load(&a.paths, "morning-report").unwrap();
+        r.file.retries = 2;
+        r.save_approved(&a.paths).unwrap();
+        // Outside the list: switched off, no more retries, a new line in
+        // the prompt.
+        r.file.enabled = false;
+        r.file.retries = 0;
+        r.prompt.push_str("\nAnd one more thing.");
+        r.save(&a.paths).unwrap();
+        a.reload();
+        a.select_id("morning-report");
+        let mut t = Terminal::new(TestBackend::new(140, 44)).unwrap();
+        t.draw(|f| ui::draw(f, &mut a)).unwrap();
+        let buf = t.backend().buffer().clone();
+        let rows: Vec<String> = (0..44u16)
+            .map(|y| (0..140u16).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+        let all = rows.join("\n");
+        assert!(
+            all.contains("changed outside the list: on/off, if it fails, prompt · a shows it"),
+            "{all}"
+        );
+        // The row for retries is gone with them; the new prompt line is
+        // yellow, the one from before is not.
+        assert!(!all.contains("If it fails     "), "{all}");
+        let cell = |text: &str| {
+            let y = rows.iter().position(|r| r.contains(text)).unwrap();
+            let x = rows[y]
+                .find(text)
+                .map(|at| rows[y][..at].chars().count())
+                .unwrap();
+            buf[(x as u16, y as u16)].fg
+        };
+        assert_eq!(cell("And one more thing."), YELLOW);
+        assert_eq!(cell("Then stop."), MUTED);
+        // Approved again: nothing is marked any more.
+        press(&mut a, KeyCode::Char('a'));
+        press(&mut a, KeyCode::End);
+        screen(&mut a, 140, 44);
+        press(&mut a, KeyCode::Char('y'));
+        let all = screen(&mut a, 140, 44).join("\n");
+        assert!(
+            !all.contains('▌') && !all.contains("changed outside"),
+            "{all}"
+        );
     }
 
     #[test]

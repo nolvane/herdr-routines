@@ -46,6 +46,11 @@ All notable changes to this plugin. The format follows
   run): a tab with Claude Code that has the run's record and output and
   the routine's files to read, says what happened, answers questions and
   changes the routine when asked. A change waits for approval in the list.
+- A routine that was changed outside the list shows what changed since
+  you approved it: the details under the list name the changed settings
+  and mark their rows in yellow, and the approval view (`a`) marks new
+  and changed lines, with the new words in yellow and the line as it was
+  above them. `n` goes to the next change.
 - `routines` (JSON) also prints the new settings and how many runs went
   wrong in a row; `runs` says whether a run counts as a problem.
 
