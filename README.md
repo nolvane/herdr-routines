@@ -7,52 +7,58 @@ the time comes, the plugin opens a tab in the background, starts the agent
 there and hands it the prompt. You can watch any run live, answer when the
 agent asks something and keep talking to it afterwards. A routine can also
 be a plain shell command or script, without any AI, and such a command can
-also be a classic cron job that your system's cron runs.
+also be a cron job that your system's cron runs.
 
 Routines run as long as the Herdr server runs, also when no Herdr window is
 open. Herdr can also start in the background at login (the list asks once,
 and the "autostart" chip at the top or `A` switches it), so routines also
-run after a restart without opening Herdr. Classic cron jobs run whenever
+run after a restart without opening Herdr. Cron jobs run whenever
 the computer is on. The "routines" chip at the top (or `S`) switches all of
 them on or off at once.
 
 ```
- ◷ Scheduled routines    Routines (3)   Cron jobs (2)   Runs (41)     ● autostart on   ● routines on
+ ◷ Scheduled routines    Routines (3)   Cron jobs (2)   Runs (41)   ● autostart on   ● routines on
 
-    Routine                                     Schedule                  Last run
- ●  Inbox clean up                              Weekdays, hourly at :15   ✓ Finished  12 runs ›
-    claude · Sonnet · Auto · ~/mail             next in 12 min            48 min ago · took 3 min
- ●  Nightly backup                              Daily at 02:00            ✓ Finished  30 runs ›
-    shell · ./backup.sh --all · ~/code/app      next 02:00                10 h ago · took 4 min
- ●  Release notes                               Monthly on the 1st        –
-    claude · Opus · Plan only · ~/code/app      off                       no run yet
+      Routine                                 Schedule                  Last run
+ ●    Inbox clean up                          Weekdays, hourly at :15   ✓ Finished  12 runs ›
+      claude · Sonnet · Auto · ~/mail         next in 12 min            48 min ago · took 3 min
+ ●    Nightly backup                          Daily at 02:00            ✗ Failed  30 runs ›
+      shell command · ./backup.sh --all · …   next Thu 02:00            10 h ago · took 4 min
+ ○    Release notes                           Monthly on the 1st        –
+      claude · Opus · Plan only · ~/code/app  off                       no run yet
 
- Inbox clean up ──────────────────────────────────────────────────────────────────────
- Schedule       Weekdays, hourly at :15 · next 10:15
- Agent          claude · Auto · Sonnet
- Folder         ~/mail
- Time limit     30 minutes, then stops · retries once after 5 min
- Last run       ✓ Finished · 48 min ago · 3 newsletters archived, 2 drafts written
- Prompt         Sort the new mail in the inbox: archive newsletters,
-                draft replies to questions …
+  Inbox clean up ────────────────────────────────────────────────────────────────────────────────
+  Schedule        Weekdays, hourly at :15 · next in 12 min
+  Last run        ✓ Finished · 48 min ago · 3 newsletters archived, 2 drafts written
+  Runs with       claude · Sonnet · Auto
+  Folder          ~/mail
+  Time limit      30 minutes, then the run is stopped
+  If it fails     tries once more after 5 minutes
+  Run history     The last 30 runs, none older than 90 days
+  Prompt          Sort the new mail in the inbox: archive newsletters,
+                  draft replies to questions …
 
- ⏎ edit  n new  r run now  space on/off  ? all keys  q close
+ ⏎ edit  n new  r run now  space on/off  l output  h its runs  p prompt  ? all keys  q close
 ```
 
-The dot in front of a routine is green when it is on and red when it is
-off; a yellow warning sign marks a routine with a problem. In a tall enough
-window, the selected routine's details show under the list.
+The sign in front of a routine says how it stands, by shape as well as by
+colour: `●` on, `○` off, `!` a problem, `◐` waits for your approval. The
+selected routine's details show under the list whenever rows are free. In a
+narrow pane the list keeps the last run: it moves into the routine's second
+line, and the header drops its title before anything else ("routines off"
+always stays).
 
 ## What it does
 
 - **List of routines** with their schedule in words, the next time and the
   last run. Switch a routine on or off with one key, run it now, edit it,
-  write its prompt, copy it (the copy starts switched off), or create and
-  delete routines. The edit form is grouped into parts: the routine, its
-  schedule, what happens when it runs long or fails, the agent extras and
-  the prompt, of which it shows the first lines. Works with the keyboard
-  and the mouse, like the other Herdr plugins of this author; `?` shows all
-  keys.
+  write its prompt, duplicate it (the copy starts switched off), or create
+  and delete routines. The form starts with what a routine needs: its name,
+  what it runs with, the prompt (its first lines show), when and where.
+  Everything else (permission mode, model, time limit, retries, alerts, run
+  history and more) is under "More settings", with values that suit most
+  routines. Works with the keyboard and the mouse, like the other Herdr
+  plugins of this author; `?` shows all keys.
 - **Permission mode, model and effort** per routine, picked from a list:
   for Claude Code the permission modes (Auto, Accept edits, Plan only and
   more), the models (Fable, Opus, Sonnet, Haiku or any typed name) and the
@@ -62,17 +68,17 @@ window, the selected routine's details show under the list.
   Antigravity; refreshed daily in the background), its documented aliases,
   models other routines use, or any typed name. New routines start in
   Auto, since nobody watches a scheduled run.
-- **Shell commands:** choose "Shell command" as the agent and write the
+- **Shell commands:** choose "Shell command" under "Runs with" and write the
   command or script instead of a prompt. It runs in its own tab in the
   folder, with your shell and its environment. Exit code 0 counts as
   finished; any other code marks the run as failed and Herdr shows a
   notification.
-- **Classic cron jobs** have their own tab. `n`, then "Classic cron job",
+- **Cron jobs** have their own tab. `n`, then "Cron job",
   creates one: a one-line shell command that the system's cron runs from
   your crontab, also when Herdr is closed. It stays an ordinary line in
   your crontab: the list edits that line (schedule, command, on or off),
-  and keeps what cron has no place for (its name, retries, alerts, how
-  many runs to keep) in the plugin. Edits you make to the line by hand win
+  and keeps what cron has no place for (its name, retries, alerts, its run
+  history) in the plugin. Edits you make to the line by hand win
   and show in the list. Its runs (output, result, exit code, failures,
   retries, alerts) show in Runs like any other, and `r` runs it now, in
   the background, as cron would. Every change to the crontab keeps a
@@ -85,12 +91,13 @@ window, the selected routine's details show under the list.
   **Before you remove the plugin or its state folder, hand these jobs
   back to cron** (see [Uninstall](#uninstall)): cron starts them through
   that folder and cannot start them without it.
-- **Your other cron jobs** show in the Cron jobs tab too (◇). `⏎` on one (or
-  `C` for all) offers: keep it as a cron job but manage it here (its line
-  stays where it is, as you wrote it), move it to Herdr (it runs in a tab
-  instead), or copy it to Herdr switched off. Moving comments the old
-  crontab line out, so nothing runs twice. Variables set in the crontab
-  (such as `PATH`) come along.
+- **Your other cron jobs** show in the Cron jobs tab too (◇), marked "only
+  in your crontab". `⏎` on one (or `C` for all) takes them over: keep it as
+  a cron job (its line stays where it is, as you wrote it, and the list
+  follows its runs), move it to Herdr (it runs in a tab instead), or copy
+  it to Herdr switched off. Keeping and moving change your crontab, so they
+  ask first. Moving comments the old crontab line out, so nothing runs
+  twice. Variables set in the crontab (such as `PATH`) come along.
 - **How cron jobs are followed:** the plugin puts a comment above a managed
   job's line and sets `SHELL` around it to a small wrapper (a link to the
   plugin in its state folder, named after the job). Cron starts the
@@ -101,15 +108,17 @@ window, the selected routine's details show under the list.
   are the ones you approved; at the time limit it stops the command and
   everything the command started.
 - **Run history:** each routine and cron job keeps its last 30 runs, none
-  older than 90 days, by default. "Keep" in the form changes that (such as
-  10 runs, 100 runs and a year, or all runs).
+  older than 90 days, by default. "Run history" in the form (under "More
+  settings") changes that (such as 10 runs, 100 runs and a year, or all
+  runs).
 - **Create with Claude:** `n`, then "Describe it to Claude", opens a tab
   where Claude asks what the routine should do, writes it and checks that
   it loads. You then approve it in the list with `a`.
 - **Your approval:** a routine runs only as you saved it in the list or
   approved it there. When anything else creates or changes its files (an
-  agent, an editor outside the list), it waits, marked "Changed outside the
-  list", until you press `a`, read what it would run (every setting, every
+  agent, an editor outside the list), it waits, marked `◐` and "New, not
+  approved yet" or "Changed outside the list", until you press `a`, read
+  what it would run (every setting, every
   option and the whole prompt or command) to the end and approve it with
   `y`. When a waiting routine's time comes, Herdr tells you once. So an
   agent that writes routine files the normal way cannot make the
@@ -129,13 +138,17 @@ window, the selected routine's details show under the list.
 - **Prompt editor** in the list: type, paste, move with the arrows or the
   mouse, mark text with Shift and the arrows or by dragging, copy, cut and
   paste with `Ctrl+C`, `Ctrl+X`, `Ctrl+V`, undo with `Ctrl+Z`. `Esc`
-  closes it and keeps what you wrote. `Ctrl+O` opens the prompt in your own
-  editor instead.
+  closes it and keeps what you wrote (a routine's prompt is saved at once;
+  in the form it goes back to the form). `Ctrl+D` leaves without keeping
+  what you wrote since it opened, after asking. `Ctrl+O` opens the prompt in
+  your own editor instead.
 - **Runs** of all routines, newest first: status, how it was started (on
-  time, catch-up, retry or by hand), how long it took and what it came to.
-  "n runs" next to a routine (or `h`) shows only its runs. `⏎` jumps to the
-  run's tab, `l` shows its result and output, also after the tab is
-  closed (of a very long output its end), and `f` opens the output file.
+  time, catch-up, retry or by hand), how long it took, what it came to and,
+  when it failed, why. "n runs ›" next to a routine (or `h`) shows only its
+  runs, and `Esc` comes back to the routine. `⏎` goes to the run's tab, `l`
+  shows its result and output, also after the tab is closed (of a very
+  long output its end), with the reason of a failure kept above the
+  output, and `f` opens the output file.
 - **Output kept:** a shell command's whole output goes into a file; an
   agent's tab is saved every minute while it is open, so closing the tab by
   hand loses nothing.
@@ -167,7 +180,7 @@ window, the selected routine's details show under the list.
   run carries on. This also covers questions before the agent is ready, such
   as Claude asking whether to trust a new folder: the prompt goes in once
   you answered.
-- **Notification or popup** per routine ("Tell me by"): Herdr's usual
+- **Notification or popup** per routine ("Alerts"): Herdr's usual
   notification, a popup in Herdr that stays in front until you press OK
   when a run fails, runs too long or needs you, or such a popup also when
   a run finishes. The popup can take you to the run's tab.
@@ -248,33 +261,50 @@ their runs.
 
 | Key | Does |
 | --- | --- |
-| `↑` `↓` | Move |
-| `⏎` | Edit the routine (in Runs: go to the run's tab) |
-| `n` | New: a Herdr routine, a classic cron job, or describe it to Claude |
-| `p` | Write the prompt |
+| `↑` `↓` | Move (`PgUp` `PgDn` a page, `g` `G` first and last) |
+| `⏎` | Edit the routine (in Runs: go to the run's tab, or its output once the tab is closed) |
+| `n` | New: a Herdr routine, a cron job, or describe it to Claude |
+| `p` | Write the prompt or command |
 | `r` | Run now (asks first) |
-| `a` | Approve a routine changed outside the list (shows it first) |
+| `a` | Approve a routine that is new or was changed outside the list (shows it first) |
 | `space` | Switch on or off |
-| `c` | Copy the routine; the copy starts switched off |
+| `c` | Duplicate the routine; the copy starts switched off |
 | `o` | Go to the tab of the last run |
-| `l` | Result and output of the last run |
-| `h` | Only this routine's runs (`Esc` shows all again) |
+| `l` | Output of the last run |
+| `h` | The routine's runs (`Esc` comes back to it); in Runs: only this routine's runs, again for all |
+| `f` | In Runs: open the output file |
 | `d` | Delete; asks whether its runs stay in Runs or go too (in Runs: delete the run) |
 | `←` `→` `1` `2` `3` | Switch between routines, cron jobs and runs |
 | `S` | All routines and cron jobs on or off (asks first) |
-| `A` | Start Herdr at login, or not any more (asks first) |
-| `C` | Your crontab's other jobs: keep them as cron jobs, move or copy them |
+| `A` | Autostart: Herdr starts at login, or not any more (asks first) |
+| `C` | Take over your crontab's other jobs: keep them as cron jobs, move or copy them |
+| `i` | Nerd Font icons or plain symbols |
 | `q` | Close the list (asks first); routines keep running |
 
-The mouse works too: click a tab or a row, double click to open, scroll with
-the wheel, click the keys in the footer. A right click on a routine, cron
-job or run opens a menu of what can be done with it, each entry with its
-key.
+The footer shows the keys that work where you are: the list's keys in the
+list, a dialog's keys while a dialog is open. A key that does not apply to
+the row says why (such as `h` on a routine without runs, or `r` on a job
+that is only in your crontab).
 
-In the form, `↑` `↓` move between fields, `⏎` opens the list of a choice
-(or the prompt editor), `←` `→` step through a choice, typing edits a text
-field, `Ctrl+U` clears it and `Ctrl+S` or "Save" saves. `Esc` goes back and
-asks first when something changed.
+The mouse follows one rule everywhere: a click marks a row or a field, and
+a click on what is marked opens it. What does only one thing acts at once:
+a tab, a chip at the top, a key in the footer, a button, `‹` and `›` of a
+choice, an entry of a list to choose from, and "n runs ›" beside a routine.
+The wheel scrolls the view without moving the mark, a click beside a dialog
+closes it, and a right click on a routine, cron job or run opens a menu of
+what can be done with it, each entry with its key.
+
+A question is answered with `y`. `⏎` answers yes too where the same key
+undoes it (switching all routines, autostart, taking over cron jobs);
+deleting, discarding and running by hand need `y` itself. Any other key
+means no.
+
+In the form, `↑` `↓` move between fields, `⏎` opens the list of a choice,
+the prompt editor or "More settings", and `←` `→` step through a choice.
+In a text field the arrows, `Home` and `End` move the cursor, `Backspace`
+and `Del` delete, and `Ctrl+U` clears the field. `Ctrl+S` saves from
+anywhere, and the save button stays in sight. `Esc` goes back and asks
+first when something changed.
 
 ## Routines are files
 
@@ -321,7 +351,7 @@ time_limit_minutes = 120
 `prompt.md` holds the prompt, as you would type it to the agent. A shell
 routine has `agent = "shell"` and its command in `command.sh` instead; it
 runs in your `$SHELL`, line by line like a script. With `runs_in = "cron"`
-it is a classic cron job: `command.sh` is then one line, which the list
+it is a cron job: `command.sh` is then one line, which the list
 writes into your crontab once the routine is approved. A cron job runs in
 your home folder, so its `folder` is `~` (use `cd` in the command for
 another one).
@@ -364,13 +394,14 @@ switch safeguards off or widen where the agent may write (such as
 `--mcp-config`, `--plugin-dir`, `--settings`, `--bare`, Codex
 `-c mcp_servers.…` or `--add-dir`, Gemini `--extensions`). That list
 cannot be complete, since agents gain options: the list shows `args`
-under the routine's name, and the approval view warns whenever a routine
-has any. Approve extra arguments only when you know each of them.
+under the routine's name (the form calls them "Extra options"), and the
+approval view warns whenever a routine has any. Approve extra options
+only when you know each of them.
 
 Runs are kept in the plugin's state directory
 (`~/.local/state/herdr/plugins/herdr-routines/`), by default the last 30
-per routine and none older than 90 days ("Keep" in the form, `keep_runs`
-and `keep_days` in the file): under
+per routine and none older than 90 days ("Run history" in the form,
+`keep_runs` and `keep_days` in the file): under
 `runs/<routine id>/`, each run has a record `<run id>.json` (status,
 times, result) and next to it its output (`.log` from the tab, `.out` from
 a shell command), the prompt it got (`.prompt`) and, for shell commands,
@@ -381,7 +412,7 @@ holds the earlier results of a routine that remembers. The plugin's
 folders and files are readable only by you, since prompts, commands and
 saved output can hold secrets.
 
-**Start at login** (`A` in the list, or a click on the "autostart" chip;
+**Autostart** (`A` in the list, or a click on the "autostart" chip;
 the list asks once on its first start) writes a launch agent
 (`~/Library/LaunchAgents/herdr-routines.herdr-server.plist`) on macOS or a
 systemd user service on Linux that runs `herdr server` at login. It takes

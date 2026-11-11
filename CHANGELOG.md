@@ -7,37 +7,51 @@ All notable changes to this plugin. The format follows
 
 ### Added
 
-- Classic cron jobs: a shell command can run from the system's crontab
-  instead of Herdr ("Runs in: Cron", or `n` then "Classic cron job"), also
+- Cron jobs: a shell command can run from the system's crontab
+  instead of Herdr ("Runs in: Cron", or `n` then "Cron job"), also
   when Herdr is closed. They have their own tab "Cron jobs", are edited
   like routines, and their runs, output, exit code, retries and alerts
   show in Runs. Each stays a real line in your crontab, edited in place
   by the list; its name and other settings live in the plugin, and edits
   made to the line by hand win. `r` runs one now, in the background.
-- The rest of the crontab shows in the Cron jobs tab too; `⏎` keeps a job
-  as a cron job managed here (its line stays where it is), moves it to
-  Herdr or copies it.
-- "Keep" per routine and cron job: how many runs stay in Runs, by default
+- The rest of the crontab shows in the Cron jobs tab too, marked "only in
+  your crontab"; `⏎` takes a job over: keeps it as a cron job (its line
+  stays where it is), moves it to Herdr or copies it. Keeping and moving
+  change the crontab and ask first.
+- "Run history" per routine and cron job: how many runs stay in Runs, by default
   the last 30 and none older than 90 days. Replaces the global `history`
   setting.
 - "routines on/off" at the top (or `S`) switches all routines and cron jobs
   on or off, after asking; off stays off across Herdr restarts.
-- Runs of one routine (`h` or "n runs") show as a filter line in the Runs
-  view, with "✕ show all runs"; the tab itself stays "Runs".
+- Runs of one routine (`h` or "n runs ›") show as a filter line in the Runs
+  view; the tab itself stays "Runs". `Esc` goes back to the routine the
+  filter came from, or to all runs when it was set in Runs.
 - A right click on a routine, cron job or run opens a menu (the list asks
   Herdr to pass right clicks on to it; the entry under the mouse is
   marked) of what can be
   done with it (edit, run, switch, copy, runs, output, delete and more),
   each entry with its key.
 
-- "Tell me by" per routine: a notification (as before), a popup that
+- "Alerts" per routine: a notification (as before), a popup that
   stays in front until OK when a run fails, runs too long or needs you, or
   a popup for every run. The popup can go to the run's tab.
-- `c` copies a routine; the copy starts switched off, without runs or
+- `c` duplicates a routine; the copy starts switched off, without runs or
   memory, and waits for approval when the original does.
-- In a tall enough window the selected routine's details show under the
-  list: schedule, agent, folder, limits, extras, last run and the start of
-  the prompt.
+- The selected routine's details show under the list whenever rows are
+  free: schedule, last run and why it failed, what it runs with, folder,
+  limits, run history and the start of the prompt. They say what the list
+  says: no next time for a routine with a problem or one that waits for
+  approval.
+- Lists, lists to choose from, the form, the help and the output view say
+  which part shows ("1–10 of 23", "↓ 8 more below", "lines 1–17 of 58").
+- Text fields in the form have a cursor: `←` `→` `Home` `End` move it,
+  `Del` deletes at it, and a value longer than its row scrolls sideways.
+- `Ctrl+D` in the prompt editor leaves without keeping what was written
+  since it opened, after asking. The footer says what `Esc` does there:
+  "save and close" for a routine's prompt, "back to the form" in a form.
+- The row under the mouse is lit; `‹` and `›` of a choice in the form can
+  be clicked; a click on an entry of a list chooses it; a click beside a
+  dialog closes it.
 - The list asks once whether Herdr should start at login; the header chip
   shows it and a click switches it. Turning it off asks too.
 
@@ -51,7 +65,7 @@ All notable changes to this plugin. The format follows
 - Routines whose name, folder, model, arguments or prompt hold hidden
   characters (zero-width, direction overrides and the like) show a problem
   and do not run.
-- The list shows a routine's extra arguments under its name, and "run now"
+- The list shows a routine's extra options under its name, and "run now"
   shows the full options.
 - `herdr-routines release-cron` hands every managed cron job back to cron
   as a plain crontab line, for before the plugin or its state folder is
@@ -67,16 +81,53 @@ All notable changes to this plugin. The format follows
 
 ### Changed
 
-- The edit form is grouped into parts with headings (routine, schedule,
-  long or failed runs, agent extras, prompt), shows up to eight lines of
-  the prompt with "…" when it goes on, and says beside the save button
-  whether the routine can be saved.
+- The form starts with what a routine needs: name, what it runs with, the
+  prompt (up to eight lines, with "…" when it goes on), when and where.
+  Everything else is under "More settings", with the same defaults as
+  before, both for a new routine and when editing. The save button stays
+  in sight and says whether the routine can be saved.
 - The lists have no empty row between routines or runs any more; the form
   has one after each part and above the footer.
+- The footer belongs to what is open: the list's keys in the list, a
+  dialog's own keys while a dialog is open, the field's keys in the form.
+  Nothing of the list can be clicked under a dialog.
+- A narrow window keeps the last run: from 80 columns in its own column,
+  below that in the routine's second line. The header drops its title
+  first, then shortens the chips; a tab is never cut and "routines off"
+  always shows. What is cut ends in "…", and the Schedule column is as
+  wide as its longest schedule where the window allows.
+- A list scrolls only when the cursor would leave the window; the wheel
+  scrolls the view and a click never moves the rows. The cursor stays on
+  its routine, cron job or run when the list reloads, when runs come in
+  and when the runs filter is removed.
+- One click marks a row and a click on the marked row opens it (no double
+  click). Only the "n runs ›" text links to a routine's runs, not the
+  whole cell.
+- A message takes the whole footer when it is long, over up to three rows,
+  and is never cut without "…". A problem stays until the next key or
+  click.
+- Questions are even: `y` has a button named after what it does, and `⏎`
+  answers yes where the same key undoes it (all routines on or off,
+  autostart, taking over cron jobs). Deleting, discarding and running by
+  hand still ask for `y`. `C` then `m` or `k` asks before it changes the
+  crontab.
+- A key that does not apply says so: `h` on a routine without runs, and
+  the keys of a routine on a job that is only in the crontab.
+- The help wraps at any width, lists every key by where it works (the
+  list's keys first) and scrolls with a position.
+- One name per thing: "cron job" (was also "classic cron job"), "Runs
+  with" (was "Agent"), "Extra options" (was "Extra arguments"), "Alerts"
+  (was "Tell me by" and "Alert"), "Run history" (was "Keep"), "Switched"
+  (was "Enabled"), "duplicate" (was "copy"), "take over" (was "manage
+  here"), "autostart" (was also "start at login"), "output" (was also
+  "result and output").
+- Symbols differ by shape, not only by colour: `●` on, `○` off, `!` a
+  problem, `◐` waits for approval; "Starting" and "Running", "Skipped" and
+  "Closed early" have their own signs.
 - "scheduler on/off" at the top is now "routines on/off".
 - Deleting a routine asks whether its runs stay (they show in Runs as of a
   deleted routine) or go too; `d` in Runs deletes a single run.
-- Extra arguments may no longer set permissions for Claude Code, Codex or
+- Extra options may no longer set permissions for Claude Code, Codex or
   Gemini; use the permission mode.
 - Routine folder names must be lower case letters, digits and dashes.
 - The plugin's folders and files are readable only by you (0700 and
@@ -111,6 +162,15 @@ All notable changes to this plugin. The format follows
 
 ### Fixed
 
+- A click on the footer under an open dialog no longer reaches the list:
+  with the delete question open, a click where "r run now" was could
+  delete the routine with all its runs.
+- A click in a scrolled list no longer moves the rows under the mouse, so
+  a second click cannot land on another row.
+- Dialogs that are taller or wider than the window scroll or shrink instead
+  of losing their buttons; the right-click menu stays inside the window.
+- Why a run failed shows also when it has output: in the runs list, in the
+  details and above the output.
 - A run's prompt goes to the run's own agent by name, and tabs are closed,
   read and shown only when Herdr confirms they are still the run's own, so
   a reused pane or tab id after a Herdr restart cannot hit another tab.
