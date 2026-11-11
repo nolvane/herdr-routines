@@ -51,7 +51,7 @@ impl Every {
 
     /// The text for `routine.toml`.
     pub fn text(&self) -> String {
-        let span = if self.days % 7 == 0 {
+        let span = if self.days.is_multiple_of(7) {
             format!("{} weeks", self.days / 7)
         } else {
             format!("{} days", self.days)
@@ -82,7 +82,7 @@ impl Every {
 
     fn describe(&self) -> String {
         let time = self.start.format("%H:%M");
-        if self.days % 7 == 0 {
+        if self.days.is_multiple_of(7) {
             let day = self.start.format("%A");
             match self.days / 7 {
                 1 => format!("{day}s at {time}"),
