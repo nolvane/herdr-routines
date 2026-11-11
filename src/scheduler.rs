@@ -6,6 +6,7 @@
 //! or the computer was off or asleep: the routine's `missed` setting decides
 //! whether it runs once now or waits for its next time.
 
+use crate::approval::Approvals;
 use crate::herdr;
 use crate::paths::{self, Paths};
 use crate::routine::{self, Missed, Routine, Settings};
@@ -27,8 +28,11 @@ pub const ON_TIME: i64 = 3;
 /// Missed times older than this are not looked for.
 const LOOKBACK_DAYS: i64 = 7;
 const TICK: std::time::Duration = std::time::Duration::from_secs(10);
-/// Failed Herdr calls in a row after which the scheduler gives up.
+/// Failed rounds in a row (ten minutes) after which the scheduler takes it
+/// that Herdr does not answer for now and asks less often.
 const MAX_FAILURES: u32 = 60;
+/// Rounds left out between two tries then: one try a minute.
+const SLOW_ROUNDS: u32 = 5;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Due {
@@ -162,8 +166,13 @@ fn tick(
     paths: &Paths,
     checked: &mut Checked,
     launches: &mut Vec<JoinHandle<()>>,
+    round: u64,
 ) -> Result<(), herdr::Error> {
     let settings = Settings::load(paths);
+    // Reachability first, so a gone server ends the loop and nothing is
+    // started (and recorded as failed) while Herdr does not answer. The
+    // times that pass meanwhile count as missed once it answers again.
+    let in_view = workspace_in_view(&settings.workspace)?;
     let routines = routine::load_all(paths);
     let now = Local::now();
     let mut waiting = Waiting::load(paths);
@@ -261,14 +270,15 @@ fn tick(
         waiting.save(paths);
     }
 
-    // Reachability check, so a gone server ends the loop.
-    let in_view = workspace_in_view(&settings.workspace)?;
     let me = paths.server_id();
+    // Routines with a run that ended in this round: their history is
+    // pruned right away.
+    let mut ended: BTreeSet<String> = BTreeSet::new();
     for mut run in store::all_runs(paths) {
         if run.cron_pid != 0 {
             // A cron job's run belongs to its process; only one that ended
             // without finishing the record is closed here.
-            if run.status.active() && !alive(run.cron_pid) {
+            if run.status.active() && !alive_since(run.cron_pid, &run.cron_started) {
                 run.finish(Status::Closed, "The cron run ended before it finished");
                 let _ = run.save(paths);
             }
@@ -293,15 +303,49 @@ fn tick(
                     paths,
                     &format!("{}: run {} is {:?}", run.routine_id, run.id, run.status),
                 );
+                if !run.status.active() {
+                    ended.insert(run.routine_id.clone());
+                }
             }
         } else {
             runner::tidy(paths, &settings, &mut run, in_view);
         }
     }
-    for r in &routines {
-        store::prune(paths, &r.id, r.file.keep_runs, r.file.keep_days);
-    }
+    prune(paths, &routines, &ended, round);
     Ok(())
+}
+
+/// Every this many rounds (about ten minutes) all histories are pruned,
+/// for runs that became too old; in between only those of routines whose
+/// run just ended. Reading every record of every routine in every round
+/// would grow with the history.
+const PRUNE_EVERY: u64 = 60;
+
+/// Prunes run histories with the settings the owner approved. A routine
+/// whose files changed outside the list (or no longer load) keeps what its
+/// approved version says until the change is approved: an edit nobody has
+/// seen must not delete history. One that was never approved has no runs.
+fn prune(paths: &Paths, routines: &[Routine], ended: &BTreeSet<String>, round: u64) {
+    let all = round.is_multiple_of(PRUNE_EVERY);
+    if !all && ended.is_empty() {
+        return;
+    }
+    let approvals = Approvals::load(paths);
+    for r in routines {
+        if !all && !ended.contains(&r.id) {
+            continue;
+        }
+        let keep = if r.approved && !r.unreadable {
+            Some((r.file.keep_runs, r.file.keep_days))
+        } else {
+            approvals
+                .routine(&r.id)
+                .map(|a| (a.file.keep_runs, a.file.keep_days))
+        };
+        if let Some((runs, days)) = keep {
+            store::prune(paths, &r.id, runs, days);
+        }
+    }
 }
 
 /// Tries a failed run again when the routine allows it and the wait is
@@ -368,29 +412,103 @@ fn workspace_in_view(label: &str) -> Result<bool, herdr::Error> {
     herdr::workspace_label_focused(label)
 }
 
-/// The pid in the pid file and the socket of the server it serves.
-fn read_pid(paths: &Paths) -> Option<(u32, String)> {
-    let text = std::fs::read_to_string(paths.pid_file()).ok()?;
+/// The pid in the pid file, the socket of the server it serves and when
+/// that process started (empty in a file an older version wrote).
+fn read_pid(paths: &Paths) -> Option<(u32, String, String)> {
+    let text = paths::read_text_limited(&paths.pid_file(), paths::FILE_LIMIT).ok()?;
     let mut lines = text.lines();
     let pid = lines.next()?.trim().parse().ok()?;
-    Some((pid, lines.next().unwrap_or("").to_string()))
+    let socket = lines.next().unwrap_or("").to_string();
+    Some((pid, socket, lines.next().unwrap_or("").trim().to_string()))
 }
 
-/// Whether the process runs and is this plugin (a pid left over from before
-/// a restart may belong to something else by now).
-pub fn alive(pid: u32) -> bool {
-    Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "comm="])
-        .output()
-        .map(|o| {
-            o.status.success() && String::from_utf8_lossy(&o.stdout).contains("herdr-routines")
-        })
-        .unwrap_or(false)
+/// One column of `ps` for a process, `None` when there is no such process.
+fn ps(pid: u32, column: &str) -> Option<String> {
+    let mut command = Command::new("ps");
+    command
+        .args(["-p", &pid.to_string(), "-o", column])
+        // The start time in one form everywhere.
+        .env("LC_ALL", "C");
+    let out = crate::shell::tool(command, std::time::Duration::from_secs(10)).ok()?;
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.success && !text.is_empty()).then_some(text)
+}
+
+/// When a process started, as `ps` prints it (`Tue Nov 10 08:15:02 2026`).
+/// With the pid it names one process: the system hands a pid out again,
+/// but not with the same start time.
+pub fn started_at(pid: u32) -> Option<String> {
+    ps(pid, "lstart=")
+}
+
+/// Whether the process with this pid and start time still runs. Records
+/// from before the start time was kept (`started` empty) fall back to the
+/// process's name, which says less: it depends on where the plugin's
+/// folders are and is cut short on Linux.
+pub fn alive_since(pid: u32, started: &str) -> bool {
+    if started.is_empty() {
+        return ps(pid, "comm=").is_some_and(|name| name.contains("herdr-routines"));
+    }
+    started_at(pid).as_deref() == Some(started)
 }
 
 /// The scheduler's pid and the socket it serves, when it runs.
 pub fn running(paths: &Paths) -> Option<(u32, String)> {
-    read_pid(paths).filter(|(pid, _)| alive(*pid))
+    read_pid(paths)
+        .filter(|(pid, _, started)| alive_since(*pid, started))
+        .map(|(pid, socket, _)| (pid, socket))
+}
+
+/// Herdr servers whose `start` found the scheduler serving another server
+/// and left it alone, one socket per line. When that server goes away, the
+/// scheduler hands over to one of these instead of leaving them without.
+fn waiting_servers_file(paths: &Paths) -> std::path::PathBuf {
+    paths.state.join("waiting-servers")
+}
+
+fn waiting_servers(paths: &Paths) -> Vec<std::path::PathBuf> {
+    paths::read_text_limited(&waiting_servers_file(paths), paths::FILE_LIMIT)
+        .map(|t| {
+            t.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(std::path::PathBuf::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn save_waiting_servers(paths: &Paths, sockets: &[std::path::PathBuf]) {
+    let text: String = sockets
+        .iter()
+        .map(|s| format!("{}\n", s.display()))
+        .collect();
+    let _ = paths::write_atomic(&waiting_servers_file(paths), text.as_bytes());
+}
+
+/// Notes that this server has no scheduler of its own (see
+/// [`waiting_servers_file`]).
+pub fn note_waiting(paths: &Paths) {
+    let mut all = waiting_servers(paths);
+    if !all.contains(&paths.socket) {
+        all.push(paths.socket.clone());
+        save_waiting_servers(paths, &all);
+    }
+}
+
+/// Whether a Herdr server answers on this socket.
+fn server_listens(socket: &Path) -> bool {
+    std::os::unix::net::UnixStream::connect(socket).is_ok()
+}
+
+/// The first waiting server that still runs, taken off the list together
+/// with those that are gone and with this scheduler's own.
+fn next_server(paths: &Paths) -> Option<std::path::PathBuf> {
+    let mut all = waiting_servers(paths);
+    all.retain(|s| *s != paths.socket && server_listens(s));
+    let next = (!all.is_empty()).then(|| all.remove(0));
+    save_waiting_servers(paths, &all);
+    next
 }
 
 /// Whether `start` should leave a running scheduler alone: it serves another
@@ -405,8 +523,17 @@ pub fn keep_running(paths: &Paths) -> Option<u32> {
 /// Starts `run` detached from Herdr's pipes and process group, so the startup
 /// hook or action returns at once. A running scheduler hands over and exits.
 pub fn spawn(paths: &Paths) -> Result<u32, String> {
+    spawn_for(paths, None)
+}
+
+/// [`spawn`], for the Herdr server on `socket` when given.
+fn spawn_for(paths: &Paths, socket: Option<&Path>) -> Result<u32, String> {
     let exe = std::env::current_exe().map_err(|e| format!("cannot find own binary: {e}"))?;
-    let child = Command::new(exe)
+    let mut command = Command::new(exe);
+    if let Some(socket) = socket {
+        command.env("HERDR_SOCKET_PATH", socket);
+    }
+    let child = command
         .arg("run")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -456,7 +583,11 @@ pub fn run(paths: &Paths) -> i32 {
     let me = std::process::id();
     let _ = paths::create_private_dir(&paths.state);
     // Taking over the pid file tells an older instance to hand over and exit.
-    let content = format!("{me}\n{}\n", paths.socket.display());
+    let content = format!(
+        "{me}\n{}\n{}\n",
+        paths.socket.display(),
+        started_at(me).unwrap_or_default()
+    );
     if paths::write_atomic(&paths.pid_file(), content.as_bytes()).is_err() {
         paths::log(paths, "cannot write pid file");
         return 1;
@@ -473,8 +604,13 @@ pub fn run(paths: &Paths) -> i32 {
     let mut checked = Checked::load(paths);
     let mut failures = 0u32;
     let mut launches = Vec::new();
+    let mut round = 0u64;
+    // Rounds left out while Herdr does not answer (see below).
+    let mut pause = 0u32;
+    // The server this scheduler serves went away (its socket is gone).
+    let mut server_gone = false;
     loop {
-        if read_pid(paths).map(|(p, _)| p) != Some(me) {
+        if read_pid(paths).map(|(p, _, _)| p) != Some(me) {
             paths::log(
                 paths,
                 "another scheduler took over or stop was requested; exiting",
@@ -483,29 +619,78 @@ pub fn run(paths: &Paths) -> i32 {
         }
         if identity.is_some() && socket_identity(&paths.socket) != identity {
             paths::log(paths, "the Herdr server changed; exiting");
+            // A new server on the same socket starts its own scheduler.
+            server_gone = !paths.socket.exists();
             break;
         }
-        match tick(paths, &mut checked, &mut launches) {
-            Ok(()) => failures = 0,
+        if pause > 0 {
+            pause -= 1;
+            sleep(TICK);
+            continue;
+        }
+        match tick(paths, &mut checked, &mut launches, round) {
+            Ok(()) => {
+                if failures >= MAX_FAILURES {
+                    paths::log(paths, "Herdr answers again");
+                }
+                failures = 0;
+            }
             Err(e) => {
                 failures += 1;
                 if failures == 1 || failures.is_multiple_of(10) {
                     paths::log(paths, &format!("tick failed ({failures}): {e}"));
                 }
                 if failures >= MAX_FAILURES {
-                    paths::log(paths, "Herdr unreachable; exiting");
-                    break;
+                    if identity.is_none() {
+                        // There never was a server on this socket.
+                        paths::log(paths, "Herdr unreachable; exiting");
+                        break;
+                    }
+                    if !server_listens(&paths.socket) {
+                        // Its socket file is left, but nobody is behind it:
+                        // the server ended without tidying up. The next
+                        // server makes a new socket and starts its own
+                        // scheduler.
+                        paths::log(paths, "the Herdr server is gone; exiting");
+                        server_gone = true;
+                        break;
+                    }
+                    // The server is there but does not answer. Nothing
+                    // would start a scheduler again once this one is gone,
+                    // so it stays and asks once a minute instead of every
+                    // round.
+                    if failures == MAX_FAILURES {
+                        paths::log(
+                            paths,
+                            "Herdr does not answer; trying once a minute until it does",
+                        );
+                    }
+                    pause = SLOW_ROUNDS;
                 }
             }
         }
+        round += 1;
         sleep(TICK);
     }
     // Let launches in progress finish, so no run is left half started.
     for handle in launches {
         let _ = handle.join();
     }
-    if read_pid(paths).map(|(p, _)| p) == Some(me) {
+    if read_pid(paths).map(|(p, _, _)| p) == Some(me) {
         let _ = std::fs::remove_file(paths.pid_file());
+        // Another Herdr server was left without a scheduler because this
+        // one ran: it gets one now.
+        if server_gone && !paused(paths) {
+            if let Some(socket) = next_server(paths) {
+                match spawn_for(paths, Some(&socket)) {
+                    Ok(pid) => paths::log(
+                        paths,
+                        &format!("handed over to pid {pid} for {}", socket.display()),
+                    ),
+                    Err(e) => paths::log(paths, &format!("could not hand over: {e}")),
+                }
+            }
+        }
     }
     0
 }
@@ -514,6 +699,7 @@ pub fn run(paths: &Paths) -> i32 {
 mod tests {
     use super::*;
     use crate::routine::RoutineFile;
+    use crate::store::Run;
     use chrono::TimeZone;
 
     fn routine(schedule: &str, missed: Missed) -> Routine {
@@ -564,5 +750,111 @@ mod tests {
         assert_eq!(due(&r, t(7, 0), t(10, 30)), Due::SkipMissed(t(10, 15)));
         // Already handled.
         assert_eq!(due(&r, t(8, 15), t(8, 20)), Due::Not);
+    }
+
+    fn temp_paths(tag: &str) -> Paths {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-routines-scheduler-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let paths = Paths {
+            config: dir.join("config"),
+            state: dir.join("state"),
+            socket: dir.join("sock"),
+        };
+        std::fs::create_dir_all(&paths.state).unwrap();
+        paths
+    }
+
+    #[test]
+    fn a_process_is_known_by_its_pid_and_start_time() {
+        let me = std::process::id();
+        let started = started_at(me).expect("ps knows this process");
+        assert!(alive_since(me, &started));
+        // The same pid handed out again to another process is not it.
+        assert!(!alive_since(me, "Thu Jan  1 00:00:00 1970"));
+        // A pid file whose process is gone, or is something else.
+        let p = temp_paths("pid");
+        std::fs::write(p.pid_file(), format!("{me}\n/tmp/x.sock\n{started}\n")).unwrap();
+        assert_eq!(running(&p), Some((me, "/tmp/x.sock".to_string())));
+        std::fs::write(
+            p.pid_file(),
+            format!("{me}\n/tmp/x.sock\nThu Jan  1 00:00:00 1970\n"),
+        )
+        .unwrap();
+        assert_eq!(running(&p), None);
+        // One written before the start time was kept: by name, and this
+        // test is not the plugin (its binary has another name).
+        std::fs::write(p.pid_file(), "1\n/tmp/x.sock\n").unwrap();
+        assert_eq!(running(&p), None);
+    }
+
+    #[test]
+    fn a_server_left_without_a_scheduler_gets_the_next_one() {
+        let p = temp_paths("waiting");
+        // Short names: a socket's path has a small limit.
+        let dir = std::env::temp_dir().join(format!("hr-w-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (gone, live) = (dir.join("gone.sock"), dir.join("live.sock"));
+        let _listener = std::os::unix::net::UnixListener::bind(&live).unwrap();
+        for socket in [&gone, &live, &p.socket] {
+            let mut other = p.clone();
+            other.socket = socket.to_path_buf();
+            note_waiting(&other);
+            note_waiting(&other);
+        }
+        assert_eq!(waiting_servers(&p).len(), 3);
+        // Not the one that is gone, and not this scheduler's own.
+        assert_eq!(next_server(&p), Some(live));
+        assert_eq!(next_server(&p), None);
+        assert!(waiting_servers(&p).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn history_is_pruned_with_approved_settings_only() {
+        let p = temp_paths("prune");
+        let mut r = routine("0 9 * * *", Missed::Skip);
+        (r.file.keep_runs, r.file.keep_days) = (5, 0);
+        r.save_approved(&p).unwrap();
+        for n in 0..8 {
+            let mut run = Run::new("r", "R", "claude", Trigger::Scheduled, None);
+            run.id = format!("20261101-08{n:02}00-000");
+            run.finish(crate::store::Status::Finished, "");
+            run.save(&p).unwrap();
+        }
+        let count = || store::runs_of(&p, "r").len();
+        let all = |p: &Paths| crate::routine::load_all(p);
+        let ended = BTreeSet::from(["r".to_string()]);
+        // Changed outside the list to keep one run: nobody approved that.
+        let file = p.routine_dir("r").join("routine.toml");
+        let approved = std::fs::read_to_string(&file).unwrap();
+        std::fs::write(&file, approved.replace("keep_runs = 5", "keep_runs = 1")).unwrap();
+        assert!(!all(&p)[0].approved);
+        // Between the full rounds only routines whose run just ended.
+        prune(&p, &all(&p), &BTreeSet::new(), 1);
+        assert_eq!(count(), 8);
+        prune(&p, &all(&p), &ended, 1);
+        assert_eq!(count(), 5, "the approved 5, not the 1 in the file");
+        // A file that no longer reads (half written, a typo) deletes nothing.
+        std::fs::write(&file, "name = ").unwrap();
+        assert!(all(&p)[0].unreadable);
+        prune(&p, &all(&p), &ended, 0);
+        assert_eq!(count(), 5);
+        // Never approved: there are no settings to prune with.
+        let mut other = routine("0 9 * * *", Missed::Skip);
+        other.id = "other".into();
+        (other.file.keep_runs, other.approved) = (1, false);
+        other.save(&p).unwrap();
+        for n in 0..3 {
+            let mut run = Run::new("other", "O", "claude", Trigger::Manual, None);
+            run.id = format!("20261101-09{n:02}00-000");
+            run.finish(crate::store::Status::Finished, "");
+            run.save(&p).unwrap();
+        }
+        prune(&p, &all(&p), &BTreeSet::new(), 0);
+        assert_eq!(store::runs_of(&p, "other").len(), 3);
     }
 }

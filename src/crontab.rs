@@ -14,11 +14,22 @@
 //! (the list writes the crontab when you save, and reads it back when it
 //! opens and every few seconds).
 
+//!
+//! The crontab is the person's own file: it is handled as bytes, so lines
+//! this plugin does not touch go back exactly as they were (also text that
+//! is not UTF-8), and every change is made under a lock, on a fresh read.
+
+use crate::approval::Approvals;
 use crate::paths::{self, Paths};
 use crate::routine::{Missed, Routine, RoutineFile, RunsIn, SHELL};
 use crate::schedule::{Schedule, AT_START};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
+
+/// How long `crontab` may take before a call is given up.
+const LIMIT: Duration = Duration::from_secs(20);
 
 /// The program to call. Tests never reach the real crontab: they set a
 /// stand-in for their own thread with `use_fake`, and without one there is
@@ -66,24 +77,87 @@ pub struct CronJob {
     pub note: Option<String>,
 }
 
-/// The crontab, empty when there is none.
-pub fn read() -> Result<String, String> {
+/// The crontab as its lines, byte for byte. Reading and showing it goes
+/// through [`Tab::text`]; a change replaces single lines and leaves the
+/// bytes of all others alone.
+#[derive(Debug, Clone, PartialEq, Default)]
+struct Tab {
+    lines: Vec<Vec<u8>>,
+}
+
+/// A line as text: bytes that are not UTF-8 show as the replacement
+/// character, and a carriage return at the end is left off.
+fn shown(line: &[u8]) -> String {
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    String::from_utf8_lossy(line).into_owned()
+}
+
+impl Tab {
+    fn from_bytes(bytes: &[u8]) -> Tab {
+        let mut lines: Vec<Vec<u8>> = bytes.split(|b| *b == b'\n').map(<[u8]>::to_vec).collect();
+        // What follows the last line break is a line only when it has text.
+        if lines.last().is_some_and(Vec::is_empty) {
+            lines.pop();
+        }
+        Tab { lines }
+    }
+
+    fn bytes(&self) -> Vec<u8> {
+        let mut out = self.lines.join(&b'\n');
+        if !self.lines.is_empty() {
+            out.push(b'\n');
+        }
+        out
+    }
+
+    /// The crontab as text, line for line (see [`shown`]): line `n` of the
+    /// text is line `n` here.
+    fn text(&self) -> String {
+        let mut out = String::new();
+        for line in &self.lines {
+            out.push_str(&shown(line));
+            out.push('\n');
+        }
+        out
+    }
+
+    /// Puts `new` in place of the lines in `range`. A new line that reads
+    /// like the line it replaces keeps that line's bytes (its line end).
+    fn put(&mut self, range: std::ops::Range<usize>, new: Vec<Vec<u8>>) {
+        let old: Vec<Vec<u8>> = self.lines[range.clone()].to_vec();
+        let new = new
+            .into_iter()
+            .enumerate()
+            .map(|(i, line)| match old.get(i) {
+                Some(bytes) if shown(bytes) == shown(&line) => bytes.clone(),
+                _ => line,
+            });
+        self.lines.splice(range, new.collect::<Vec<_>>());
+    }
+}
+
+/// The crontab as it is now, empty when there is none.
+fn read_tab() -> Result<Tab, String> {
     let Some(program) = program() else {
-        return Ok(String::new());
+        return Ok(Tab::default());
     };
-    let out = Command::new(program)
-        .arg("-l")
-        .output()
-        .map_err(|e| format!("cannot run crontab: {e}"))?;
-    if out.status.success() {
-        return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
+    let mut command = Command::new(program);
+    command.arg("-l");
+    let out = crate::shell::tool(command, LIMIT).map_err(|e| format!("cannot run crontab: {e}"))?;
+    if out.success {
+        return Ok(Tab::from_bytes(&out.stdout));
     }
     let err = String::from_utf8_lossy(&out.stderr);
     if err.contains("no crontab") {
-        Ok(String::new())
+        Ok(Tab::default())
     } else {
         Err(err.trim().to_string())
     }
+}
+
+/// The crontab as text, empty when there is none.
+pub fn read() -> Result<String, String> {
+    read_tab().map(|t| t.text())
 }
 
 fn env_assignment(line: &str) -> Option<(String, String)> {
@@ -325,16 +399,39 @@ pub fn routine_for(job: &CronJob, enabled: bool) -> (RoutineFile, String) {
     (file, script)
 }
 
+/// What goes in front of a moved job's line to comment it out.
+fn moved_mark(line: &str, moved: &[(String, String)]) -> Option<String> {
+    moved
+        .iter()
+        .find(|(l, _)| l == line)
+        .map(|(_, id)| format!("{MOVED} (routine {id}): "))
+}
+
 /// The crontab with the moved jobs' lines commented out.
+#[cfg(test)]
 pub fn without(text: &str, moved: &[(String, String)]) -> String {
     let mut out: Vec<String> = Vec::new();
     for line in text.lines() {
-        match moved.iter().find(|(l, _)| l == line) {
-            Some((_, id)) => out.push(format!("{MOVED} (routine {id}): {line}")),
+        match moved_mark(line, moved) {
+            Some(mark) => out.push(format!("{mark}{line}")),
             None => out.push(line.to_string()),
         }
     }
     out.join("\n") + "\n"
+}
+
+/// [`without`] on the crontab's own bytes: a commented line keeps them.
+fn without_moved(tab: &Tab, moved: &[(String, String)]) -> Tab {
+    let lines = tab.lines.iter().map(|line| {
+        let text = shown(line);
+        match moved_mark(&text, moved) {
+            Some(mark) => [mark.as_bytes(), line].concat(),
+            None => line.clone(),
+        }
+    });
+    Tab {
+        lines: lines.collect(),
+    }
 }
 
 /// What becomes of a cron job taken over.
@@ -375,9 +472,8 @@ pub fn import(paths: &Paths, jobs: &[CronJob], how: Take) -> Result<usize, Strin
         moved.push((job.line.clone(), id));
     }
     if moving && !moved.is_empty() {
-        // Read again: only lines still there are changed.
-        let now = read()?;
-        install(paths, &now, &without(&now, &moved)).map_err(|e| {
+        // On a fresh read: only lines still there are changed.
+        change(paths, |tab| Ok(Some(without_moved(tab, &moved)))).map_err(|e| {
             format!("the routines were added, but {e}; comment the lines out by hand")
         })?;
     }
@@ -387,7 +483,6 @@ pub fn import(paths: &Paths, jobs: &[CronJob], how: Take) -> Result<usize, Strin
 /// Manages a job of the crontab where it is: a routine for its name and
 /// settings, and the marker and wrapper around its line.
 fn keep(paths: &Paths, job: &CronJob) -> Result<(), String> {
-    let now = read()?;
     let mut file = cron_file(name_for(&job.command), job.schedule.clone(), true);
     file.runs_in = RunsIn::Cron;
     let id = crate::routine::new_id(paths, &file.name);
@@ -399,31 +494,39 @@ fn keep(paths: &Paths, job: &CronJob) -> Result<(), String> {
         unreadable: false,
         approved: true,
     };
-    let lines: Vec<&str> = now.lines().collect();
-    let skip: Vec<std::ops::Range<usize>> = managed(&now)
-        .iter()
-        .map(|m| m.start..m.start + m.len)
-        .collect();
-    let Some(at) = lines
-        .iter()
-        .enumerate()
-        .position(|(n, l)| *l == job.line && !skip.iter().any(|r| r.contains(&n)))
-    else {
-        return Err("the job is no longer in the crontab".into());
-    };
-    let shell = shell_before(&now, at);
-    // The line itself stays as written; only the marker and SHELL go around.
-    let group = vec![
-        marker(&id),
-        format!("SHELL={}", wrapper(paths, &id).display()),
-        job.line.clone(),
-        format!("SHELL={shell}"),
-    ];
-    let mut next: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
-    next.splice(at..at + 1, group);
     r.save_approved(paths)?;
     prepare_wrapper(paths, &id)?;
-    install(paths, &now, &(next.join("\n") + "\n"))
+    change(paths, |tab| {
+        let now = tab.text();
+        let skip: Vec<std::ops::Range<usize>> = managed(&now)
+            .iter()
+            .map(|m| m.start..m.start + m.len)
+            .collect();
+        let Some(at) = now
+            .lines()
+            .enumerate()
+            .position(|(n, l)| l == job.line && !skip.iter().any(|r| r.contains(&n)))
+        else {
+            return Err("the job is no longer in the crontab".into());
+        };
+        let shell = shell_before(&now, at);
+        // The line itself stays as written, byte for byte; only the
+        // marker and SHELL go around.
+        let mut next = tab.clone();
+        next.lines
+            .insert(at + 1, format!("SHELL={shell}").into_bytes());
+        next.lines.insert(
+            at,
+            format!("SHELL={}", wrapper(paths, &id).display()).into_bytes(),
+        );
+        next.lines.insert(at, marker(&id).into_bytes());
+        Ok(Some(next))
+    })
+    .inspect_err(|_| {
+        // Not taken over after all: the routine made for it goes again.
+        let _ = Routine::delete(paths, &id, true);
+        let _ = std::fs::remove_file(wrapper(paths, &id));
+    })
 }
 
 // ---- managed cron jobs ----------------------------------------------------
@@ -570,53 +673,158 @@ fn group(paths: &Paths, r: &Routine, shell: &str) -> Result<Vec<String>, String>
 
 /// Writes a managed cron job into the crontab: in place when it is there,
 /// else at the end.
+///
+/// Only an approved routine reaches the crontab. One that waits for
+/// approval (its files changed outside the list) leaves its group as it
+/// is, so cron keeps running the line the owner approved until `a`
+/// approves the new one; whichever caller asks, nothing is written.
 pub fn write_job(paths: &Paths, r: &Routine) -> Result<(), String> {
-    let now = read()?;
-    let mut lines: Vec<String> = now.lines().map(str::to_string).collect();
-    match managed(&now).into_iter().find(|m| m.id == r.id) {
-        Some(m) => {
-            let g = group(paths, r, &m.shell)?;
-            lines.splice(m.start..m.start + m.len, g);
-        }
-        None => {
-            let g = group(paths, r, &shell_before(&now, lines.len()))?;
-            if lines.last().is_some_and(|l| !l.trim().is_empty()) {
-                lines.push(String::new());
-            }
-            lines.extend(g);
-        }
-    }
-    let next = lines.join("\n") + "\n";
-    if next == now {
+    if !r.approved {
         return Ok(());
     }
-    prepare_wrapper(paths, &r.id)?;
-    install(paths, &now, &next)
+    // Checked before anything is touched.
+    group(paths, r, "/bin/sh")?;
+    let mut prepared = false;
+    change(paths, |tab| {
+        let now = tab.text();
+        let mut next = tab.clone();
+        match managed(&now).into_iter().find(|m| m.id == r.id) {
+            Some(m) => {
+                // A job whose time and command are as they were keeps its
+                // line byte for byte (it need not be UTF-8, and its spacing
+                // is the owner's); only on or off follows the routine.
+                let same = when(r).as_deref() == Some(m.when.as_str())
+                    && r.prompt.trim() == m.command.trim();
+                let kept = job_line(tab, &m)
+                    .filter(|_| same)
+                    .map(|(_, line)| without_off(line).to_vec());
+                let mut g: Vec<Vec<u8>> = group(paths, r, &m.shell)?
+                    .into_iter()
+                    .map(String::into_bytes)
+                    .collect();
+                if let Some(line) = kept {
+                    g[2] = if r.file.enabled {
+                        line
+                    } else {
+                        [OFF.as_bytes(), &line].concat()
+                    };
+                }
+                next.put(m.start..m.start + m.len, g);
+            }
+            None => {
+                let g = group(paths, r, &shell_before(&now, next.lines.len()))?;
+                if next
+                    .lines
+                    .last()
+                    .is_some_and(|l| !shown(l).trim().is_empty())
+                {
+                    next.lines.push(Vec::new());
+                }
+                next.lines.extend(g.into_iter().map(String::into_bytes));
+            }
+        }
+        if next != *tab && !prepared {
+            prepare_wrapper(paths, &r.id)?;
+            prepared = true;
+        }
+        Ok(Some(next))
+    })
+}
+
+/// Where a managed group's job line is, and its bytes.
+fn job_line<'a>(tab: &'a Tab, m: &Managed) -> Option<(usize, &'a [u8])> {
+    (m.start..m.start + m.len).find_map(|n| {
+        let line = tab.lines.get(n)?;
+        let text = shown(line);
+        let text = text.trim();
+        split_job(text.strip_prefix(OFF).unwrap_or(text)).map(|_| (n, line.as_slice()))
+    })
+}
+
+/// A job line's bytes without the `#off ` in front.
+fn without_off(line: &[u8]) -> &[u8] {
+    let start = line
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(0);
+    line[start..].strip_prefix(OFF.as_bytes()).unwrap_or(line)
+}
+
+/// Switches a managed job's line in the crontab on or off and changes
+/// nothing else about it. For a routine that waits for approval: the line
+/// stays the approved one, but `space` in the list still stops and starts
+/// it.
+pub fn switch(paths: &Paths, id: &str, enabled: bool) -> Result<(), String> {
+    change(paths, |tab| {
+        let Some(m) = managed(&tab.text()).into_iter().find(|m| m.id == id) else {
+            return Ok(None);
+        };
+        let Some((at, line)) = job_line(tab, &m).filter(|_| m.enabled != enabled) else {
+            return Ok(None);
+        };
+        let line = if enabled {
+            without_off(line).to_vec()
+        } else {
+            [OFF.as_bytes(), line].concat()
+        };
+        let mut next = tab.clone();
+        next.lines[at] = line;
+        Ok(Some(next))
+    })
+}
+
+/// A managed group's lines turned back into what the job was before: its
+/// own line (commented out when it is switched off), or nothing.
+fn released(tab: &Tab, m: &Managed, keep_line: bool) -> Vec<Vec<u8>> {
+    match job_line(tab, m).filter(|_| keep_line) {
+        Some((_, line)) if m.enabled => vec![line.to_vec()],
+        Some((_, line)) => vec![[b"# ", without_off(line)].concat()],
+        None => Vec::new(),
+    }
 }
 
 /// Takes a managed job out of the crontab. `keep_line`: its line stays as
 /// an ordinary job (not managed any more); otherwise it goes.
 pub fn remove_job(paths: &Paths, id: &str, keep_line: bool) -> Result<(), String> {
-    let now = read()?;
-    let Some(m) = managed(&now).into_iter().find(|m| m.id == id) else {
-        return Ok(());
-    };
-    let mut lines: Vec<String> = now.lines().map(str::to_string).collect();
-    let job: Vec<String> = lines[m.start..m.start + m.len]
-        .iter()
-        .find(|l| split_job(l.trim().strip_prefix(OFF).unwrap_or(l.trim())).is_some())
-        .map(|l| {
-            if m.enabled {
-                vec![l.trim().to_string()]
-            } else {
-                vec![format!("# {}", l.trim().trim_start_matches(OFF))]
-            }
-        })
-        .filter(|_| keep_line)
-        .unwrap_or_default();
-    lines.splice(m.start..m.start + m.len, job);
+    change(paths, |tab| {
+        let Some(m) = managed(&tab.text()).into_iter().find(|m| m.id == id) else {
+            return Ok(None);
+        };
+        let mut next = tab.clone();
+        next.lines
+            .splice(m.start..m.start + m.len, released(tab, &m, keep_line));
+        Ok(Some(next))
+    })?;
     let _ = std::fs::remove_file(wrapper(paths, id));
-    install(paths, &now, &(lines.join("\n") + "\n"))
+    Ok(())
+}
+
+/// Hands every managed cron job back to cron as a plain crontab line: the
+/// marker and the `SHELL` lines go, the job's own line stays (commented
+/// out when it is switched off). For before the plugin or its state folder
+/// is removed: a managed job is started through a wrapper in that folder,
+/// and without it cron can no longer start the job at all. Returns how
+/// many jobs were handed back.
+pub fn release_all(paths: &Paths) -> Result<usize, String> {
+    let mut ids: Vec<String> = Vec::new();
+    change(paths, |tab| {
+        let groups = managed(&tab.text());
+        ids = groups.iter().map(|m| m.id.clone()).collect();
+        if groups.is_empty() {
+            return Ok(None);
+        }
+        let mut next = tab.clone();
+        // From the end, so the lines before keep their numbers.
+        for m in groups.iter().rev() {
+            next.lines
+                .splice(m.start..m.start + m.len, released(tab, m, true));
+        }
+        Ok(Some(next))
+    })?;
+    for id in &ids {
+        let _ = std::fs::remove_file(wrapper(paths, id));
+    }
+    Ok(ids.len())
 }
 
 /// Brings the managed cron jobs in the plugin in line with the crontab,
@@ -681,32 +889,74 @@ pub fn pull(paths: &Paths) -> Result<bool, String> {
     Ok(changed)
 }
 
-/// Replaces the crontab with `text`, after a backup of the current one in
-/// the state folder (the last five are kept).
-fn install(paths: &Paths, now: &str, text: &str) -> Result<(), String> {
+/// The backup of the crontab as it was before this plugin first changed
+/// it. It is never deleted.
+const FIRST_BACKUP: &str = "crontab-first.txt";
+/// How many later backups are kept besides it.
+const BACKUPS: usize = 5;
+
+/// Changes the crontab. `edit` gets the crontab as it is now and returns
+/// the one to install (`None`, or the same: nothing to do).
+///
+/// The crontab has no way to say "replace it only if it is still what I
+/// read", so a change is: read, work out the new crontab, read again, and
+/// install only when nothing changed in between (a hand edit, another
+/// program); otherwise start over on the fresh read. Other processes of
+/// this plugin (a second list, a cron job's wrapper) wait for the lock.
+fn change(
+    paths: &Paths,
+    mut edit: impl FnMut(&Tab) -> Result<Option<Tab>, String>,
+) -> Result<(), String> {
+    paths::locked(&paths.crontab_lock_file(), || {
+        for _ in 0..3 {
+            let before = read_tab()?;
+            let Some(next) = edit(&before)?.filter(|next| *next != before) else {
+                return Ok(());
+            };
+            if read_tab()? == before {
+                return install(paths, &before, &next);
+            }
+        }
+        Err("the crontab kept changing while it was read; nothing was written".into())
+    })
+}
+
+/// Replaces the crontab with `next`, after a backup of the current one
+/// (`now`, read just before) in the state folder: the first one ever is
+/// kept for good, of the later ones the last five.
+fn install(paths: &Paths, now: &Tab, next: &Tab) -> Result<(), String> {
     let program = program().ok_or("there is no crontab here")?;
     let dir = paths.state.join("crontab-backups");
     paths::create_private_dir(&dir).map_err(|e| e.to_string())?;
+    let backup = |name: String| {
+        paths::write_atomic(&dir.join(name), &now.bytes())
+            .map_err(|e| format!("cannot back up the crontab: {e}"))
+    };
+    if !dir.join(FIRST_BACKUP).exists() {
+        backup(FIRST_BACKUP.to_string())?;
+    }
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S%.3f");
-    paths::write_atomic(&dir.join(format!("crontab-{stamp}.txt")), now.as_bytes())
-        .map_err(|e| format!("cannot back up the crontab: {e}"))?;
-    let mut old: Vec<_> = std::fs::read_dir(&dir)
+    backup(format!("crontab-{stamp}.txt"))?;
+    let mut old: Vec<PathBuf> = std::fs::read_dir(&dir)
         .map(|d| d.flatten().map(|e| e.path()).collect())
         .unwrap_or_default();
+    old.retain(|p| p.file_name().is_some_and(|n| n != FIRST_BACKUP));
     old.sort();
-    let extra = old.len().saturating_sub(5);
+    let extra = old.len().saturating_sub(BACKUPS);
     for p in old.into_iter().take(extra) {
         let _ = std::fs::remove_file(p);
     }
-    let next = paths.state.join("crontab-new.txt");
-    paths::write_atomic(&next, text.as_bytes()).map_err(|e| e.to_string())?;
-    let out = Command::new(program)
-        .arg(&next)
-        .output()
-        .map_err(|e| format!("cannot run crontab: {e}"));
-    let _ = std::fs::remove_file(&next);
+    // One file per process: two never share it.
+    let file = paths
+        .state
+        .join(format!("crontab-new-{}.txt", std::process::id()));
+    paths::write_atomic(&file, &next.bytes()).map_err(|e| e.to_string())?;
+    let mut command = Command::new(program);
+    command.arg(&file);
+    let out = crate::shell::tool(command, LIMIT).map_err(|e| format!("cannot run crontab: {e}"));
+    let _ = std::fs::remove_file(&file);
     let out = out?;
-    if out.status.success() {
+    if out.success {
         Ok(())
     } else {
         Err(format!(
@@ -720,18 +970,35 @@ fn install(paths: &Paths, now: &str, text: &str) -> Result<(), String> {
 
 /// Whether the program was started as a cron job's wrapper: as
 /// `<state>/bin/cron/<id> -c <command>`.
-pub fn wrapper_call(args: &[String]) -> Option<(PathBuf, String)> {
-    if args.len() < 3 || args[1] != "-c" {
+///
+/// The arguments are taken as the system hands them over, not as text: a
+/// command in the crontab need not be UTF-8, and it must run all the same.
+pub fn wrapper_call<S: AsRef<OsStr>>(args: &[S]) -> Option<(PathBuf, std::ffi::OsString)> {
+    if args.len() < 3 || args[1].as_ref() != "-c" {
         return None;
     }
-    let me = PathBuf::from(&args[0]);
-    (me.parent()?.file_name()? == "cron").then(|| (me, args[2].clone()))
+    let me = PathBuf::from(args[0].as_ref());
+    (me.parent()?.file_name()? == "cron").then(|| (me, args[2].as_ref().to_os_string()))
 }
 
 /// Starts a managed cron job now, as cron would (`r` in the list): its
 /// wrapper with its command, in the background.
+///
+/// The routine is read again here and must be one that can run: the files
+/// may have changed since the list (or whoever calls) last looked, and
+/// the owner's "yes" was for the approved routine.
 pub fn run_now(paths: &Paths, r: &Routine) -> Result<(), String> {
     use std::os::unix::process::CommandExt;
+    let r = &Routine::load(paths, &r.id)?;
+    if let Some(problem) = &r.problem {
+        return Err(problem.clone());
+    }
+    if !r.approved {
+        return Err("it changed outside the list and waits for approval there (key a)".into());
+    }
+    if !r.is_cron() {
+        return Err("it is not a cron job".into());
+    }
     prepare_wrapper(paths, &r.id)?;
     // The command as the crontab has it, which is what cron runs.
     let command = managed(&read()?)
@@ -764,8 +1031,14 @@ pub fn run_now(paths: &Paths, r: &Routine) -> Result<(), String> {
 /// settings say, and hands the output on to cron. Never keeps cron from
 /// running the command: whatever is wrong with the plugin's side, the
 /// command runs.
-pub fn wrapper_main(me: &Path, cmd: &str) -> i32 {
+///
+/// What the plugin adds (name, time limit, retries, alerts, runs kept)
+/// comes from the routine as the owner approved it (`Approvals::routine`),
+/// never from files that still wait for approval; and the wrapper itself
+/// never approves anything.
+pub fn wrapper_main(me: &Path, cmd: impl AsRef<OsStr>) -> i32 {
     use crate::store::{Run, Status, Trigger};
+    let cmd = cmd.as_ref();
     let id = me
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -798,14 +1071,18 @@ pub fn wrapper_main(me: &Path, cmd: &str) -> i32 {
         std::env::set_var("HERDR_BIN_PATH", h);
     }
     let text = read().unwrap_or_default();
-    let shell = managed(&text)
-        .into_iter()
-        .find(|m| m.id == id)
-        .map(|m| m.shell)
+    let group = managed(&text).into_iter().find(|m| m.id == id);
+    let shell = group
+        .as_ref()
+        .map(|m| m.shell.clone())
         .filter(|s| !s.contains("/bin/cron/"))
         .unwrap_or_else(|| "/bin/sh".into());
-    let Ok(routine) = Routine::load(&paths, &id) else {
-        // Without the plugin's side: just the command, as cron would.
+    let approved = crate::routine::valid_id(&id)
+        .then(|| Approvals::load(&paths).routine(&id))
+        .flatten();
+    let Some(routine) = approved else {
+        // Without the plugin's side (no routine the owner approved): just
+        // the command, as cron would.
         return Command::new(&shell)
             .arg("-c")
             .arg(cmd)
@@ -822,7 +1099,34 @@ pub fn wrapper_main(me: &Path, cmd: &str) -> i32 {
         return 0;
     }
     let manual = std::env::var("HERDR_ROUTINES_TRIGGER").as_deref() == Ok("manual");
+    // A single run on a date: cron has no year, so its line comes round
+    // every year on that day. It runs only on the date itself (as long
+    // as the line is still the one written for that date; a line edited
+    // by hand runs as edited).
+    let once = match routine.schedule() {
+        Some(Schedule::Once(t)) if !manual => Some(t),
+        _ => None,
+    };
+    if let Some(t) = once {
+        let as_written = group
+            .as_ref()
+            .is_none_or(|m| when(&routine).as_deref() == Some(m.when.as_str()));
+        if as_written && t.date_naive() != chrono::Local::now().date_naive() {
+            paths::log(
+                &paths,
+                &format!("{id}: not run, it is set for {} only", t.format("%Y-%m-%d")),
+            );
+            return 0;
+        }
+    }
+    // Bounds also for a routine approved before they were checked.
+    let retries = routine.file.retries.min(crate::routine::MAX_RETRIES);
+    let retry_delay = routine
+        .file
+        .retry_delay_minutes
+        .clamp(1, crate::routine::MAX_MINUTES);
     let pid = std::process::id();
+    let started = crate::scheduler::started_at(pid).unwrap_or_default();
     let mut trigger = if manual {
         Trigger::Manual
     } else {
@@ -835,6 +1139,7 @@ pub fn wrapper_main(me: &Path, cmd: &str) -> i32 {
             if crate::scheduler::busy(&paths, &id) {
                 let mut skipped = Run::new(&id, &routine.file.name, SHELL, trigger, None);
                 skipped.cron_pid = pid;
+                skipped.cron_started = started.clone();
                 skipped.tab_closed = true;
                 skipped.finish(Status::Skipped, "The previous run was still going");
                 let _ = skipped.save(&paths);
@@ -842,6 +1147,7 @@ pub fn wrapper_main(me: &Path, cmd: &str) -> i32 {
             }
             let mut run = Run::new(&id, &routine.file.name, SHELL, trigger, None);
             run.cron_pid = pid;
+            run.cron_started = started.clone();
             run.attempt = attempt;
             run.status = Status::Running;
             run.tab_closed = true;
@@ -851,14 +1157,28 @@ pub fn wrapper_main(me: &Path, cmd: &str) -> i32 {
         let Some(mut run) = run else { return 0 };
         let limit_minutes = routine.file.time_limit_minutes.max(1);
         let limit = std::time::Duration::from_secs(u64::from(limit_minutes) * 60);
-        let (output, ended) = match crate::shell::run_as_cron(&shell, cmd, limit) {
-            Some(e) => (e.output, e.code),
-            None => (format!("Could not start {shell}.\n"), Some(127)),
+        // The output goes into the run's file and on to cron as it comes.
+        let tee = || Tee {
+            file: paths::create_private_file(&run.file(&paths, "out")).ok(),
         };
-        // Cron mails or drops what a job prints: hand it on.
-        print!("{output}");
-        let _ = paths::write_atomic(&run.file(&paths, "out"), output.as_bytes());
-        run.result = crate::runner::last_line(&output);
+        // What cron feeds the command (the text after a `%` in its line)
+        // is there once: the first try gets it.
+        let input = if attempt == 0 {
+            std::process::Stdio::inherit()
+        } else {
+            std::process::Stdio::null()
+        };
+        let (tail, ended) =
+            match crate::shell::run_as_cron(&shell, cmd, limit, input, Some(Box::new(tee()))) {
+                Some(e) => (e.tail, e.code),
+                None => {
+                    let text = format!("Could not start {shell}.\n");
+                    let _ = std::fs::write(run.file(&paths, "out"), &text);
+                    print!("{text}");
+                    (text, Some(127))
+                }
+            };
+        run.result = crate::runner::last_line(&tail);
         let failed = match ended {
             Some(0) => {
                 run.finish(Status::Finished, "");
@@ -886,7 +1206,7 @@ pub fn wrapper_main(me: &Path, cmd: &str) -> i32 {
         };
         let _ = run.save(&paths);
         crate::store::prune(&paths, &id, routine.file.keep_runs, routine.file.keep_days);
-        let retry = failed && run.status == Status::Failed && attempt < routine.file.retries;
+        let retry = failed && run.status == Status::Failed && attempt < retries;
         if failed && !retry {
             crate::alert::tell(
                 &paths,
@@ -911,25 +1231,57 @@ pub fn wrapper_main(me: &Path, cmd: &str) -> i32 {
             );
         }
         if retry {
-            std::thread::sleep(std::time::Duration::from_secs(
-                u64::from(routine.file.retry_delay_minutes) * 60,
-            ));
+            std::thread::sleep(std::time::Duration::from_secs(u64::from(retry_delay) * 60));
             attempt += 1;
             trigger = Trigger::Retry;
             continue;
         }
         break;
     }
-    // A single run on a date switches its cron job off.
-    if !manual && matches!(routine.schedule(), Some(Schedule::Once(_))) {
-        if let Ok(mut done) = Routine::load(&paths, &id) {
-            done.file.enabled = false;
-            if done.save_approved(&paths).is_ok() {
-                let _ = write_job(&paths, &done);
-            }
+    // A single run on a date switches its cron job off: the routine as it
+    // was approved, saved switched off (as `space` would), when its files
+    // are still the approved ones. Files that changed meanwhile wait for
+    // the owner and are neither overwritten nor approved here; then only
+    // the crontab line is switched off.
+    if once.is_some() {
+        let unchanged = Routine::load(&paths, &id).is_ok_and(|now| now.approved);
+        let mut done = routine.clone();
+        done.file.enabled = false;
+        if unchanged && done.save_approved(&paths).is_ok() {
+            let _ = write_job(&paths, &done);
+        } else {
+            let _ = switch(&paths, &id, false);
         }
     }
     code
+}
+
+/// Where a cron job's output goes as it comes: into the run's output file
+/// and on to cron, which mails or drops it as it would without the plugin.
+/// Nothing of it is held back, however much it is.
+struct Tee {
+    file: Option<std::fs::File>,
+}
+
+impl std::io::Write for Tee {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // Neither side stops the other: a full disk still lets cron have
+        // the output, and a closed pipe to cron still fills the file.
+        if self
+            .file
+            .as_mut()
+            .is_some_and(|f| f.write_all(buf).is_err())
+        {
+            self.file = None;
+        }
+        let _ = std::io::stdout().write_all(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let _ = std::io::stdout().flush();
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1003,5 +1355,198 @@ mod tests {
         assert!(wrapper_call(&args(&["/s/bin/cron/say-hi", "-c", "echo hi"])).is_some());
         assert!(wrapper_call(&args(&["/s/bin/herdr-routines", "-c", "x"])).is_none());
         assert!(wrapper_call(&args(&["/s/bin/cron/x", "list"])).is_none());
+        // A command that is not UTF-8 arrives as it is.
+        use std::os::unix::ffi::OsStringExt;
+        let command = std::ffi::OsString::from_vec(b"echo caf\xe9".to_vec());
+        let args = ["/s/bin/cron/x".into(), "-c".into(), command.clone()];
+        assert_eq!(wrapper_call(&args).unwrap().1, command);
+    }
+
+    /// Made-up folders and a stand-in for `crontab` on this thread: `-l`
+    /// runs `on_list` and prints the file, a path replaces it. Returns the
+    /// folders and the file.
+    fn stand_in(tag: &str, text: &[u8], on_list: &str) -> (Paths, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-routines-crontab-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let paths = Paths {
+            config: dir.join("config"),
+            state: dir.join("state"),
+            socket: dir.join("sock"),
+        };
+        std::fs::create_dir_all(&paths.state).unwrap();
+        let tab = dir.join("tab");
+        std::fs::write(&tab, text).unwrap();
+        let fake = dir.join("crontab");
+        let script = format!(
+            "#!/bin/sh\ncd '{}'\nif [ \"$1\" = -l ]; then cat tab; {on_list}\nelse cp \"$1\" tab; fi\n",
+            dir.display()
+        );
+        std::fs::write(&fake, script).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700)).unwrap();
+        use_fake(Some(&fake));
+        (paths, tab)
+    }
+
+    /// An approved cron job routine, saved.
+    fn job(paths: &Paths, id: &str, schedule: &str, command: &str, enabled: bool) -> Routine {
+        let mut file = cron_file(id.to_string(), schedule.to_string(), enabled);
+        file.runs_in = RunsIn::Cron;
+        let r = Routine {
+            id: id.to_string(),
+            file,
+            prompt: command.to_string(),
+            problem: None,
+            unreadable: false,
+            approved: true,
+        };
+        r.save_approved(paths).unwrap();
+        r
+    }
+
+    #[test]
+    fn bytes_that_are_not_text_survive_every_change() {
+        // Latin-1 in a comment and in a command, and Windows line ends.
+        let before: &[u8] =
+            b"# caf\xe9 jobs\r\nMAILTO=\"\"\r\n*/5 * * * *   /opt/caf\xe9/run --all\r\n0 1 * * * other\n";
+        let (paths, tab) = stand_in("bytes", before, ":");
+        let now = || std::fs::read(&tab).unwrap();
+        let has = |part: &[u8]| now().windows(part.len()).any(|w| w == part);
+        // Managed where it is: the line keeps its bytes and its spacing.
+        let jobs = parse(&read().unwrap());
+        assert_eq!(jobs.len(), 2);
+        keep(&paths, &jobs[0]).unwrap();
+        let line: &[u8] = b"\n*/5 * * * *   /opt/caf\xe9/run --all\r\n";
+        assert!(has(line), "{:?}", String::from_utf8_lossy(&now()));
+        let id = managed(&read().unwrap())[0].id.clone();
+        // Off and on again, by the key and by a saved routine.
+        switch(&paths, &id, false).unwrap();
+        assert!(has(b"\n#off */5 * * * *   /opt/caf\xe9/run --all\r\n"));
+        assert!(!managed(&read().unwrap())[0].enabled);
+        switch(&paths, &id, true).unwrap();
+        assert!(has(line));
+        pull(&paths).unwrap();
+        let mut r = Routine::load(&paths, &id).unwrap();
+        assert!(r.approved && r.problem.is_none(), "{:?}", r.problem);
+        r.file.enabled = false;
+        r.file.name = "Caf run".into();
+        r.save_approved(&paths).unwrap();
+        write_job(&paths, &r).unwrap();
+        assert!(has(b"\n#off */5 * * * *   /opt/caf\xe9/run --all\r\n"));
+        // Another job is added and removed: the rest stays byte for byte.
+        let other = job(&paths, "say-hi", "0 9 * * *", "echo 100%", true);
+        write_job(&paths, &other).unwrap();
+        assert!(has(b"\n0 9 * * * echo 100\\%\nSHELL=/bin/sh\n"));
+        assert!(has(b"# caf\xe9 jobs\r\nMAILTO=\"\"\r\n"));
+        remove_job(&paths, "say-hi", false).unwrap();
+        r.file.enabled = true;
+        r.save_approved(&paths).unwrap();
+        write_job(&paths, &r).unwrap();
+        // Handed back to cron: the crontab is what it was at the start
+        // (but for the empty line a new group leaves behind).
+        assert_eq!(release_all(&paths).unwrap(), 1);
+        assert_eq!(now(), [before, b"\n"].concat());
+        assert!(!wrapper(&paths, &id).exists());
+        use_fake(None);
+    }
+
+    #[test]
+    fn a_routine_that_waits_for_approval_is_never_written() {
+        let (paths, tab) = stand_in("waiting", b"0 1 * * * other\n", ":");
+        let mut r = job(&paths, "say-hi", "0 9 * * *", "echo hi", true);
+        write_job(&paths, &r).unwrap();
+        let approved = std::fs::read(&tab).unwrap();
+        // As `Routine::load` hands over one whose files changed.
+        r.prompt = "echo something else".into();
+        r.file.schedule = "* * * * *".into();
+        r.approved = false;
+        write_job(&paths, &r).unwrap();
+        assert_eq!(std::fs::read(&tab).unwrap(), approved);
+        // Switching it changes on or off and nothing else.
+        switch(&paths, "say-hi", false).unwrap();
+        let off = String::from_utf8(std::fs::read(&tab).unwrap()).unwrap();
+        assert!(off.contains("\n#off 0 9 * * * echo hi\n"), "{off}");
+        switch(&paths, "say-hi", false).unwrap();
+        assert_eq!(
+            String::from_utf8(std::fs::read(&tab).unwrap()).unwrap(),
+            off
+        );
+        switch(&paths, "say-hi", true).unwrap();
+        assert_eq!(std::fs::read(&tab).unwrap(), approved);
+        switch(&paths, "no-such-job", false).unwrap();
+        assert_eq!(std::fs::read(&tab).unwrap(), approved);
+        use_fake(None);
+    }
+
+    #[test]
+    fn a_crontab_that_changes_meanwhile_is_not_overwritten() {
+        // Something else edits the crontab once, right after it was read.
+        let edit_once =
+            "if [ ! -e edited ]; then echo '0 2 * * * by hand' >> tab; touch edited; fi";
+        let (paths, tab) = stand_in("race", b"0 1 * * * other\n", edit_once);
+        let r = job(&paths, "say-hi", "0 9 * * *", "echo hi", true);
+        write_job(&paths, &r).unwrap();
+        let now = std::fs::read_to_string(&tab).unwrap();
+        assert!(
+            now.starts_with("0 1 * * * other\n0 2 * * * by hand\n"),
+            "{now}"
+        );
+        assert!(now.contains("\n0 9 * * * echo hi\n"), "{now}");
+        // One that changes on every read is left alone, with an error.
+        let (paths, tab) = stand_in("race-always", b"0 1 * * * other\n", "echo '# again' >> tab");
+        let r = job(&paths, "say-hi", "0 9 * * *", "echo hi", true);
+        let e = write_job(&paths, &r).unwrap_err();
+        assert!(e.contains("kept changing"), "{e}");
+        assert!(!std::fs::read_to_string(&tab).unwrap().contains("echo hi"));
+        use_fake(None);
+    }
+
+    #[test]
+    fn the_first_backup_stays_besides_the_last_five() {
+        let first = "0 1 * * * as it was before the plugin\n";
+        let (paths, _tab) = stand_in("backups", first.as_bytes(), ":");
+        let r = job(&paths, "say-hi", "0 9 * * *", "echo hi", true);
+        write_job(&paths, &r).unwrap();
+        for n in 0..8 {
+            switch(&paths, "say-hi", n % 2 == 1).unwrap();
+            // The backups are named by the time, to the millisecond.
+            std::thread::sleep(std::time::Duration::from_millis(3));
+        }
+        let dir = paths.state.join("crontab-backups");
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names.len(), BACKUPS + 1, "{names:?}");
+        assert!(names.contains(&FIRST_BACKUP.to_string()));
+        assert_eq!(
+            std::fs::read_to_string(dir.join(FIRST_BACKUP)).unwrap(),
+            first
+        );
+        use_fake(None);
+    }
+
+    #[test]
+    fn managed_jobs_are_handed_back_as_plain_lines() {
+        let (paths, tab) = stand_in("release", b"SHELL=/bin/bash\n0 1 * * * other\n", ":");
+        write_job(&paths, &job(&paths, "say-hi", "0 9 * * *", "echo hi", true)).unwrap();
+        write_job(&paths, &job(&paths, "say-bye", "@start", "echo bye", false)).unwrap();
+        assert_eq!(managed(&read().unwrap()).len(), 2);
+        assert!(wrapper(&paths, "say-hi").exists());
+        assert_eq!(release_all(&paths).unwrap(), 2);
+        // No marker and no wrapper are left: cron runs the lines itself,
+        // with the shell the crontab had; the one that was off stays off.
+        assert_eq!(
+            std::fs::read_to_string(&tab).unwrap(),
+            "SHELL=/bin/bash\n0 1 * * * other\n\n0 9 * * * echo hi\n\n# @reboot echo bye\n"
+        );
+        assert!(!wrapper(&paths, "say-hi").exists() && !wrapper(&paths, "say-bye").exists());
+        assert_eq!(release_all(&paths).unwrap(), 0);
+        use_fake(None);
     }
 }

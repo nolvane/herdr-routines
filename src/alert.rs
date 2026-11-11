@@ -10,7 +10,6 @@
 
 use crate::herdr;
 use crate::paths::Paths;
-use crate::routine::Routine;
 use crate::store::Run;
 
 const ENV: &str = "HERDR_ROUTINES_ALERT";
@@ -22,7 +21,10 @@ const WIDTH: u16 = 64;
 /// notification either way (a finished run without `notify_finished`), only
 /// the popup a routine asks for.
 pub fn tell(paths: &Paths, run: &Run, problem: bool, title: &str, body: &str, notify: bool) {
-    let alert = Routine::load(paths, &run.routine_id)
+    // As the owner approved it: a change that waits for approval does not
+    // decide how they are told.
+    let alert = crate::approval::Approvals::load(paths)
+        .routine(&run.routine_id)
         .map(|r| r.file.alert)
         .unwrap_or_default();
     if alert.popup(problem) && open(run, title, body) {

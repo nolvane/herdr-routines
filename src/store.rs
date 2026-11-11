@@ -75,6 +75,14 @@ impl Status {
     pub fn active(self) -> bool {
         matches!(self, Status::Starting | Status::Running | Status::NeedsYou)
     }
+
+    /// A record of a time at which nothing ran (the previous run was still
+    /// going, or the check found nothing to do). These are kept apart from
+    /// the runs when the history is pruned, so a row of them never pushes
+    /// out the runs that have output.
+    pub fn note(self) -> bool {
+        matches!(self, Status::Skipped | Status::NothingToDo)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -141,6 +149,11 @@ pub struct Run {
     /// record (it has no tab, and Herdr's scheduler leaves it alone).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub cron_pid: u32,
+    /// When that wrapper process started, as `ps` prints it. A pid alone
+    /// is handed out again; together with its start time it names one
+    /// process (`scheduler::alive_since`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub cron_started: String,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -186,6 +199,7 @@ impl Run {
             result: String::new(),
             attempt: 0,
             cron_pid: 0,
+            cron_started: String::new(),
         }
     }
 
@@ -248,7 +262,8 @@ pub fn runs_of(paths: &Paths, routine_id: &str) -> Vec<Run> {
         .flatten()
         .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
         .filter_map(|e| {
-            let run: Run = serde_json::from_slice(&std::fs::read(e.path()).ok()?).ok()?;
+            let bytes = paths::read_limited(&e.path(), paths::FILE_LIMIT).ok()?;
+            let run: Run = serde_json::from_slice(&bytes).ok()?;
             let stem = e.path().file_stem()?.to_string_lossy().to_string();
             (run.routine_id == routine_id && run.id == stem && valid_run_id(&run.id)).then_some(run)
         })
@@ -273,15 +288,26 @@ pub fn all_runs(paths: &Paths) -> Vec<Run> {
     out
 }
 
-/// Deletes the oldest finished runs beyond `keep`.
 /// Keeps a routine's newest `keep_runs` runs, none older than `keep_days`
-/// days (0: no limit for either). Runs still going always stay.
+/// days (0: no limit for either). Runs still going always stay. Notes of
+/// times at which nothing ran (`Status::note`) are counted on their own,
+/// with the same limits, so they never push a real run out.
 pub fn prune(paths: &Paths, routine_id: &str, keep_runs: u32, keep_days: u32) {
     let runs = runs_of(paths, routine_id);
+    // A number of days too large for the calendar means no age limit.
     let oldest = (keep_days > 0)
-        .then(|| chrono::Local::now() - chrono::Duration::days(i64::from(keep_days)));
-    for (i, run) in runs.iter().enumerate() {
-        let too_many = keep_runs > 0 && i >= keep_runs as usize;
+        .then(|| chrono::Duration::try_days(i64::from(keep_days)))
+        .flatten()
+        .and_then(|d| chrono::Local::now().checked_sub_signed(d));
+    let (mut real, mut notes) = (0usize, 0usize);
+    for run in &runs {
+        let seen = if run.status.note() {
+            &mut notes
+        } else {
+            &mut real
+        };
+        *seen += 1;
+        let too_many = keep_runs > 0 && *seen > keep_runs as usize;
         let too_old = oldest.is_some_and(|t| run.started < t);
         if (too_many || too_old) && !run.status.active() {
             remove(paths, run);
@@ -367,6 +393,33 @@ mod tests {
         let left = runs_of(&p, "b");
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].id, "20261101-090000-000");
+    }
+
+    #[test]
+    fn notes_do_not_push_runs_out_and_huge_limits_do_not_panic() {
+        let p = temp_paths("notes");
+        let mk = |id: &str, status: Status| {
+            let mut run = Run::new("a", "A", "claude", Trigger::Scheduled, None);
+            run.id = id.into();
+            run.finish(status, "");
+            run.save(&p).unwrap();
+        };
+        mk("20261101-080000-000", Status::Finished);
+        mk("20261101-081000-000", Status::Failed);
+        for i in 0..5 {
+            mk(&format!("20261101-09{i:02}00-000"), Status::Skipped);
+            mk(&format!("20261101-10{i:02}00-000"), Status::NothingToDo);
+        }
+        prune(&p, "a", 2, 90);
+        let left = runs_of(&p, "a");
+        let real = left.iter().filter(|r| !r.status.note()).count();
+        assert_eq!(real, 2, "both real runs stay");
+        assert_eq!(left.len(), 4, "and the two newest notes");
+        // Limits far outside the calendar: no panic, nothing deleted by age.
+        for days in [100_000_000, u32::MAX] {
+            prune(&p, "a", 0, days);
+        }
+        assert_eq!(runs_of(&p, "a").len(), 4);
     }
 
     #[test]

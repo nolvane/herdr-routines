@@ -3,13 +3,47 @@
 use serde_json::Value;
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::Duration;
 
-/// The running Herdr binary, as Herdr hands it to plugins.
+/// The running Herdr binary, as Herdr hands it to plugins. Only for
+/// writing its path down (the login item, the cron wrappers); calls go
+/// through [`program`].
 pub fn bin() -> PathBuf {
     std::env::var_os("HERDR_BIN_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("herdr"))
 }
+
+/// The program every Herdr call starts. Tests never reach a real Herdr
+/// (no notification, popup or tab in the developer's own session): without
+/// a stand-in set by `use_fake` for their thread, there is no Herdr.
+fn program() -> Option<PathBuf> {
+    #[cfg(test)]
+    {
+        FAKE.with(|f| f.borrow().clone())
+    }
+    #[cfg(not(test))]
+    {
+        Some(bin())
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAKE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Tests: a stand-in for `herdr` on this thread.
+#[cfg(test)]
+pub fn use_fake(program: Option<&std::path::Path>) {
+    FAKE.with(|f| *f.borrow_mut() = program.map(PathBuf::from));
+}
+
+/// How long a Herdr call may take before it is given up, so a server that
+/// does not answer cannot hang the scheduler or the list.
+const LIMIT: Duration = Duration::from_secs(20);
+/// `agent start` waits up to a minute for the agent itself.
+const START_LIMIT: Duration = Duration::from_secs(90);
 
 /// A failed Herdr call: the error code (such as `pane_not_found`) and text.
 #[derive(Debug, Clone)]
@@ -28,12 +62,21 @@ impl std::fmt::Display for Error {
     }
 }
 
-fn run(args: &[&str]) -> Result<Vec<u8>, Error> {
-    let out = Command::new(bin()).args(args).output().map_err(|e| Error {
+/// One call of the Herdr command line, waited for at most `limit`.
+pub fn output(args: &[&str], limit: Duration) -> Result<crate::shell::ToolOutput, Error> {
+    let failed = |message: String| Error {
         code: String::new(),
-        message: format!("cannot run herdr: {e}"),
-    })?;
-    if out.status.success() {
+        message,
+    };
+    let program = program().ok_or_else(|| failed("there is no herdr here".into()))?;
+    let mut command = Command::new(program);
+    command.args(args);
+    crate::shell::tool(command, limit).map_err(|e| failed(format!("cannot run herdr: {e}")))
+}
+
+fn run_within(args: &[&str], limit: Duration) -> Result<Vec<u8>, Error> {
+    let out = output(args, limit)?;
+    if out.success {
         return Ok(out.stdout);
     }
     let v: Value = serde_json::from_slice(&out.stderr).unwrap_or(Value::Null);
@@ -43,6 +86,10 @@ fn run(args: &[&str]) -> Result<Vec<u8>, Error> {
         .map(str::to_string)
         .unwrap_or_else(|| String::from_utf8_lossy(&out.stderr).trim().to_string());
     Err(Error { code, message })
+}
+
+fn run(args: &[&str]) -> Result<Vec<u8>, Error> {
+    run_within(args, LIMIT)
 }
 
 fn call(args: &[&str]) -> Result<Value, Error> {
@@ -190,7 +237,7 @@ pub fn agent_start(name: &str, kind: &str, pane: &str, args: &[String]) -> Resul
         a.push("--");
         a.extend(args.iter().map(String::as_str));
     }
-    call(&a).map(|_| ())
+    run_within(&a, START_LIMIT).map(|_| ())
 }
 
 /// Types a command line into the pane's shell and runs it.
@@ -315,6 +362,31 @@ pub fn notify(title: &str, body: &str, sound: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tests_have_no_herdr_unless_they_bring_one() {
+        // Whatever HERDR_BIN_PATH says: without a stand-in nothing is run.
+        let e = output(&["pane", "list"], LIMIT).unwrap_err();
+        assert!(e.message.contains("no herdr"), "{e}");
+        assert!(pane_info("w1:p1").is_err());
+        let dir = std::env::temp_dir().join(format!("herdr-routines-fake-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("herdr");
+        let script = "#!/bin/sh\nif [ \"$1\" = hang ]; then sleep 30; fi\necho '{\"error\":{\"code\":\"pane_not_found\",\"message\":\"no such pane\"}}' >&2\nexit 1\n";
+        std::fs::write(&fake, script).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700)).unwrap();
+        use_fake(Some(&fake));
+        assert_eq!(pane_info("w1:p1").unwrap(), None, "its error code is read");
+        // A Herdr that does not answer is given up.
+        let start = std::time::Instant::now();
+        let e = output(&["hang"], Duration::from_millis(200)).unwrap_err();
+        assert!(e.message.contains("no answer"), "{e}");
+        assert!(start.elapsed() < Duration::from_secs(10));
+        use_fake(None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Herdr 0.9.5's answers, trimmed (taken from a throwaway session).
     #[test]

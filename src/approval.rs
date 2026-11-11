@@ -49,6 +49,18 @@ impl Approvals {
             .iter()
             .all(|f| approved.get(*f).is_some() && approved.get(*f) == files.get(*f))
     }
+
+    /// The routine as the owner approved it last, whatever its files say
+    /// now. Processes that act without the owner looking (the cron
+    /// wrapper, pruning the history) take their settings from here, so a
+    /// change that still waits for approval has no effect. `None` for a
+    /// routine that was never approved.
+    pub fn routine(&self, id: &str) -> Option<Routine> {
+        let files = self.0.get(id)?;
+        Routine::from_files(id, files, self)
+            .ok()
+            .filter(|r| r.approved)
+    }
 }
 
 /// Changes `approved.json` under its lock, so two lists approving at the
@@ -79,13 +91,16 @@ fn deciding(files: Snapshot) -> Snapshot {
         .collect()
 }
 
-/// The routine's files as they are on disk now, each read once.
+/// The routine's files as they are on disk now, each read once. Only plain
+/// text files within [`paths::FILE_LIMIT`] count: anything else (a pipe, a
+/// device, a huge file) is left out like a missing file, so it can neither
+/// stall nor fill the processes that read the routines every few seconds.
 pub fn snapshot(paths: &Paths, id: &str) -> Snapshot {
     let dir = paths.routine_dir(id);
     FILES
         .iter()
         .filter_map(|f| {
-            std::fs::read_to_string(dir.join(f))
+            paths::read_text_limited(&dir.join(f), paths::FILE_LIMIT)
                 .ok()
                 .map(|t| (f.to_string(), t))
         })

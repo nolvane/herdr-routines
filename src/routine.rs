@@ -226,6 +226,12 @@ pub struct RoutineFile {
 
 pub const KEEP_RUNS: u32 = 30;
 pub const KEEP_DAYS: u32 = 90;
+/// The most a routine can ask for (`Routine::check`).
+pub const MAX_KEEP_RUNS: u32 = 100_000;
+pub const MAX_KEEP_DAYS: u32 = 36_500;
+pub const MAX_RETRIES: u32 = 3;
+/// A year, for the time limit and the wait between retries.
+pub const MAX_MINUTES: u32 = 525_600;
 
 fn default_keep_runs() -> u32 {
     KEEP_RUNS
@@ -265,32 +271,41 @@ pub struct Routine {
 /// overrides, soft hyphen, tag characters), variation selectors beyond
 /// the two emoji ones, and private-use characters.
 pub fn has_hidden(text: &str, multi_line: bool) -> bool {
-    text.chars().any(|c| {
-        if c.is_control() {
-            return !(multi_line && matches!(c, '\n' | '\t' | '\r'));
-        }
-        matches!(
-            c,
-            '\u{00AD}'
-                | '\u{034F}'
-                | '\u{061C}'
-                | '\u{115F}'..='\u{1160}'
-                | '\u{17B4}'..='\u{17B5}'
-                | '\u{180B}'..='\u{180F}'
-                | '\u{200B}'..='\u{200C}'
-                | '\u{200E}'..='\u{200F}'
-                | '\u{202A}'..='\u{202E}'
-                | '\u{2060}'..='\u{206F}'
-                | '\u{3164}'
-                | '\u{FE00}'..='\u{FE0D}'
-                | '\u{FEFF}'
-                | '\u{FFA0}'
-                | '\u{FFF0}'..='\u{FFFB}'
-                | '\u{E000}'..='\u{F8FF}'
-                | '\u{E0000}'..='\u{E0FFF}'
-                | '\u{F0000}'..='\u{10FFFF}'
-        )
-    })
+    text.chars().any(|c| is_hidden(c, multi_line))
+}
+
+/// The text without the characters [`has_hidden`] finds (line breaks and
+/// tabs stay). For text that comes back from a run (an agent's result, a
+/// check command's output) before it goes into a later prompt.
+pub fn without_hidden(text: &str) -> String {
+    text.chars().filter(|c| !is_hidden(*c, true)).collect()
+}
+
+fn is_hidden(c: char, multi_line: bool) -> bool {
+    if c.is_control() {
+        return !(multi_line && matches!(c, '\n' | '\t' | '\r'));
+    }
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{034F}'
+            | '\u{061C}'
+            | '\u{115F}'..='\u{1160}'
+            | '\u{17B4}'..='\u{17B5}'
+            | '\u{180B}'..='\u{180F}'
+            | '\u{200B}'..='\u{200C}'
+            | '\u{200E}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{206F}'
+            | '\u{3164}'
+            | '\u{FE00}'..='\u{FE0D}'
+            | '\u{FEFF}'
+            | '\u{FFA0}'
+            | '\u{FFF0}'..='\u{FFFB}'
+            | '\u{E000}'..='\u{F8FF}'
+            | '\u{E0000}'..='\u{E0FFF}'
+            | '\u{F0000}'..='\u{10FFFF}'
+    )
 }
 
 /// Whether a folder name can be a routine id: lower case letters, digits
@@ -380,6 +395,43 @@ impl Routine {
         if file.time_limit_minutes == 0 {
             return Some("the time limit is 0 minutes".into());
         }
+        // Bounds for every number: a value far outside them is a mistake
+        // (or an attempt to break the scheduler's date arithmetic).
+        if file.time_limit_minutes > MAX_MINUTES {
+            return Some(format!(
+                "the time limit is at most {MAX_MINUTES} minutes (a year)"
+            ));
+        }
+        if file.retries > MAX_RETRIES {
+            return Some(format!(
+                "a failed run is retried at most {MAX_RETRIES} times"
+            ));
+        }
+        if file.retries > 0 && !(1..=MAX_MINUTES).contains(&file.retry_delay_minutes) {
+            return Some(format!(
+                "retries are 1 to {MAX_MINUTES} minutes apart, not {}",
+                file.retry_delay_minutes
+            ));
+        }
+        if file.keep_runs > MAX_KEEP_RUNS {
+            return Some(format!(
+                "at most {MAX_KEEP_RUNS} runs are kept (0 keeps all)"
+            ));
+        }
+        if file.keep_days > MAX_KEEP_DAYS {
+            return Some(format!(
+                "runs are kept for at most {MAX_KEEP_DAYS} days (0 keeps them without limit)"
+            ));
+        }
+        // Cron starts its jobs in the home folder, whatever the file says:
+        // a different folder here would show a place the command never
+        // runs in.
+        if file.runs_in == RunsIn::Cron && paths::expand(&file.folder) != paths::expand("~") {
+            return Some(
+                "a cron job runs in your home folder: its folder must be ~ (use cd in the command)"
+                    .into(),
+            );
+        }
         None
     }
 
@@ -417,7 +469,23 @@ impl Routine {
                 "the folder name \"{id}\" may only have lower case letters, digits and dashes"
             ));
         }
-        Routine::from_files(id, &approval::snapshot(paths, id), approvals)
+        let files = approval::snapshot(paths, id);
+        let mut routine = Routine::from_files(id, &files, approvals).map_err(|e| {
+            if paths.routine_dir(id).join("routine.toml").exists() {
+                format!("{e} (it must be a plain text file of at most 1 MB)")
+            } else {
+                e
+            }
+        })?;
+        // A prompt or command that is there but was not read (a pipe, a
+        // device, too large, not text) says so instead of "empty".
+        let text = Routine::text_file(&routine.file.agent);
+        if !files.contains_key(text) && paths.routine_dir(id).join(text).exists() {
+            routine.problem = Some(format!(
+                "{text} cannot be read: it must be a plain text file of at most 1 MB"
+            ));
+        }
+        Ok(routine)
     }
 
     /// The routine from one read of its files. Its approval is judged
@@ -629,7 +697,7 @@ impl Default for Settings {
 
 impl Settings {
     pub fn load(paths: &Paths) -> Settings {
-        std::fs::read_to_string(paths.settings_file())
+        paths::read_text_limited(&paths.settings_file(), paths::FILE_LIMIT)
             .ok()
             .and_then(|t| toml::from_str(&t).ok())
             .unwrap_or_default()
@@ -819,5 +887,86 @@ mod tests {
         f = sample();
         f.folder = "/does/not/exist/here".into();
         assert!(Routine::check(&f, "go").is_some());
+    }
+
+    #[test]
+    fn numbers_have_bounds() {
+        let ok = |f: &RoutineFile| Routine::check(f, "go").is_none();
+        let mut f = sample();
+        (f.retries, f.retry_delay_minutes) = (MAX_RETRIES, 1);
+        (f.keep_runs, f.keep_days) = (MAX_KEEP_RUNS, MAX_KEEP_DAYS);
+        f.time_limit_minutes = MAX_MINUTES;
+        assert!(ok(&f));
+        // Retries without end, one right after the other.
+        f.retries = u32::MAX;
+        assert!(!ok(&f));
+        (f.retries, f.retry_delay_minutes) = (1, 0);
+        assert!(!ok(&f));
+        // Without retries the wait between them does not matter.
+        f.retries = 0;
+        assert!(ok(&f));
+        // Values that would overflow the date arithmetic.
+        f.keep_days = u32::MAX;
+        assert!(!ok(&f));
+        f = sample();
+        f.keep_runs = u32::MAX;
+        assert!(!ok(&f));
+        f = sample();
+        f.time_limit_minutes = u32::MAX;
+        assert!(!ok(&f));
+        // Keeping everything stays possible.
+        f = sample();
+        (f.keep_runs, f.keep_days) = (0, 0);
+        assert!(ok(&f));
+    }
+
+    #[test]
+    fn a_cron_job_is_set_up_for_the_home_folder() {
+        let mut f = sample();
+        f.agent = SHELL.into();
+        f.permission_mode = String::new();
+        f.model = String::new();
+        f.runs_in = RunsIn::Cron;
+        assert_eq!(Routine::check(&f, "echo hi"), None);
+        f.folder = "/tmp".into();
+        let problem = Routine::check(&f, "echo hi").unwrap();
+        assert!(problem.contains("home folder"), "{problem}");
+        // Run by Herdr, the same command may use any folder.
+        f.runs_in = RunsIn::Herdr;
+        assert_eq!(Routine::check(&f, "echo hi"), None);
+    }
+
+    #[test]
+    fn routine_files_are_plain_files_of_a_sane_size() {
+        let p = temp_paths("plain");
+        let r = Routine {
+            id: "morning-report".into(),
+            file: sample(),
+            prompt: "Write the report.".into(),
+            problem: None,
+            unreadable: false,
+            approved: true,
+        };
+        r.save_approved(&p).unwrap();
+        let dir = p.routine_dir("morning-report");
+        // A prompt too large to be one: a problem, not a long read.
+        let big = vec![b'x'; paths::FILE_LIMIT as usize + 1];
+        std::fs::write(dir.join("prompt.md"), big).unwrap();
+        let now = Routine::load(&p, "morning-report").unwrap();
+        assert!(!now.can_run());
+        assert!(now.problem.unwrap().contains("prompt.md cannot be read"));
+        // A pipe in place of a file: reading it would wait for ever.
+        std::fs::remove_file(dir.join("prompt.md")).unwrap();
+        let made = std::process::Command::new("mkfifo")
+            .arg(dir.join("prompt.md"))
+            .status();
+        if made.is_ok_and(|s| s.success()) {
+            let now = Routine::load(&p, "morning-report").unwrap();
+            assert!(now.problem.unwrap().contains("prompt.md cannot be read"));
+        }
+        std::fs::remove_file(dir.join("routine.toml")).unwrap();
+        std::os::unix::fs::symlink("/dev/zero", dir.join("routine.toml")).unwrap();
+        let all = load_all(&p);
+        assert!(all[0].unreadable && !all[0].can_run());
     }
 }

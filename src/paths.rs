@@ -95,6 +95,11 @@ impl Paths {
         self.state.join(".approved.lock")
     }
 
+    /// Held while the crontab is read, changed and installed.
+    pub fn crontab_lock_file(&self) -> PathBuf {
+        self.state.join(".crontab.lock")
+    }
+
     /// Routines that were due while they waited for approval and were
     /// already announced, so the notification comes once per wait.
     pub fn waiting_file(&self) -> PathBuf {
@@ -118,7 +123,7 @@ pub fn locked<T>(file: &Path, f: impl FnOnce() -> T) -> T {
     f()
 }
 
-fn server_id_of(socket: &Path) -> String {
+pub fn server_id_of(socket: &Path) -> String {
     use std::os::unix::fs::MetadataExt;
     let ino = std::fs::metadata(socket).map(|m| m.ino()).unwrap_or(0);
     format!("{}#{ino}", socket.display())
@@ -188,7 +193,7 @@ pub fn secure_roots(paths: &Paths) {
 
 /// Opens a new file readable only by the owner (`0600`). Fails when the
 /// name exists, a link included, so it never writes through a planted link.
-fn create_private_file(path: &Path) -> std::io::Result<std::fs::File> {
+pub fn create_private_file(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     std::fs::OpenOptions::new()
         .write(true)
@@ -227,11 +232,80 @@ pub fn write_atomic(path: &Path, content: &[u8]) -> std::io::Result<()> {
     })
 }
 
+/// The most a routine file (`routine.toml`, the prompt or command) or a run
+/// record may hold. Larger files are not read.
+pub const FILE_LIMIT: u64 = 1024 * 1024;
+/// The log is moved aside (one older copy is kept) once it is this large.
+const LOG_LIMIT: u64 = 2 * 1024 * 1024;
+
+/// Reads a file only when it is a plain file of at most `limit` bytes.
+/// Routine files and run records are written by other programs too: a
+/// pipe, a device or a huge file there must not stall or fill the process
+/// that reads them every few seconds.
+pub fn read_limited(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let refuse = |why: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, why.to_string());
+    // Checked before opening, since opening a pipe would wait for a writer.
+    let meta = std::fs::metadata(path)?;
+    if !meta.is_file() {
+        return Err(refuse("not a plain file"));
+    }
+    if meta.len() > limit {
+        return Err(refuse("the file is too large"));
+    }
+    let file = std::fs::File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(refuse("not a plain file"));
+    }
+    let mut bytes = Vec::new();
+    file.take(limit + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(refuse("the file is too large"));
+    }
+    Ok(bytes)
+}
+
+/// [`read_limited`] for text; a file that is not UTF-8 is refused.
+pub fn read_text_limited(path: &Path, limit: u64) -> std::io::Result<String> {
+    String::from_utf8(read_limited(path, limit)?)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "not UTF-8 text"))
+}
+
+/// The last `limit` bytes of a file as text, and whether it is longer than
+/// that. Bytes that are not UTF-8 show as the replacement character, so
+/// output with a stray byte is still readable. `None` when it cannot be read.
+pub fn read_tail_lossy(path: &Path, limit: u64) -> Option<(String, bool)> {
+    use std::io::{Read, Seek, SeekFrom};
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let mut file = std::fs::File::open(path).ok()?;
+    let cut = meta.len() > limit;
+    if cut {
+        file.seek(SeekFrom::Start(meta.len() - limit)).ok()?;
+    }
+    let mut bytes = Vec::new();
+    file.take(limit).read_to_end(&mut bytes).ok()?;
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    if cut {
+        // Start at a whole line.
+        if let Some(i) = text.find('\n') {
+            text.drain(..=i);
+        }
+    }
+    Some((text, cut))
+}
+
 /// Appends a timestamped line to the plugin log.
 pub fn log(paths: &Paths, line: &str) {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let _ = create_private_dir(&paths.state);
+    // Kept small: the current log and the one before it.
+    if std::fs::metadata(paths.log_file()).is_ok_and(|m| m.len() > LOG_LIMIT) {
+        let _ = std::fs::rename(paths.log_file(), paths.state.join("routines.log.1"));
+    }
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -299,6 +373,47 @@ mod tests {
                 0o700
             );
         }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn only_plain_files_within_the_limit_are_read() {
+        let d = temp("limited");
+        std::fs::create_dir_all(&d).unwrap();
+        let f = d.join("a.txt");
+        std::fs::write(&f, b"12345").unwrap();
+        assert_eq!(read_limited(&f, 5).unwrap(), b"12345");
+        assert!(read_limited(&f, 4).is_err(), "too large");
+        assert!(read_limited(&d, 100).is_err(), "a folder");
+        // A pipe is refused without waiting for a writer.
+        let fifo = d.join("pipe");
+        let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+        if made.is_ok_and(|s| s.success()) {
+            assert!(read_limited(&fifo, 100).is_err());
+        }
+        std::fs::write(&f, b"one\ntwo \xff\nthree\n").unwrap();
+        assert!(read_text_limited(&f, 100).is_err(), "not UTF-8");
+        let (tail, cut) = read_tail_lossy(&f, 100).unwrap();
+        assert!(!cut && tail.starts_with("one\ntwo \u{FFFD}"));
+        let (tail, cut) = read_tail_lossy(&f, 8).unwrap();
+        assert!(cut);
+        assert_eq!(tail, "three\n");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_log_is_moved_aside_when_large() {
+        let d = temp("log");
+        let p = Paths {
+            config: d.join("config"),
+            state: d.join("state"),
+            socket: d.join("sock"),
+        };
+        std::fs::create_dir_all(&p.state).unwrap();
+        std::fs::write(p.log_file(), vec![b'x'; LOG_LIMIT as usize + 1]).unwrap();
+        log(&p, "next");
+        assert!(p.state.join("routines.log.1").exists());
+        assert!(std::fs::metadata(p.log_file()).unwrap().len() < 200);
         let _ = std::fs::remove_dir_all(&d);
     }
 
