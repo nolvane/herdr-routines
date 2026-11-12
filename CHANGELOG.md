@@ -5,8 +5,40 @@ All notable changes to this plugin. The format follows
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-11-12
+
+First release.
+
 ### Added
 
+- Scheduler that starts with Herdr and runs routines on five-field cron
+  schedules in local time, each run as an interactive agent in its own tab.
+- Any agent kind Herdr can start (Claude, Codex, Gemini, OpenCode and more).
+- "Needs you" detection with a notification, also for questions before the
+  agent is ready; the prompt follows once answered.
+- Missed times caught up once or skipped, per routine; no overlapping runs;
+  time limit per routine; finished tabs closed after an hour.
+- List of routines and runs with a form to create and edit routines, run
+  now, on and off, delete, and saved output; the same look and the same
+  keys and mouse use as the other Herdr plugins of this author, with all
+  keys under `?`.
+- Permission mode, model and effort per routine, picked from a list, for
+  Claude Code, Codex and Gemini; new routines start in Auto.
+- Prompt editor inside the list (arrows, mouse, paste, undo), and `Ctrl+O`
+  for your own editor.
+- Shell commands as routines, like cron jobs without AI: exit code 0
+  finishes the run, anything else marks it failed and notifies.
+- On and off at a glance: a green dot for on, a red one for off.
+- A model choice for every agent that takes one, from the agent's own list
+  where it prints one; long lists filter by typing.
+- Create a routine by describing it to Claude.
+- Retries for failed runs, stopping a run at its time limit, single runs on
+  a date, runs when Herdr starts, and starting Herdr at login.
+- Check command before an agent run; the agent's summary saved with each
+  run, and optionally given to the next runs.
+- Whole output of shell commands in a file; agent tabs saved every minute;
+  `f` opens a run's output file; the runs of one routine with "n runs".
+- `routines` (JSON) and `fire <id>` commands for scripts and other agents.
 - Every run that went wrong is told, not only a command's error and the
   time limit: an agent that could not be started, a check command that
   broke, a tab closed before the run was done. When Herdr is closed (a
@@ -253,6 +285,8 @@ All notable changes to this plugin. The format follows
 
 ### Security
 
+- A carriage return in a command or prompt is refused, so what the list
+  shows is what runs (#1).
 - A cron job that waits for approval is never written into the crontab,
   whichever key is pressed: its approved line stays until `a` approves the
   change. `space` only switches that line on or off.
@@ -271,36 +305,3 @@ All notable changes to this plugin. The format follows
 - The `fire`, `status` and other commands print text from routine files
   without control characters.
 - The unit tests cannot reach a real Herdr any more.
-
-## [0.1.0] - 2026-11-10
-
-### Added
-
-- Scheduler that starts with Herdr and runs routines on five-field cron
-  schedules in local time, each run as an interactive agent in its own tab.
-- Any agent kind Herdr can start (Claude, Codex, Gemini, OpenCode and more).
-- "Needs you" detection with a notification, also for questions before the
-  agent is ready; the prompt follows once answered.
-- Missed times caught up once or skipped, per routine; no overlapping runs;
-  time limit per routine; finished tabs closed after an hour.
-- List of routines and runs with a form to create and edit routines, run
-  now, on and off, delete, and saved output; the same look and the same
-  keys and mouse use as the other Herdr plugins of this author, with all
-  keys under `?`.
-- Permission mode, model and effort per routine, picked from a list, for
-  Claude Code, Codex and Gemini; new routines start in Auto.
-- Prompt editor inside the list (arrows, mouse, paste, undo), and `Ctrl+O`
-  for your own editor.
-- Shell commands as routines, like cron jobs without AI: exit code 0
-  finishes the run, anything else marks it failed and notifies.
-- On and off at a glance: a green dot for on, a red one for off.
-- A model choice for every agent that takes one, from the agent's own list
-  where it prints one; long lists filter by typing.
-- Create a routine by describing it to Claude.
-- Retries for failed runs, stopping a run at its time limit, single runs on
-  a date, runs when Herdr starts, and starting Herdr at login.
-- Check command before an agent run; the agent's summary saved with each
-  run, and optionally given to the next runs.
-- Whole output of shell commands in a file; agent tabs saved every minute;
-  `f` opens a run's output file; the runs of one routine with "n runs".
-- `routines` (JSON) and `fire <id>` commands for scripts and other agents.
