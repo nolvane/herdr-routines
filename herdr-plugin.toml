@@ -2,7 +2,7 @@
 
 id = "herdr-routines"
 name = "herdr-routines"
-version = "0.1.0"
+version = "1.0.0"
 min_herdr_version = "0.9.0"
 description = "Runs coding agents (Claude Code, Codex and others) and shell commands on a schedule, each run in its own tab, and follows your cron jobs, with a list to manage routines and their runs"
 platforms = ["linux", "macos"]
