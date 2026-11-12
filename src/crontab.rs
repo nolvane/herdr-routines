@@ -646,7 +646,7 @@ pub fn when(r: &Routine) -> Option<String> {
 fn group(paths: &Paths, r: &Routine, shell: &str) -> Result<Vec<String>, String> {
     let when = when(r).ok_or("the schedule cannot be read")?;
     let command = r.prompt.trim();
-    if command.contains('\n') {
+    if command.contains(['\n', '\r']) {
         return Err("a cron job's command is one line".into());
     }
     // In the crontab a % starts the command's input: escape it.
