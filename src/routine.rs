@@ -315,7 +315,9 @@ pub fn without_hidden(text: &str) -> String {
 
 fn is_hidden(c: char, multi_line: bool) -> bool {
     if c.is_control() {
-        return !(multi_line && matches!(c, '\n' | '\t' | '\r'));
+        // A carriage return is not shown in the list, yet a shell reads it
+        // as a line end: it stays out, so what is shown is what runs.
+        return !(multi_line && matches!(c, '\n' | '\t'));
     }
     matches!(
         c,
@@ -919,6 +921,28 @@ mod tests {
         f = sample();
         f.name = "Report\u{FE01}".into();
         assert!(Routine::check(&f, "go").is_some());
+    }
+
+    #[test]
+    fn carriage_returns_are_a_problem() {
+        // A lone carriage return is not shown in the list, so a command or
+        // prompt that holds one could differ from what the person approved.
+        let mut f = sample();
+        assert!(Routine::check(&f, "echo one\r# hidden").is_some());
+        assert!(Routine::check(&f, "echo one\r\n").is_some());
+        f.agent = SHELL.into();
+        f.permission_mode = String::new();
+        f.model = String::new();
+        assert_eq!(Routine::check(&f, "cd ~/scratch\ntouch x"), None);
+        assert!(Routine::check(&f, "cd ~/scratch\r\ntouch x").is_some());
+        assert!(Routine::check(&f, "echo done \r# ; touch x").is_some());
+        f.runs_in = RunsIn::Cron;
+        assert!(Routine::check(&f, "echo done \r# ; touch x").is_some());
+        // Line breaks and tabs are still fine.
+        f.runs_in = RunsIn::Herdr;
+        assert_eq!(Routine::check(&f, "echo a\n\techo b"), None);
+        // Text that comes back from a run loses them.
+        assert_eq!(without_hidden("a\r\nb\rc"), "a\nbc");
     }
 
     #[test]
